@@ -1,0 +1,18 @@
+# Keep the build context small and — critically — never copy the host virtualenv over the
+# container's (/app/.venv is built for the image's platform).
+.venv
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+docs/
+dev/
+airflow/
+tmp/
+*.md
+!README.md
+.env

@@ -1,0 +1,80 @@
+[project]
+name = "cloudio-orchestrator"
+version = "0.1.0"
+description = "Orchestrator core for our private cloud"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "sqlmodel",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "httpx",
+    "alembic",
+    "typer",
+    "loguru",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "respx",
+    "testcontainers[postgres]",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+orchestrator = "orchestrator.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orchestrator"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+# `class X(str, Enum)` is the deliberate idiom here (native-enum persistence relies on the values);
+# StrEnum (UP042) is not adopted.
+ignore = ["UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test helpers legitimately poll external state (repo/DB) in a loop with a wall-clock bound.
+"tests/**" = ["ASYNC109", "ASYNC110"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency markers are the standard exception to "no calls in arg defaults" (B008).
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header",
+                          "fastapi.Path", "fastapi.Body"]
+
+[tool.mypy]
+strict = true
+files = ["src"]                 # the strict gate covers production code; tests use pytest
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "respx", "pgqueuer.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    # Upstream Starlette renamed the 422 constant; we keep the documented name.
+    "ignore:.*HTTP_422_UNPROCESSABLE_ENTITY.*",
+]
+markers = [
+    "integration: requires Docker (testcontainers Postgres); skipped when unavailable",
+]

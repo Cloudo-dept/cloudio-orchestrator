@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Orchestrator — dev console</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>Orchestrator <span class="muted">dev console</span></h1>
+    </div>
+    <div class="status">
+      <span class="status-label">API</span>
+      <span id="health" class="pill pill-unknown" title="API reachability">checking…</span>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab is-active" data-tab="workflows" role="tab">Workflows</button>
+    <button class="tab" data-tab="runs" role="tab">Runs</button>
+  </nav>
+
+  <main>
+    <!-- ==================== WORKFLOWS TAB ==================== -->
+    <section id="tab-workflows" class="tabpanel is-active" role="tabpanel">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <button class="btn btn-primary" data-act="new-workflow">+ Register workflow</button>
+        </div>
+        <div class="toolbar-right muted small">
+          auto-refresh <span class="dot"></span> 5s · <span id="wf-count">0</span> total
+        </div>
+      </div>
+
+      <!-- Register / edit form (collapsible) -->
+      <form id="register-form" class="panel-form" hidden>
+        <div class="form-title" id="wf-form-title">Register workflow</div>
+        <div class="grid">
+          <label>identifier
+            <input name="identifier" id="wf-identifier" required placeholder="provision-vm" /></label>
+          <label>name <input name="name" placeholder="(optional)" /></label>
+          <label>run_type
+            <select name="run_type">
+              <option value="automation">automation</option>
+              <option value="resource">resource</option>
+            </select>
+          </label>
+          <label>engine_type
+            <select name="engine_type"><option value="airflow">airflow</option></select>
+          </label>
+          <label>automation_id <input name="automation_id" required placeholder="dag-x" /></label>
+          <label>ticket_template_id <input name="ticket_template_id" required placeholder="cat-1" /></label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary" id="wf-submit">Register</button>
+          <button type="button" class="btn btn-ghost" data-act="cancel-workflow">Cancel</button>
+        </div>
+      </form>
+
+      <div class="table-wrap">
+        <table id="workflows-table">
+          <thead>
+            <tr>
+              <th>identifier</th><th>name</th><th>type</th><th>engine</th>
+              <th>automation_id</th><th>ticket_template_id</th><th class="actions-col">actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ==================== RUNS TAB ==================== -->
+    <section id="tab-runs" class="tabpanel" role="tabpanel">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <button class="btn btn-primary" data-act="new-run">+ Trigger run</button>
+        </div>
+        <div class="toolbar-right muted small">
+          auto-refresh <span class="dot"></span> 5s · <span id="run-count">0</span> total (newest 200)
+        </div>
+      </div>
+
+      <!-- Trigger form (collapsible) -->
+      <form id="trigger-form" class="panel-form" hidden>
+        <div class="grid">
+          <label>workflow
+            <select name="workflow_identifier" id="trigger-workflow" required></select>
+          </label>
+          <label>created_by <input name="created_by" required value="dev" /></label>
+          <label>max_retries <input name="max_retries" type="number" min="0" max="10" value="3" /></label>
+        </div>
+
+        <fieldset class="params">
+          <legend>ticket_params <span class="muted small">— template variables sent to the ticket system</span></legend>
+          <div class="kv" data-kv="ticket_params"></div>
+          <button type="button" class="btn btn-sm" data-kv-add="ticket_params">+ add field</button>
+        </fieldset>
+
+        <fieldset class="params">
+          <legend>workflow_params <span class="muted small">— conf passed through to the engine (DAG run)</span></legend>
+          <div class="kv" data-kv="workflow_params"></div>
+          <button type="button" class="btn btn-sm" data-kv-add="workflow_params">+ add field</button>
+        </fieldset>
+
+        <fieldset class="params" id="resource-fields" hidden>
+          <legend>resource <span class="muted small">— sent to the resource manager (required for resource workflows)</span></legend>
+          <div class="grid">
+            <label>project_id <input name="res_project_id" placeholder="proj-1" /></label>
+            <label>resource_type <input name="res_resource_type" placeholder="vm" /></label>
+            <label>vendor_id <span class="muted small">— update/delete only; a create is assigned the run id</span>
+              <input name="res_vendor_id" placeholder="(leave blank for create)" /></label>
+            <label>name <input name="res_name" placeholder="app-01" /></label>
+            <label>region <input name="res_region" placeholder="(optional)" /></label>
+            <label>environment <input name="res_environment" placeholder="(optional)" /></label>
+            <label class="wide">description <input name="res_description" placeholder="(optional)" /></label>
+            <label>tags <span class="muted small">comma-separated</span>
+              <input name="res_tags" placeholder="web, prod" /></label>
+            <label>alert_groups <span class="muted small">comma-separated</span>
+              <input name="res_alert_groups" placeholder="sre, dba" /></label>
+          </div>
+          <fieldset class="params">
+            <legend>data <span class="muted small">— free-form resource attributes</span></legend>
+            <div class="kv" data-kv="res_data"></div>
+            <button type="button" class="btn btn-sm" data-kv-add="res_data">+ add field</button>
+          </fieldset>
+        </fieldset>
+
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary">Trigger</button>
+          <button type="button" class="btn btn-ghost" data-act="cancel-run">Cancel</button>
+        </div>
+      </form>
+
+      <div class="table-wrap">
+        <table id="runs-table">
+          <thead>
+            <tr>
+              <th>run</th><th>type</th><th>status</th><th>step</th>
+              <th>created_by</th><th>retries</th><th class="actions-col">actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <p class="footnote muted small">
+      Tables load the full server-side lists automatically every 5s. Values you type into a param
+      field are sent as JSON when they parse as JSON (numbers, <code>true</code>, objects), otherwise
+      as a plain string. The API exposes no update/delete, so rows have no edit/remove action.
+    </p>
+  </main>
+
+  <!-- Details drawer -->
+  <aside id="drawer" class="drawer" hidden>
+    <div class="drawer-head">
+      <strong id="drawer-title">Details</strong>
+      <button class="btn btn-ghost" data-act="close-drawer">✕</button>
+    </div>
+    <pre id="drawer-body" class="log"></pre>
+  </aside>
+
+  <!-- Toasts -->
+  <div id="toasts" class="toasts"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
