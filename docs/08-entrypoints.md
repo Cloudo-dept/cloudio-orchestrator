@@ -74,7 +74,9 @@ class WorkflowRunService:
 ## `api.py` — FastAPI app + HTTP schemas
 
 Explicit request/response DTOs keep the HTTP contract decoupled from the persistence shape.
-There is **no callbacks router** — completion is polled (see
+Completion is polled; a **callbacks router** (`POST /api/v1/callbacks/ticket-approval`,
+`POST /api/v1/callbacks/engine-run`) co-exists as a wake-early optimization — an external
+notification only makes the waiting run due now so it re-polls immediately (see
 [01-external-contracts](01-external-contracts.md)).
 
 ```python
@@ -411,8 +413,10 @@ at the HTTP boundary, not deep inside a step). An `automation` workflow omits `r
 
 ## What got simpler here (vs. the previous revision)
 
-- **No callbacks router, no HMAC verification, no `record_callback`** — the webhook path was cut
-  (see [01-external-contracts](01-external-contracts.md)).
+- **The callbacks router is a pure wake-early nudge, not a status writer** — it sets
+  `scheduled_at=now` via `runs.wake(...)` and lets the existing poll step read the authoritative
+  status; no `record_callback`, no provider status trusted from the body (see
+  [01-external-contracts](01-external-contracts.md)). Auth is network-trust (no HMAC/token).
 - **`api.py` is one module** (schemas + routes) instead of `app.py` + `dependencies.py` +
   `schemas/` + `routers/` — six files for five routes was ceremony.
 - **`resource` is a typed `ResourceSpec` in the request** — validation errors surface as 422s at

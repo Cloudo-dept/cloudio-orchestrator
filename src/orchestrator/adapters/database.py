@@ -8,13 +8,14 @@ including the whole ``run_state`` model (no in-place tracking needed).
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import String, text
+from sqlalchemy import String, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.sql import literal_column
 from sqlmodel import select
 
 from orchestrator.domain import (
+    RunStatus,
     StaleRunError,
     Workflow,
     WorkflowAlreadyExistsError,
@@ -99,6 +100,27 @@ class PostgresWorkflowRunRepository(WorkflowRunRepository):
                     ids.append(run.run_id)
             return ids
 
+    async def wake(self, run_id: uuid.UUID) -> bool:
+        # A targeted nudge, NOT a state change: set scheduled_at=now for a non-terminal run so the
+        # next claim_due picks it up immediately. Deliberately outside the optimistic version scheme
+        # (no version read/bump) — a concurrent in-flight drive is itself the re-poll we wanted, and
+        # its own save just re-sets scheduled_at to the next poll afterwards.
+        async with self.session_factory() as session:
+            async with session.begin():
+                now = utcnow()
+                stmt = (
+                    update(WorkflowRun)
+                    .where(
+                        WorkflowRun.run_id == run_id,  # type: ignore[arg-type]
+                        WorkflowRun.status.in_(  # type: ignore[attr-defined]
+                            (RunStatus.PENDING, RunStatus.RUNNING)
+                        ),
+                    )
+                    .values(scheduled_at=now, updated_at=now)
+                )
+                result = await session.execute(stmt)
+            return bool(result.rowcount)  # type: ignore[attr-defined]
+
     async def list_recent(self, limit: int = 200) -> list[WorkflowRun]:
         async with self.session_factory() as session:
             stmt = (
@@ -116,6 +138,9 @@ class PostgresWorkflowRunRepository(WorkflowRunRepository):
 
     async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]:
         return await self._find_by_path("{resource,vendor_id}", vendor_id)
+
+    async def find_by_engine_run_id(self, engine_run_id: str) -> list[WorkflowRun]:
+        return await self._find_by_path("{engine_run_id}", engine_run_id)
 
     async def _find_by_path(self, json_path: str, value: str) -> list[WorkflowRun]:
         # `run_state #>> '{a,b}'` — matches the partial JSONB index in the migration.

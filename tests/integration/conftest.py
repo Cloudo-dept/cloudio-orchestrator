@@ -75,6 +75,9 @@ _INDEX_DDL = [
     "CREATE INDEX idx_runs_resource_vendor_id ON workflow_runs "
     "((run_state #>> '{resource,vendor_id}')) "
     "WHERE (run_state #>> '{resource,vendor_id}') IS NOT NULL",
+    "CREATE INDEX idx_runs_engine_run_id ON workflow_runs "
+    "((run_state #>> '{engine_run_id}')) "
+    "WHERE (run_state #>> '{engine_run_id}') IS NOT NULL",
 ]
 
 

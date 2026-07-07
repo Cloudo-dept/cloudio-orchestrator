@@ -47,10 +47,22 @@ class WorkflowRunRepository(abc.ABC):
         worker) to drive. Workers pass limit=1 to claim a single run each."""
 
     @abc.abstractmethod
+    async def wake(self, run_id: uuid.UUID) -> bool:
+        """Make a non-terminal run due now (set scheduled_at to now) so a worker re-drives it
+        immediately, and return whether a row was woken. A deliberate nudge OUTSIDE the optimistic
+        version scheme: it never raises StaleRunError. Used by callbacks to shorten the wait between
+        polls — the re-driven poll step is still what reads the authoritative external status."""
+
+    @abc.abstractmethod
     async def find_by_ticket_id(self, ticket_id: str) -> list[WorkflowRun]: ...
 
     @abc.abstractmethod
     async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]: ...
+
+    @abc.abstractmethod
+    async def find_by_engine_run_id(self, engine_run_id: str) -> list[WorkflowRun]:
+        """Runs whose engine run id (the string trigger_workflow returned) matches — the lookup a
+        workflow-engine completion callback uses to resolve which run to wake."""
 
     @abc.abstractmethod
     async def list_recent(self, limit: int = 200) -> list[WorkflowRun]:

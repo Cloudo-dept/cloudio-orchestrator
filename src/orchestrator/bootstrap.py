@@ -18,7 +18,7 @@ from orchestrator.orchestration.escalator import FailureEscalator
 from orchestrator.orchestration.executor import RunExecutor
 from orchestrator.orchestration.plans import build_handlers
 from orchestrator.ports import HealthCheck, WorkflowEngineClient
-from orchestrator.services import WorkflowRunService, WorkflowService
+from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
 from orchestrator.worker import OrchestratorWorker
 
 
@@ -29,6 +29,7 @@ class Container(BaseModel):
 
     workflow_service: WorkflowService
     run_service: WorkflowRunService
+    callback_service: RunCallbackService
     worker: OrchestratorWorker
     health_check: HealthCheck
 
@@ -86,6 +87,7 @@ async def build(settings: Settings) -> Container:
     return Container(
         workflow_service=WorkflowService(workflows),
         run_service=WorkflowRunService(runs, workflows),
+        callback_service=RunCallbackService(runs),
         worker=worker,
         health_check=PostgresHealthCheck(session_factory),
     )

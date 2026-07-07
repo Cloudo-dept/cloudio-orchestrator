@@ -17,7 +17,7 @@ Two asynchronous workflow types (both create the RITM):
 - **Application owns retry *policy*.** The `WorkflowRun` tracks per-step attempt counts in `state.step_attempts`. On a transient failure the executor increments the count and, if under `max_retries`, sets `scheduled_at = now + backoff`; once exhausted the run terminates `FAILED` and escalates.
 - **Crash recovery is a re-drive lease.** `claim_due` pushes each claimed run's `scheduled_at` forward by a lease before driving, so a run whose worker dies becomes due again and is re-driven by another worker. Idempotency keys make the re-drive safe.
 - **Optimistic concurrency** on `WorkflowRun`: every save checks the expected `version`, bumps it, and raises `StaleRunError` on conflict (the concurrent writer is an overlapping re-drive after a lease expiry — rare but possible). The executor drops the lost save; another worker re-drives — it never clobbers.
-- **Completion is polled.** No webhook, no callback route: an in-progress engine run just sets `scheduled_at` a poll interval ahead. One writer path, one wake-up mechanism.
+- **Completion is polled; callbacks only wake early.** An in-progress step sets `scheduled_at` a poll interval ahead. A callback route lets an external system make the run due *now* (`runs.wake(...)`) to shorten that wait — it does not write run state or advance the run itself, so the poll stays the single authoritative wake-up-and-decide mechanism.
 - Exactly-once external side effects come from **server-side idempotency keys** `(run_id, step, attempt)`, independent of any transport.
 - **No Saga.** Permanent step failure ends the run at `FAILED`; nothing is undone.
 

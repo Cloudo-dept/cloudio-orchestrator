@@ -11,6 +11,7 @@ from orchestrator.domain import (
     ApprovalStatus,
     EngineFailure,
     EngineRunStatus,
+    RunStatus,
     StaleRunError,
     TicketRef,
     Workflow,
@@ -26,6 +27,8 @@ from orchestrator.ports import (
     WorkflowRepository,
     WorkflowRunRepository,
 )
+
+_TERMINAL_STATUSES = (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.REJECTED)
 
 
 class FakeHealthCheck(HealthCheck):
@@ -107,6 +110,22 @@ class FakeWorkflowRunRepository(WorkflowRunRepository):
             for r in self._runs.values()
             if r.run_state.resource is not None and r.run_state.resource.vendor_id == vendor_id
         ]
+
+    async def find_by_engine_run_id(self, engine_run_id: str) -> list[WorkflowRun]:
+        return [
+            _copy(r)
+            for r in self._runs.values()
+            if r.run_state.engine_run_id == engine_run_id
+        ]
+
+    async def wake(self, run_id: uuid.UUID) -> bool:
+        # A nudge outside the version scheme: make a non-terminal run due now, no version bump.
+        stored = self._runs.get(run_id)
+        if stored is None or stored.status in _TERMINAL_STATUSES:
+            return False
+        stored.scheduled_at = utcnow()
+        stored.updated_at = utcnow()
+        return True
 
 
 class FakeWorkflowRepository(WorkflowRepository):

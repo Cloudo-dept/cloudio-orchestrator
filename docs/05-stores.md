@@ -191,11 +191,12 @@ single-delivery work queue; a second transport would restate it.
 
 - **`create(run)` / `register(workflow)` take a constructed entity**, not `**fields` — typed at
   the call site, mypy-checked, nothing stringly.
-- **`find_by_state(key, value)` became two explicit finders** (`find_by_ticket_id`,
-  `find_by_resource_id`) matching the two API filters that actually exist. A generic key/value
-  query invited untyped state coupling.
-- **`record_callback` is gone** — it existed only for the optional webhook, which was cut
-  (see [01-external-contracts](01-external-contracts.md)). The port shrank by a method and the
-  run store no longer has a second writer in the common case.
+- **`find_by_state(key, value)` became explicit finders** (`find_by_ticket_id`,
+  `find_by_resource_id`, `find_by_engine_run_id`) matching the API filters and the callback
+  lookups that actually exist. A generic key/value query invited untyped state coupling.
+- **`record_callback` never came back** — the wake-early callback does not record anything on the
+  run; it calls `wake(run_id)`, a targeted `scheduled_at=now` UPDATE *outside* the optimistic
+  `version` scheme (it never raises `StaleRunError`), and the authoritative status still comes from
+  the poll (see [01-external-contracts](01-external-contracts.md)).
 - **No mapper layer** — the repositories read and write `WorkflowRun`/`Workflow` directly
   (they're SQLModel); `state` round-trips through `PydanticJSONB` automatically.

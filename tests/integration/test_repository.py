@@ -96,6 +96,63 @@ async def test_find_by_ticket_and_resource(pg_session_factory: async_sessionmake
     assert await repo.find_by_ticket_id("absent") == []
 
 
+async def test_find_by_engine_run_id(pg_session_factory: async_sessionmaker) -> None:
+    repo = PostgresWorkflowRunRepository(pg_session_factory)
+    run = await repo.create(make_run())
+    loaded = await repo.get(run.run_id)
+    assert loaded is not None
+    loaded.run_state.engine_run_id = "dagrun-42"
+    await repo.save(loaded)
+
+    found = await repo.find_by_engine_run_id("dagrun-42")
+    assert [r.run_id for r in found] == [run.run_id]
+    assert await repo.find_by_engine_run_id("absent") == []
+
+
+async def test_wake_makes_a_waiting_run_due_now(pg_session_factory: async_sessionmaker) -> None:
+    repo = PostgresWorkflowRunRepository(pg_session_factory)
+    run = await repo.create(make_run())
+    loaded = await repo.get(run.run_id)
+    assert loaded is not None
+    loaded.status = RunStatus.RUNNING
+    loaded.scheduled_at = utcnow().replace(year=utcnow().year + 1)  # far-future poll
+    await repo.save(loaded)
+    assert await repo.claim_due(1, lease_seconds=300) == []  # not due yet
+
+    assert await repo.wake(run.run_id) is True
+    woken = await repo.get(run.run_id)
+    assert woken is not None and woken.scheduled_at is not None
+    assert woken.scheduled_at <= utcnow()  # now due
+    assert await repo.claim_due(1, lease_seconds=300) == [run.run_id]  # a worker picks it up now
+
+
+async def test_wake_is_a_noop_for_a_terminal_run(pg_session_factory: async_sessionmaker) -> None:
+    repo = PostgresWorkflowRunRepository(pg_session_factory)
+    run = await repo.create(make_run())
+    loaded = await repo.get(run.run_id)
+    assert loaded is not None
+    loaded.status = RunStatus.COMPLETED
+    loaded.scheduled_at = None  # terminal runs carry no schedule
+    await repo.save(loaded)
+
+    assert await repo.wake(run.run_id) is False
+    still = await repo.get(run.run_id)
+    assert still is not None and still.scheduled_at is None  # untouched
+
+
+async def test_wake_does_not_bump_version(pg_session_factory: async_sessionmaker) -> None:
+    # wake is a nudge outside the optimistic-version scheme, so a run loaded before the wake can
+    # still be saved afterwards without a StaleRunError.
+    repo = PostgresWorkflowRunRepository(pg_session_factory)
+    run = await repo.create(make_run())
+    held = await repo.get(run.run_id)
+    assert held is not None
+
+    assert await repo.wake(run.run_id) is True
+    held.status = RunStatus.RUNNING
+    await repo.save(held)  # must not raise — wake left version alone
+
+
 async def test_workflow_registry_roundtrip(pg_session_factory: async_sessionmaker) -> None:
     repo = PostgresWorkflowRepository(pg_session_factory)
     await repo.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))

@@ -103,3 +103,33 @@ class WorkflowRunService:
 
     async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]:
         return await self.runs.find_by_resource_id(vendor_id)
+
+
+class RunCallbackService:
+    """Wake-early on an external notification: a callback resolves the waiting run by a neutral
+    external reference and makes it due now, so a worker re-drives it immediately instead of
+    waiting out the poll interval. It never trusts a status from the callback — the re-driven poll
+    step still reads the authoritative state from the provider, so polling stays the source of
+    truth and a lost/duplicate callback is harmless."""
+
+    def __init__(self, runs: WorkflowRunRepository) -> None:
+        self.runs = runs
+
+    async def wake_by_ticket(self, ticket_id: str) -> int:
+        runs = await self.runs.find_by_ticket_id(ticket_id)
+        woken = await self._wake_all(runs)
+        logger.info("Ticket callback for {}: woke {} run(s) to re-poll now.", ticket_id, woken)
+        return woken
+
+    async def wake_by_engine_run(self, engine_run_id: str) -> int:
+        runs = await self.runs.find_by_engine_run_id(engine_run_id)
+        woken = await self._wake_all(runs)
+        logger.info("Engine callback for {}: woke {} run(s) to re-poll now.", engine_run_id, woken)
+        return woken
+
+    async def _wake_all(self, runs: list[WorkflowRun]) -> int:
+        woken = 0
+        for run in runs:
+            if await self.runs.wake(run.run_id):  # no-op for a terminal run
+                woken += 1
+        return woken

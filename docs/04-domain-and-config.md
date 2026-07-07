@@ -315,7 +315,8 @@ CREATE INDEX idx_runs_resource_vendor_id ON workflow_runs ((run_state #>> '{reso
   change tracking.
 - **One DSN and no queue** — a single `database_url`; the workers claim and drive runs straight
   from the run store, so there is no second (queue) DSN or connection pool to configure.
-- **No webhook settings** (`public_base_url`, `webhook_secret`) — the callback path was cut; see
+- **No webhook settings** (`public_base_url`, `webhook_secret`) — the wake-early callback endpoints
+  are network-trust (no app-layer auth) and inbound-only, so they need no config; see
   [01-external-contracts](01-external-contracts.md).
 
 The HTTP request/response schemas live with the API in [08-entrypoints](08-entrypoints.md).

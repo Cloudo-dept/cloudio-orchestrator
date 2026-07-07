@@ -1,5 +1,6 @@
 """HTTP surface via ASGITransport, with services wired to the in-memory fakes."""
 
+import uuid
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
@@ -7,7 +8,7 @@ import httpx
 import pytest
 
 from orchestrator.api import app
-from orchestrator.services import WorkflowRunService, WorkflowService
+from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
 from tests.fakes import FakeHealthCheck, FakeWorkflowRepository, FakeWorkflowRunRepository
 
 
@@ -18,6 +19,7 @@ async def client(
     app.state.container = SimpleNamespace(
         workflow_service=WorkflowService(workflows),
         run_service=WorkflowRunService(runs, workflows),
+        callback_service=RunCallbackService(runs),
         health_check=FakeHealthCheck(healthy=True),
     )
     transport = httpx.ASGITransport(app=app)
@@ -157,6 +159,65 @@ async def test_malformed_resource_spec_is_422_at_boundary(client: httpx.AsyncCli
 async def test_get_unknown_run_is_404(client: httpx.AsyncClient) -> None:
     resp = await client.get(f"/api/v1/workflow-runs/{'0' * 8}-0000-0000-0000-000000000000")
     assert resp.status_code == 404
+
+
+async def _make_waiting_run(
+    runs: FakeWorkflowRunRepository,
+    *,
+    ticket_id: str | None = None,
+    engine_run_id: str | None = None,
+) -> uuid.UUID:
+    """A RUNNING run parked on a far-future poll — the state a callback wakes early."""
+    from datetime import timedelta
+
+    from orchestrator.domain import RunStatus, RunType, TicketRef, utcnow
+    from tests.factories import make_run
+
+    run = make_run(run_type=RunType.RESOURCE)
+    run.status = RunStatus.RUNNING
+    run.scheduled_at = utcnow() + timedelta(days=1)
+    if ticket_id is not None:
+        run.run_state.ticket = TicketRef(ticket_id=ticket_id, native_id="sys-1")
+    run.run_state.engine_run_id = engine_run_id
+    await runs.create(run)
+    return run.run_id
+
+
+async def test_ticket_approval_callback_wakes_the_run(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    from orchestrator.domain import utcnow
+
+    run_id = await _make_waiting_run(runs, ticket_id="RITM0001234")
+    resp = await client.post(
+        "/api/v1/callbacks/ticket-approval", json={"ticket_id": "RITM0001234"}
+    )
+    assert resp.status_code == 202 and resp.json() == {"woken": 1}
+    woken = await runs.get(run_id)
+    assert woken is not None and woken.scheduled_at is not None
+    assert woken.scheduled_at <= utcnow()  # now due → a worker re-polls immediately
+
+
+async def test_engine_run_callback_wakes_the_run(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    from orchestrator.domain import utcnow
+
+    run_id = await _make_waiting_run(runs, engine_run_id="dagrun-7")
+    resp = await client.post("/api/v1/callbacks/engine-run", json={"engine_run_id": "dagrun-7"})
+    assert resp.status_code == 202 and resp.json() == {"woken": 1}
+    woken = await runs.get(run_id)
+    assert woken is not None and woken.scheduled_at is not None
+    assert woken.scheduled_at <= utcnow()
+
+
+async def test_callback_for_unknown_reference_is_a_noop(client: httpx.AsyncClient) -> None:
+    ticket = await client.post(
+        "/api/v1/callbacks/ticket-approval", json={"ticket_id": "RITM-ghost"}
+    )
+    assert ticket.status_code == 202 and ticket.json() == {"woken": 0}
+    engine = await client.post("/api/v1/callbacks/engine-run", json={"engine_run_id": "ghost"})
+    assert engine.status_code == 202 and engine.json() == {"woken": 0}
 
 
 async def test_list_by_resource_and_ticket(client: httpx.AsyncClient) -> None:

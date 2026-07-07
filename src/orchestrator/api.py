@@ -1,7 +1,8 @@
 """FastAPI app + HTTP schemas + routers.
 
 Explicit request/response DTOs keep the HTTP contract decoupled from the persistence shape.
-There is no callbacks router — completion is polled.
+Completion is polled; the callbacks router is a wake-early optimization that co-exists with the
+poll — an external notification only makes the waiting run due now so it re-polls immediately.
 """
 
 import uuid
@@ -24,7 +25,7 @@ from orchestrator.domain import (
     WorkflowEngineType,
 )
 from orchestrator.ports import HealthCheck
-from orchestrator.services import WorkflowRunService, WorkflowService
+from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
 
 # --- HTTP schemas ---
 
@@ -84,6 +85,24 @@ class WorkflowRunResponse(BaseModel):
     run_state: RunState  # typed — clients see a real schema
 
 
+class TicketApprovalCallbackRequest(BaseModel):
+    """The ticket system notifies us that a request's approval state changed. Carries only the
+    neutral ticket id — never a provider status; the run re-polls the authoritative state itself."""
+
+    ticket_id: str
+
+
+class EngineRunCallbackRequest(BaseModel):
+    """The workflow engine notifies us that a run finished. Carries only the neutral engine run id
+    (the string trigger_workflow returned) — never a provider status."""
+
+    engine_run_id: str
+
+
+class CallbackAcceptedResponse(BaseModel):
+    woken: int  # how many waiting runs were made due now (0 = nothing matched / already terminal)
+
+
 class HealthResponse(BaseModel):
     status: str  # "ok" (liveness) / "ready" | "unavailable" (readiness)
 
@@ -119,6 +138,11 @@ def get_workflow_service(request: Request) -> WorkflowService:
 
 def get_run_service(request: Request) -> WorkflowRunService:
     service: WorkflowRunService = request.app.state.container.run_service
+    return service
+
+
+def get_callback_service(request: Request) -> RunCallbackService:
+    service: RunCallbackService = request.app.state.container.callback_service
     return service
 
 
@@ -257,3 +281,40 @@ async def list_workflow_runs(
     if resource_id:
         return await svc.find_by_resource_id(resource_id)
     return await svc.list_recent()  # unfiltered: the most recent runs, newest first
+
+
+# --- Callbacks: external systems wake a waiting run early (co-exists with polling) ---
+
+
+@app.post(
+    "/api/v1/callbacks/ticket-approval",
+    response_model=CallbackAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["callbacks"],
+)
+async def ticket_approval_callback(
+    request: TicketApprovalCallbackRequest,
+    svc: RunCallbackService = Depends(get_callback_service),
+) -> CallbackAcceptedResponse:
+    """The ticket system tells us a request's approval changed. We make any run waiting on that
+    ticket due now so it re-polls the authoritative approval state immediately. Idempotent: an
+    unknown or already-terminal ticket is a no-op (woken=0), never an error."""
+    woken = await svc.wake_by_ticket(request.ticket_id)
+    return CallbackAcceptedResponse(woken=woken)
+
+
+@app.post(
+    "/api/v1/callbacks/engine-run",
+    response_model=CallbackAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["callbacks"],
+)
+async def engine_run_callback(
+    request: EngineRunCallbackRequest,
+    svc: RunCallbackService = Depends(get_callback_service),
+) -> CallbackAcceptedResponse:
+    """The workflow engine tells us a run finished. We make the run waiting on that engine run due
+    now so it re-polls the authoritative run status immediately. Idempotent: an unknown or
+    already-terminal engine run is a no-op (woken=0), never an error."""
+    woken = await svc.wake_by_engine_run(request.engine_run_id)
+    return CallbackAcceptedResponse(woken=woken)
