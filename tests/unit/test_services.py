@@ -1,0 +1,112 @@
+"""WorkflowService / WorkflowRunService over the in-memory fakes."""
+
+import pytest
+
+from orchestrator.domain import (
+    ResourceParamsRequired,
+    RunStatus,
+    RunType,
+    UnknownWorkflowError,
+)
+from orchestrator.services import WorkflowRunService, WorkflowService
+from tests.factories import make_resource_spec, make_workflow
+
+
+async def test_register_and_get_workflow(workflows) -> None:
+    svc = WorkflowService(workflows)
+    wf = await svc.register(make_workflow(identifier="provision-vm"))
+    assert wf.identifier == "provision-vm"
+    fetched = await svc.get("provision-vm")
+    assert fetched is not None and fetched.automation_id == "dag-x"
+    assert await svc.get("nope") is None
+    assert [w.identifier for w in await svc.list()] == ["provision-vm"]
+
+
+async def test_trigger_builds_run_from_snapshot(runs, workflows) -> None:
+    await workflows.register(
+        make_workflow(identifier="run-automation", run_type=RunType.AUTOMATION)
+    )
+    svc = WorkflowRunService(runs, workflows)
+
+    run = await svc.trigger(
+        workflow_identifier="run-automation",
+        created_by="jdoe",
+        max_retries=5,
+        ticket_params={"v": 1},
+        workflow_params={"size": "L"},
+        resource=None,
+    )
+
+    assert run.run_type is RunType.AUTOMATION
+    assert run.status is RunStatus.PENDING
+    assert run.max_retries == 5
+    assert run.scheduled_at is not None  # due now → claimable immediately
+    # The registry mapping was snapshotted into the run's state.
+    assert run.run_state.workflow.identifier == "run-automation"
+    assert run.run_state.workflow.automation_id == "dag-x"
+    assert run.run_state.workflow_params == {"size": "L"}
+    assert run.run_state.resource is None
+    # And it was persisted.
+    assert await svc.get(run.run_id) is not None
+
+
+async def test_trigger_resource_workflow_carries_spec(runs, workflows) -> None:
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    svc = WorkflowRunService(runs, workflows)
+
+    run = await svc.trigger(
+        workflow_identifier="provision-vm",
+        created_by="jdoe",
+        max_retries=3,
+        ticket_params={},
+        workflow_params={},
+        resource=make_resource_spec(vendor_id="vm-9"),
+    )
+
+    assert run.run_type is RunType.RESOURCE
+    assert run.run_state.resource is not None
+    assert run.run_state.resource.vendor_id == "vm-9"
+
+
+async def test_trigger_unknown_workflow_raises(runs, workflows) -> None:
+    svc = WorkflowRunService(runs, workflows)
+    with pytest.raises(UnknownWorkflowError):
+        await svc.trigger(
+            workflow_identifier="ghost",
+            created_by="jdoe",
+            max_retries=3,
+            ticket_params={},
+            workflow_params={},
+            resource=None,
+        )
+
+
+async def test_trigger_resource_without_spec_raises(runs, workflows) -> None:
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    svc = WorkflowRunService(runs, workflows)
+    with pytest.raises(ResourceParamsRequired):
+        await svc.trigger(
+            workflow_identifier="provision-vm",
+            created_by="jdoe",
+            max_retries=3,
+            ticket_params={},
+            workflow_params={},
+            resource=None,
+        )
+
+
+async def test_find_by_ticket_and_resource(runs, workflows) -> None:
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    svc = WorkflowRunService(runs, workflows)
+    run = await svc.trigger(
+        workflow_identifier="provision-vm",
+        created_by="jdoe",
+        max_retries=3,
+        ticket_params={},
+        workflow_params={},
+        resource=make_resource_spec(vendor_id="vm-7"),
+    )
+
+    found = await svc.find_by_resource_id("vm-7")
+    assert [r.run_id for r in found] == [run.run_id]
+    assert await svc.find_by_resource_id("absent") == []

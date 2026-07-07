@@ -1,0 +1,145 @@
+name: cloudio-orchestrator
+
+# Shared config for the three app containers (migrate / api / worker) — same image, same env,
+# same mounted source for live editing.
+x-app: &app
+  build: .
+  image: cloudio-orchestrator:dev
+  pull_policy: build          # local tag — always build, never try to pull from a registry
+  env_file:
+    - .env                    # cp .env.example .env first (provider creds live here)
+  environment:
+    # Point at the compose services, overriding whatever is in .env.
+    ORCH_DATABASE_URL: postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator
+    ORCH_AIRFLOW_BASE_URL: http://airflow:8080          # engine adapter target (creds from .env)
+    ORCH_PM_BASE_URL: http://project-manager:8000       # dev Project Manager mock (token from .env)
+  volumes:
+    - ./src:/app/src          # editable install → code edits hot-reload
+    - ./alembic.ini:/app/alembic.ini
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+      POSTGRES_DB: orchestrator
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator -d orchestrator"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Local Airflow (standalone, 3.0.3) — the workflow engine the adapter points at.
+  # Login is always admin / password: we seed SimpleAuthManager's passwords file before boot
+  # so it never generates a random one (put "password" in .env as ORCH_AIRFLOW_PASSWORD).
+  airflow:
+    image: apache/airflow:3.0.3
+    command:
+      - bash
+      - -c
+      - "echo '{\"admin\": \"password\"}' > /opt/airflow/simple_auth_manager_passwords.json.generated && exec airflow standalone"
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - airflow-home:/opt/airflow          # persists the SQLite metadata db + admin password
+      - ./airflow/dags:/opt/airflow/dags    # drop DAGs here (e.g. the automation_id you register)
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
+  # Dedicated Postgres for the Project Manager dev mock (separate from the orchestrator db).
+  pm-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pm
+      POSTGRES_PASSWORD: pm
+      POSTGRES_DB: pm
+    volumes:
+      - pm-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pm -d pm"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Dev-only Project Manager API mock (FastAPI + its own Postgres). The orchestrator's PM adapter
+  # points here via ORCH_PM_BASE_URL above.
+  project-manager:
+    build: ./dev/project_manager
+    environment:
+      PM_DATABASE_URL: postgresql+asyncpg://pm:pm@pm-postgres:5432/pm
+    ports:
+      - "8081:8000"
+    depends_on:
+      pm-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8000/healthz')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # Dev-only browser console (static GUI + /api reverse proxy to the orchestrator API).
+  ui:
+    build: ./dev/ui
+    environment:
+      ORCH_API_BASE: http://api:8000
+      UI_PORT: "8090"
+    volumes:
+      - ./dev/ui/static:/app/static    # edit the console live — no rebuild needed
+      - ./dev/ui/server.py:/app/server.py
+    ports:
+      - "8090:8090"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # One-shot: apply migrations, then exit. api/worker wait for it to finish.
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+
+  api:
+    <<: *app
+    command: ["uvicorn", "orchestrator.api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # liveness — the app is serving (readiness/DB is /readyz; keep the probe cheap)
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8000/healthz')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *app
+    command: ["orchestrator", "worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  airflow-home:
+  pm-pgdata:
