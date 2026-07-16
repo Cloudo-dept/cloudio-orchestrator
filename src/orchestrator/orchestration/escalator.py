@@ -33,6 +33,7 @@ class FailureEscalator:
                 responsible_group=group,
                 flow_type=st.workflow.automation_id if failure and failure.failed_task else None,
                 failed_task=failure.failed_task if failure else None,
+                comment=str(error),
             )
             st.incident_id = inc.ticket_id
             logger.info("Opened incident {} for run {}.", inc.ticket_id, run.run_id)

@@ -174,6 +174,7 @@ async def test_permanent_failure_marks_failed_and_escalates(
     # Escalation opened an Incident routed to the default team (no engine failure detail).
     assert len(tickets.incidents) == 1
     assert tickets.incidents[0]["responsible_group"] == "cloudio"
+    assert tickets.incidents[0]["comment"] == "ServiceNow unavailable"  # exception message attached
     assert final.run_state.incident_id is not None
 
 
@@ -407,10 +408,11 @@ async def test_engine_final_vendor_id_overrides_finalize_target(
     final = await drive(runs, executor, run.run_id)
 
     assert final.status is RunStatus.COMPLETED
-    # The engine-reported id lands under data.vendor_id. Finalize PATCHes the record where it was
-    # created (the run id) and re-keys it to the engine-reported id as it marks it done.
+    # The engine-reported id lands in the RUN_ENGINE step result. Finalize PATCHes the record where
+    # it was created (the run id) and re-keys it to the engine-reported id as it marks it done.
     assert final.run_state.resource is not None
-    assert final.run_state.resource.data["vendor_id"] == "vm-engine-99"
+    assert final.run_state.resource.vendor_id == str(run.run_id)  # placeholder preserved
+    assert final.run_state.step_results[StepName.RUN_ENGINE].final_vendor_id == "vm-engine-99"
     assert resources.updated[-1] == (
         "proj-1",
         "vm",
@@ -431,4 +433,4 @@ async def test_finalize_falls_back_to_original_vendor_id(
 
     assert resources.updated[-1] == ("proj-1", "vm", str(run.run_id), {"in_progress": False})
     assert final.run_state.resource is not None
-    assert "vendor_id" not in final.run_state.resource.data
+    assert StepName.RUN_ENGINE not in final.run_state.step_results

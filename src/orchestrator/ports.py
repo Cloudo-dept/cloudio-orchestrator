@@ -117,8 +117,10 @@ class TicketSystemClient(abc.ABC):
         responsible_group: str,
         flow_type: str | None = None,
         failed_task: str | None = None,
+        comment: str | None = None,
     ) -> TicketRef:
-        """Raise an incident for a failure, routed to the responsible group."""
+        """Raise an incident for a failure, routed to the responsible group. ``comment``, when
+        given, is attached to the incident as a note (e.g. the failure's exception message)."""
 
 
 class ResourceManagerClient(abc.ABC):

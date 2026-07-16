@@ -60,31 +60,29 @@ services:
       retries: 12
       start_period: 90s
 
-  # Dedicated Postgres for the Project Manager dev mock (separate from the orchestrator db).
-  pm-postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: pm
-      POSTGRES_PASSWORD: pm
-      POSTGRES_DB: pm
+  # Dedicated MongoDB for the Project Manager dev mock (separate from the orchestrator db).
+  pm-mongo:
+    image: mongo:7
+    ports:
+      - "27018:27017"   
     volumes:
-      - pm-pgdata:/var/lib/postgresql/data
+      - pm-mongodata:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pm -d pm"]
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 2s
       timeout: 3s
       retries: 30
 
-  # Dev-only Project Manager API mock (FastAPI + its own Postgres). The orchestrator's PM adapter
+  # Dev-only Project Manager API mock (FastAPI + its own MongoDB). The orchestrator's PM adapter
   # points here via ORCH_PM_BASE_URL above.
   project-manager:
     build: ./dev/project_manager
     environment:
-      PM_DATABASE_URL: postgresql+asyncpg://pm:pm@pm-postgres:5432/pm
+      PM_DATABASE_URL: mongodb://pm-mongo:27017/
     ports:
       - "8081:8000"
     depends_on:
-      pm-postgres:
+      pm-mongo:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8000/healthz')\""]
@@ -142,4 +140,4 @@ services:
 volumes:
   pgdata:
   airflow-home:
-  pm-pgdata:
+  pm-mongodata:

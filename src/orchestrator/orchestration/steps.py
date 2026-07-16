@@ -27,6 +27,7 @@ from orchestrator.domain import (
     RunRejected,
     RunState,
     StepName,
+    StepResult,
     WorkflowEngineType,
     WorkflowRun,
 )
@@ -223,8 +224,8 @@ class RunEngineStep(StepHandler):
     async def _capture_final_vendor_id(
         self, run: WorkflowRun, client: WorkflowEngineClient
     ) -> None:
-        # If the run published a `final_vendor_id` output, record it under the resource's
-        # data.vendor_id so finalize targets the resource the engine actually provisioned.
+        # If the run published a `final_vendor_id` output, record it in this step's results so
+        # finalize can re-key the placeholder record to the id the engine actually provisioned.
         st = run.run_state
         if st.resource is None or st.engine_run_id is None:
             return
@@ -239,12 +240,13 @@ class RunEngineStep(StepHandler):
             return
         if final_vendor_id is not None:
             logger.info("Run {}: engine reported final vendor id {}.", run.run_id, final_vendor_id)
-            st.resource.data["vendor_id"] = final_vendor_id
+            st.step_results[StepName.RUN_ENGINE] = StepResult(final_vendor_id=final_vendor_id)
 
     def reset_for_retry(self, state: RunState) -> None:  # noqa: B027 (optional hook; default no-op)
         logger.debug("Resetting RUN_ENGINE state for retry (clearing engine_run_id).")
         state.engine_run_id = None
         state.engine_failure = None
+        state.step_results.pop(StepName.RUN_ENGINE, None)
 
 
 class FinalizeResourceStep(StepHandler):
@@ -260,12 +262,13 @@ class FinalizeResourceStep(StepHandler):
             logger.debug("Run {}: no resource to finalize (or already done).", run.run_id)
             return True
         # Target the record where ConfigureResourceStep created/targeted it (resource.vendor_id —
-        # the run id for a CREATE). If the engine reported the id it actually provisioned
-        # (data.vendor_id, from the final_vendor_id output), record it on that record as we
-        # finalize — a re-key from the run-id placeholder to the real vendor id.
+        # the run id for a CREATE). If the engine reported the id it actually provisioned (the
+        # RUN_ENGINE step result's final_vendor_id), record it on that record as we finalize — a
+        # re-key from the run-id placeholder to the real vendor id.
         vendor_id = st.resource.vendor_id
         fields: dict[str, Any] = {"in_progress": False}  # done provisioning
-        engine_vendor_id = st.resource.data.get("vendor_id")
+        engine_result = st.step_results.get(StepName.RUN_ENGINE)
+        engine_vendor_id = engine_result.final_vendor_id if engine_result else None
         if engine_vendor_id and engine_vendor_id != vendor_id:
             fields["vendor_id"] = engine_vendor_id
             logger.info(

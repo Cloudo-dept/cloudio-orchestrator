@@ -152,6 +152,12 @@ class EngineFailure(BaseModel):
     detail: str | None = None
 
 
+class StepResult(BaseModel):
+    """Outputs a step publishes for later steps to consume (part of RunState)."""
+
+    final_vendor_id: str | None = None  # engine-provisioned id (RUN_ENGINE → FINALIZE_RESOURCE)
+
+
 class RunState(BaseModel):
     """The run's entire working state — explicit schema, persisted as ONE JSONB column.
     Step handlers read/write typed fields; the booleans are the idempotency markers that
@@ -173,6 +179,9 @@ class RunState(BaseModel):
     step_attempts: dict[StepName, int] = PyField(default_factory=dict)
     step_started_at: dict[StepName, datetime] = PyField(default_factory=dict)
     errors: dict[StepName, str] = PyField(default_factory=dict)
+
+    # per-step outputs handed off to later steps (keyed by StepName)
+    step_results: dict[StepName, StepResult] = PyField(default_factory=dict)
 
     # failure escalation
     engine_failure: EngineFailure | None = None

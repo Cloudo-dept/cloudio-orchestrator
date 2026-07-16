@@ -1,4 +1,4 @@
-# Dev-only Project Manager mock — tiny FastAPI + asyncpg service.
+# Dev-only Project Manager mock — tiny FastAPI + MongoDB (motor) service.
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 ENV UV_LINK_MODE=copy \
@@ -6,7 +6,7 @@ ENV UV_LINK_MODE=copy \
     PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
-RUN uv venv && uv pip install fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" asyncpg
+RUN uv venv && uv pip install fastapi "uvicorn[standard]" motor
 
 COPY app.py ./
 EXPOSE 8000

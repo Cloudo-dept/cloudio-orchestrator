@@ -199,6 +199,7 @@ class FakeTicketSystemClient(TicketSystemClient):
         responsible_group: str,
         flow_type: str | None = None,
         failed_task: str | None = None,
+        comment: str | None = None,
     ) -> TicketRef:
         ref = self._mint("INC")
         self.incidents.append(
@@ -209,6 +210,7 @@ class FakeTicketSystemClient(TicketSystemClient):
                 "responsible_group": responsible_group,
                 "flow_type": flow_type,
                 "failed_task": failed_task,
+                "comment": comment,
             }
         )
         return ref

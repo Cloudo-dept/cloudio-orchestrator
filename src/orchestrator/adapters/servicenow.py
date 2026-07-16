@@ -26,13 +26,13 @@ class ServiceNowTicketClient(TicketSystemClient):
         username: str,
         password: str,
         responsible_groups: dict[str, str],
-        timeout: float = 10.0,
+        timeout: float = 60.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._auth = (username, password)
         self._groups = responsible_groups
-        self._timeout = timeout
+        self._timeout = 60
         self._transport = transport  # test seam (11-testing); None in prod
 
     def _client(self) -> httpx.AsyncClient:
@@ -123,6 +123,7 @@ class ServiceNowTicketClient(TicketSystemClient):
         responsible_group: str,
         flow_type: str | None = None,
         failed_task: str | None = None,
+        comment: str | None = None,
     ) -> TicketRef:
         body: dict[str, Any] = {
             "u_noc": True,
@@ -139,6 +140,8 @@ class ServiceNowTicketClient(TicketSystemClient):
         if flow_type and failed_task:  # DAG-run failures only
             body["u_cloudio_flow_type"] = flow_type
             body["u_cloudio_failed_task"] = failed_task
+        if comment:  # attach the failure detail (exception message) as a work note
+            body["work_notes"] = comment
         async with self._client() as client:
             resp = await client.post("/api/now/table/incident", json=body)
             resp.raise_for_status()
