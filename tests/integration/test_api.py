@@ -50,6 +50,13 @@ WORKFLOW_BODY = {
     "automation_id": "dag-x",
     "ticket_template_id": "cat-1",
 }
+AUTOMATION_WORKFLOW_BODY = {
+    "identifier": "run-automation",
+    "run_type": "automation",
+    "engine_type": "airflow",
+    "automation_id": "dag-x",
+    "ticket_template_id": "cat-1",
+}
 RESOURCE = {  # a CREATE — the caller does not supply vendor_id (assigned at ConfigureResourceStep)
     "project_id": "proj-1",
     "resource_type": "vm",
@@ -57,6 +64,7 @@ RESOURCE = {  # a CREATE — the caller does not supply vendor_id (assigned at C
     "region": "gvt",
     "environment": "prod",
 }
+TICKET = {"ticket_id": "RITM0001234", "native_id": "sys-1234"}  # a caller's pre-existing RITM
 
 
 async def test_register_and_get_workflow(client: httpx.AsyncClient) -> None:
@@ -128,6 +136,29 @@ async def test_trigger_resource_run(client: httpx.AsyncClient) -> None:
     run_id = body["run_id"]
     got = await client.get(f"/api/v1/workflow-runs/{run_id}")
     assert got.status_code == 200 and got.json()["run_id"] == run_id
+
+
+async def test_trigger_automation_run_attaches_ticket(client: httpx.AsyncClient) -> None:
+    await client.post("/api/v1/workflows", json=AUTOMATION_WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={"workflow_identifier": "run-automation", "created_by": "jdoe", "ticket": TICKET},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["run_type"] == "automation" and body["status"] == "pending"
+    # The caller's RITM is attached to the run's state — no ticket will be created downstream.
+    assert body["run_state"]["ticket"] == TICKET
+
+
+async def test_trigger_automation_workflow_without_ticket_is_422(client: httpx.AsyncClient) -> None:
+    await client.post("/api/v1/workflows", json=AUTOMATION_WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={"workflow_identifier": "run-automation", "created_by": "jdoe"},
+    )
+    assert resp.status_code == 422
+    assert "ticket is required" in resp.json()["detail"]
 
 
 async def test_trigger_unknown_workflow_is_404(client: httpx.AsyncClient) -> None:

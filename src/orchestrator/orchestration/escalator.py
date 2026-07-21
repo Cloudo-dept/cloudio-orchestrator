@@ -18,22 +18,24 @@ class FailureEscalator:
     async def escalate(self, run: WorkflowRun, error: Exception) -> None:
         st = run.run_state
         failure = st.engine_failure
-        group = (
-            failure.responsible_group
-            if failure and failure.responsible_group
-            else self.default_team
-        )
+        detail = f"{type(error).__name__}: {error}"  # exception type + message → incident note
+        if failure is not None:  # the failure came from the automation engine (a DAG failure)
+            title = "Automation failure"
+            group = failure.responsible_group or self.default_team
+        else:  # the failure came from outside the engine → the default team owns it
+            title = "Run execution failure"
+            group = self.default_team
         logger.info(
             "Escalating run {} failure to group '{}' (opening incident).", run.run_id, group
         )
         try:
             inc = await self.ticket.open_incident(
-                summary=f"CloudIO run {run.run_id} failed at '{run.current_step}': {error}",
+                summary=title,
                 requested_by=run.created_by,
                 responsible_group=group,
                 flow_type=st.workflow.automation_id if failure and failure.failed_task else None,
                 failed_task=failure.failed_task if failure else None,
-                comment=str(error),
+                comment=detail,
             )
             st.incident_id = inc.ticket_id
             logger.info("Opened incident {} for run {}.", inc.ticket_id, run.run_id)

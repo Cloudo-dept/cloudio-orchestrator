@@ -105,6 +105,10 @@ class ResourceParamsRequired(Exception):
     """A resource workflow was triggered without a resource spec."""
 
 
+class TicketRefRequired(Exception):
+    """An automation workflow was triggered without a reference to its pre-existing ticket."""
+
+
 # --- Value objects (pure Pydantic) ---
 
 

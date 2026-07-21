@@ -120,4 +120,5 @@ async def test_worker_drives_a_real_run_to_completion(
     await _drain(worker, done)
     final = await runs.get(run.run_id)
     assert final is not None and final.status is RunStatus.COMPLETED
-    assert len(tickets.open_ticket_calls) == 1 and tickets.closed
+    # Automation attaches to the caller's RITM (never opens one) and closes it at the end.
+    assert tickets.open_ticket_calls == [] and tickets.closed

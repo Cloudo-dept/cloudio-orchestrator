@@ -14,7 +14,7 @@ from orchestrator.adapters.database import (
 from orchestrator.adapters.project_manager import ProjectManagerResourceClient
 from orchestrator.adapters.servicenow import ServiceNowTicketClient
 from orchestrator.config import Settings
-from orchestrator.domain import RunStatus, RunType, StepName, WorkflowEngineType
+from orchestrator.domain import RunStatus, RunType, StepName, TicketRef, WorkflowEngineType
 from orchestrator.orchestration.escalator import FailureEscalator
 from orchestrator.orchestration.executor import RunExecutor
 from orchestrator.orchestration.plans import build_handlers
@@ -89,6 +89,7 @@ async def test_resource_run_reaches_completed(
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-1"),
+        ticket=None,
     )
 
     final = await _drive(runs, executor, run.run_id)
@@ -118,6 +119,7 @@ async def test_resource_run_rejected_stops_without_provisioning(
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-1"),
+        ticket=None,
     )
 
     final = await _drive(runs, executor, run.run_id)
@@ -143,6 +145,8 @@ async def test_engine_failure_run_fails_and_escalates(
     await workflows.register(
         make_workflow(identifier="run-automation", run_type=RunType.AUTOMATION)
     )
+    # The automation run attaches to a pre-existing RITM (as ServiceNow would supply on trigger).
+    seeded = servicenow.seed_ritm(correlation_id="user-created")
     run = await run_service.trigger(
         workflow_identifier="run-automation",
         created_by="jdoe",
@@ -150,6 +154,7 @@ async def test_engine_failure_run_fails_and_escalates(
         ticket_params={},
         workflow_params={},
         resource=None,
+        ticket=TicketRef(ticket_id=seeded.number, native_id=seeded.sys_id),
     )
 
     # After the engine step is triggered, mark the specific dag run failed with routing detail.
