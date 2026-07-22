@@ -123,6 +123,7 @@ class WorkflowRunTriggerRequest(BaseModel):
     ticket_params: dict[str, Any] = Field(default_factory=dict)     # provider template variables
     workflow_params: dict[str, Any] = Field(default_factory=dict)   # engine conf
     resource: ResourceSpec | None = None                            # resource workflows only
+    ticket: TicketRef | None = None                                 # existing RITM (automation only)
 
 
 class WorkflowRunResponse(BaseModel):
@@ -409,7 +410,13 @@ The orchestrator resolves `provision-vm` → `run_type=resource`, `engine=airflo
 `automation_id=provision_vm_dag`, catalog item to order — and builds the run. `created_by` is the
 ServiceNow `caller_id`/`sysparm_requested_for` and the resource `last_modified_by`.
 `ticket_params` are the catalog-item variables; `resource` is a typed `ResourceSpec` (validated
-at the HTTP boundary, not deep inside a step). An `automation` workflow omits `resource`.
+at the HTTP boundary, not deep inside a step).
+
+An `automation` workflow omits `resource` and instead supplies `ticket` — a `TicketRef`
+(`{ticket_id, native_id}`) for the RITM the caller already created. ServiceNow triggers these runs:
+a user opens an RITM, and a ServiceNow outbound REST action POSTs here with that RITM. The run
+**attaches** to it (there is no CREATE_TICKET step for automation) and closes it when the engine
+finishes. Triggering an automation workflow without a `ticket` is a `422`.
 
 ## What got simpler here (vs. the previous revision)
 

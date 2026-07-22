@@ -19,7 +19,9 @@ from orchestrator.ports import (
 )
 
 RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
-    RunType.AUTOMATION: (StepName.CREATE_TICKET, StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
+    # Automation runs attach to the caller's pre-existing RITM (supplied at trigger time), so there
+    # is no CREATE_TICKET step — the run only drives the engine and closes the ticket.
+    RunType.AUTOMATION: (StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
     RunType.RESOURCE: (
         StepName.CREATE_TICKET,
         StepName.AWAIT_APPROVAL,

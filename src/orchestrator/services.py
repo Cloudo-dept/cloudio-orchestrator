@@ -12,6 +12,8 @@ from orchestrator.domain import (
     RunState,
     RunStatus,
     RunType,
+    TicketRef,
+    TicketRefRequired,
     UnknownWorkflowError,
     Workflow,
     WorkflowRun,
@@ -50,6 +52,7 @@ class WorkflowRunService:
         ticket_params: dict[str, Any],
         workflow_params: dict[str, Any],
         resource: ResourceSpec | None,
+        ticket: TicketRef | None,
     ) -> WorkflowRun:
         logger.info("Trigger requested for workflow '{}' by {}.", workflow_identifier, created_by)
         wf = await self.workflows.get_by_identifier(workflow_identifier)
@@ -62,6 +65,12 @@ class WorkflowRunService:
                 workflow_identifier,
             )
             raise ResourceParamsRequired(workflow_identifier)
+        if wf.run_type is RunType.AUTOMATION and ticket is None:
+            logger.warning(
+                "Trigger rejected: workflow '{}' is an automation run but no ticket was supplied.",
+                workflow_identifier,
+            )
+            raise TicketRefRequired(workflow_identifier)
 
         state = RunState(
             workflow=ResolvedWorkflow(
@@ -73,6 +82,8 @@ class WorkflowRunService:
             ticket_params=ticket_params,
             workflow_params=workflow_params,
             resource=resource if wf.run_type is RunType.RESOURCE else None,
+            # Automation runs attach to the caller's existing RITM; resource runs create their own.
+            ticket=ticket if wf.run_type is RunType.AUTOMATION else None,
         )
         # scheduled_at defaults to now → a RunWorker claims it on its next scan.
         run = WorkflowRun(

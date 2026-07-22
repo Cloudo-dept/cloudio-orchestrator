@@ -12,7 +12,8 @@ just marks the existing record in-progress. Finalization is two independent step
 `FinalizeResourceStep` clears in-progress once the engine is done (resource runs only), and the
 shared `CloseTicketStep` closes the RITM:
 
-- **automation**: `creating_ticket → running_engine → closing_ticket`
+- **automation**: `running_engine → closing_ticket` — attaches to the caller's pre-existing RITM
+  (supplied at trigger time), so there is no `creating_ticket` step
 - **resource**: `creating_ticket → configuring_resource → running_engine → finalizing_resource → closing_ticket`
 
 ## `orchestration/plans.py` — run plans as data
@@ -27,7 +28,7 @@ from orchestrator.orchestration.steps import (ConfigureResourceStep, CloseTicket
 from orchestrator.ports import ResourceManagerClient, TicketSystemClient, WorkflowEngineClient
 
 RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
-    RunType.AUTOMATION: (StepName.CREATE_TICKET, StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
+    RunType.AUTOMATION: (StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
     RunType.RESOURCE: (StepName.CREATE_TICKET, StepName.CONFIGURE_RESOURCE, StepName.RUN_ENGINE,
                        StepName.FINALIZE_RESOURCE, StepName.CLOSE_TICKET),
 }

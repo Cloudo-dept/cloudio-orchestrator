@@ -92,9 +92,10 @@ async def test_automation_run_completes(runs, tickets, resources, engine, settin
     assert final.status is RunStatus.COMPLETED
     assert final.current_step is None
     assert final.scheduled_at is None
-    assert len(tickets.open_ticket_calls) == 1  # ticket opened exactly once
+    assert tickets.open_ticket_calls == []  # attaches to the caller's RITM — never opens one
     assert len(engine.trigger_calls) == 1  # engine triggered exactly once
-    assert tickets.closed and tickets.closed[0][1] == "CloudIO automation completed."
+    # It closes the caller's pre-existing RITM (from make_run) at the end.
+    assert tickets.closed == [("RITM0000001", "CloudIO automation completed.")]
     assert final.run_state.ticket_closed is True
 
 
@@ -137,7 +138,8 @@ async def test_engine_polls_until_success(runs, tickets, resources, settings) ->
 
 async def test_create_ticket_step_is_idempotent(tickets) -> None:
     step = CreateTicketStep(tickets)
-    run = make_run(run_type=RunType.AUTOMATION)
+    run = make_run(run_type=RunType.RESOURCE)  # resource runs open their own RITM
+    run.run_state.ticket = None  # not yet opened
 
     assert await step.execute(run) is True
     first = run.run_state.ticket
@@ -151,13 +153,15 @@ async def test_create_ticket_step_is_idempotent(tickets) -> None:
 async def test_transient_failure_retries_then_completes(runs, resources, engine, settings) -> None:
     tickets = FlakyTicketClient(fail_times=2)  # fails twice, then succeeds
     executor, _ = build_executor(runs, tickets, resources, engine, settings)
-    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=3))
+    # A resource run exercises CREATE_TICKET (automation runs attach to an existing RITM instead).
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=3))
 
     final = await drive(runs, executor, run.run_id, iters=20)
 
     assert final.status is RunStatus.COMPLETED
     assert final.run_state.step_attempts == {}  # cleared once the step succeeded
-    assert len(tickets.open_ticket_calls) == 1  # only the successful call is recorded
+    # FlakyTicketClient records only the successful open_ticket (the two failures raise first).
+    assert len(tickets.open_ticket_calls) == 1
 
 
 async def test_permanent_failure_marks_failed_and_escalates(
@@ -165,7 +169,8 @@ async def test_permanent_failure_marks_failed_and_escalates(
 ) -> None:
     tickets = FlakyTicketClient(fail_times=99)  # never succeeds
     executor, _ = build_executor(runs, tickets, resources, engine, settings)
-    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=1))
+    # A resource run fails at CREATE_TICKET (automation runs no longer have that step).
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=1))
 
     final = await drive(runs, executor, run.run_id, iters=20)
 
@@ -174,6 +179,9 @@ async def test_permanent_failure_marks_failed_and_escalates(
     # Escalation opened an Incident routed to the default team (no engine failure detail).
     assert len(tickets.incidents) == 1
     assert tickets.incidents[0]["responsible_group"] == "cloudio"
+    assert tickets.incidents[0]["summary"] == "Run execution failure"  # non-engine title
+    # description = exception type + message
+    assert tickets.incidents[0]["comment"] == "RuntimeError: ServiceNow unavailable"
     assert final.run_state.incident_id is not None
 
 
@@ -194,16 +202,19 @@ async def test_engine_failure_escalates_to_responsible_group(
     assert final.run_state.engine_failure.responsible_group == "netops"
     inc = tickets.incidents[-1]
     assert inc["responsible_group"] == "netops"
+    assert inc["summary"] == "Automation failure"  # engine-failure title
+    assert inc["comment"].startswith("RuntimeError: ")  # exception type + message
     assert inc["failed_task"] == "provision_vm"
     assert inc["flow_type"] == "dag-x"  # automation_id, since a task failed
-    # The RITM (opened before the engine step) gets a work note about the incident.
+    # The caller's attached RITM gets a work note about the incident.
     assert tickets.notes and "Incident" in tickets.notes[-1][1]
 
 
 async def test_deadline_exceeded_fails_the_step(runs, tickets, resources, engine, settings) -> None:
     executor, handlers = build_executor(runs, tickets, resources, engine, settings)
     handlers[StepName.CREATE_TICKET].max_step_duration_seconds = 0  # any elapsed time trips it
-    run = make_run(run_type=RunType.AUTOMATION, max_retries=0)
+    # CREATE_TICKET is a resource-run step now, so drive a resource run to reach it.
+    run = make_run(run_type=RunType.RESOURCE, max_retries=0)
     # Pretend the step has been in progress since well before now.
     from datetime import timedelta
 
@@ -283,6 +294,14 @@ def test_approval_gate_follows_ticket_for_resource_runs() -> None:
     # Resource runs wait for approval right after the ticket; automation runs do not gate.
     assert RUN_PLANS[RunType.RESOURCE][:2] == (StepName.CREATE_TICKET, StepName.AWAIT_APPROVAL)
     assert StepName.AWAIT_APPROVAL not in RUN_PLANS[RunType.AUTOMATION]
+
+
+def test_automation_plan_has_no_create_ticket_step() -> None:
+    # Automation runs attach to the caller's pre-existing RITM, so they never create one; the plan
+    # starts straight at RUN_ENGINE. CREATE_TICKET remains a resource-run step.
+    assert StepName.CREATE_TICKET not in RUN_PLANS[RunType.AUTOMATION]
+    assert RUN_PLANS[RunType.AUTOMATION][0] == StepName.RUN_ENGINE
+    assert StepName.CREATE_TICKET in RUN_PLANS[RunType.RESOURCE]
 
 
 def test_finalize_is_two_ordered_steps() -> None:
@@ -407,10 +426,11 @@ async def test_engine_final_vendor_id_overrides_finalize_target(
     final = await drive(runs, executor, run.run_id)
 
     assert final.status is RunStatus.COMPLETED
-    # The engine-reported id lands under data.vendor_id. Finalize PATCHes the record where it was
-    # created (the run id) and re-keys it to the engine-reported id as it marks it done.
+    # The engine-reported id lands in the RUN_ENGINE step result. Finalize PATCHes the record where
+    # it was created (the run id) and re-keys it to the engine-reported id as it marks it done.
     assert final.run_state.resource is not None
-    assert final.run_state.resource.data["vendor_id"] == "vm-engine-99"
+    assert final.run_state.resource.vendor_id == str(run.run_id)  # placeholder preserved
+    assert final.run_state.step_results[StepName.RUN_ENGINE].final_vendor_id == "vm-engine-99"
     assert resources.updated[-1] == (
         "proj-1",
         "vm",
@@ -431,4 +451,4 @@ async def test_finalize_falls_back_to_original_vendor_id(
 
     assert resources.updated[-1] == ("proj-1", "vm", str(run.run_id), {"in_progress": False})
     assert final.run_state.resource is not None
-    assert "vendor_id" not in final.run_state.resource.data
+    assert StepName.RUN_ENGINE not in final.run_state.step_results

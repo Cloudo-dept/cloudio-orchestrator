@@ -90,12 +90,14 @@ async def test_open_incident_routes_group_and_dag_fields(
         responsible_group="netops",
         flow_type="dag-x",
         failed_task="provision_vm",
+        comment="RuntimeError: quota exceeded",
     )
     assert ref.ticket_id.startswith("INC")
     body = servicenow.incidents[-1].body
     assert body["assignment_group"] == "CloudIO NetOps"  # mapped via responsible_groups
     assert body["u_cloudio_flow_type"] == "dag-x"
     assert body["u_cloudio_failed_task"] == "provision_vm"
+    assert body["work_notes"] == "RuntimeError: quota exceeded"  # comment → incident work note
 
 
 async def test_open_incident_unmapped_group_used_verbatim(

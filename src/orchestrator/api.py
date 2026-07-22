@@ -19,6 +19,8 @@ from orchestrator.domain import (
     RunState,
     RunStatus,
     RunType,
+    TicketRef,
+    TicketRefRequired,
     UnknownWorkflowError,
     Workflow,
     WorkflowAlreadyExistsError,
@@ -71,6 +73,7 @@ class WorkflowRunTriggerRequest(BaseModel):
     ticket_params: dict[str, Any] = Field(default_factory=dict)  # provider template variables
     workflow_params: dict[str, Any] = Field(default_factory=dict)  # engine conf
     resource: ResourceSpec | None = None  # resource workflows only
+    ticket: TicketRef | None = None  # the pre-existing ticket to attach to (automation only)
 
 
 class WorkflowRunResponse(BaseModel):
@@ -247,6 +250,7 @@ async def trigger_workflow_run(
             ticket_params=request.ticket_params,
             workflow_params=request.workflow_params,
             resource=request.resource,
+            ticket=request.ticket,
         )
     except UnknownWorkflowError:
         raise HTTPException(
@@ -256,6 +260,11 @@ async def trigger_workflow_run(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="resource is required for a resource workflow.",
+        ) from None
+    except TicketRefRequired:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ticket is required for an automation workflow.",
         ) from None
 
 

@@ -6,10 +6,14 @@ from orchestrator.domain import (
     ResourceParamsRequired,
     RunStatus,
     RunType,
+    TicketRef,
+    TicketRefRequired,
     UnknownWorkflowError,
 )
 from orchestrator.services import WorkflowRunService, WorkflowService
 from tests.factories import make_resource_spec, make_workflow
+
+RITM = TicketRef(ticket_id="RITM0000001", native_id="sys1")  # a caller-supplied automation ticket
 
 
 async def test_register_and_get_workflow(workflows) -> None:
@@ -35,6 +39,7 @@ async def test_trigger_builds_run_from_snapshot(runs, workflows) -> None:
         ticket_params={"v": 1},
         workflow_params={"size": "L"},
         resource=None,
+        ticket=RITM,
     )
 
     assert run.run_type is RunType.AUTOMATION
@@ -46,6 +51,8 @@ async def test_trigger_builds_run_from_snapshot(runs, workflows) -> None:
     assert run.run_state.workflow.automation_id == "dag-x"
     assert run.run_state.workflow_params == {"size": "L"}
     assert run.run_state.resource is None
+    # The caller's pre-existing RITM was attached — the run will not open its own.
+    assert run.run_state.ticket == RITM
     # And it was persisted.
     assert await svc.get(run.run_id) is not None
 
@@ -61,11 +68,31 @@ async def test_trigger_resource_workflow_carries_spec(runs, workflows) -> None:
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-9"),
+        ticket=None,
     )
 
     assert run.run_type is RunType.RESOURCE
     assert run.run_state.resource is not None
     assert run.run_state.resource.vendor_id == "vm-9"
+    assert run.run_state.ticket is None  # resource runs open their own RITM downstream
+
+
+async def test_trigger_resource_ignores_supplied_ticket(runs, workflows) -> None:
+    # A ticket handed to a resource run is dropped — resource runs always create their own RITM.
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    svc = WorkflowRunService(runs, workflows)
+
+    run = await svc.trigger(
+        workflow_identifier="provision-vm",
+        created_by="jdoe",
+        max_retries=3,
+        ticket_params={},
+        workflow_params={},
+        resource=make_resource_spec(vendor_id="vm-9"),
+        ticket=RITM,
+    )
+
+    assert run.run_state.ticket is None
 
 
 async def test_trigger_unknown_workflow_raises(runs, workflows) -> None:
@@ -78,6 +105,7 @@ async def test_trigger_unknown_workflow_raises(runs, workflows) -> None:
             ticket_params={},
             workflow_params={},
             resource=None,
+            ticket=None,
         )
 
 
@@ -92,6 +120,24 @@ async def test_trigger_resource_without_spec_raises(runs, workflows) -> None:
             ticket_params={},
             workflow_params={},
             resource=None,
+            ticket=None,
+        )
+
+
+async def test_trigger_automation_without_ticket_raises(runs, workflows) -> None:
+    await workflows.register(
+        make_workflow(identifier="run-automation", run_type=RunType.AUTOMATION)
+    )
+    svc = WorkflowRunService(runs, workflows)
+    with pytest.raises(TicketRefRequired):
+        await svc.trigger(
+            workflow_identifier="run-automation",
+            created_by="jdoe",
+            max_retries=3,
+            ticket_params={},
+            workflow_params={},
+            resource=None,
+            ticket=None,
         )
 
 
@@ -105,6 +151,7 @@ async def test_find_by_ticket_and_resource(runs, workflows) -> None:
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-7"),
+        ticket=None,
     )
 
     found = await svc.find_by_resource_id("vm-7")

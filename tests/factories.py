@@ -7,6 +7,7 @@ from orchestrator.domain import (
     RunState,
     RunStatus,
     RunType,
+    TicketRef,
     Workflow,
     WorkflowEngineType,
     WorkflowRun,
@@ -67,6 +68,8 @@ def make_run(
         ticket_params={"catalog_variable_1": "value"},
         workflow_params={"size": "large"},
         resource=make_resource_spec() if with_resource else None,
+        # Automation runs attach to the caller's pre-existing RITM; resource runs open their own.
+        ticket=None if with_resource else TicketRef(ticket_id="RITM0000001", native_id="sys1"),
     )
     return WorkflowRun(
         run_type=run_type,
