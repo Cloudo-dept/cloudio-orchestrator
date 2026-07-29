@@ -4,11 +4,10 @@ Templates are catalog items, tickets are RITMs (sc_req_item), incidents are INCs
 vocabulary is confined to this class. Create idempotency is orchestrator-added: the RITM is tagged
 with correlation_id and looked up before re-ordering.
 """
-
-from typing import Any
+from loguru import logger
+from typing 
 
 import httpx
-from loguru import logger
 
 from orchestrator.domain import ApprovalStatus, TicketRef
 from orchestrator.ports import TicketSystemClient
@@ -27,13 +26,13 @@ class ServiceNowTicketClient(TicketSystemClient):
         username: str,
         password: str,
         responsible_groups: dict[str, str],
-        timeout: float = 60.0,
+        timeout: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._auth = (username, password)
         self._groups = responsible_groups
-        self._timeout = 60
+        self._timeout = timeout
         self._transport = transport  # test seam (11-testing); None in prod
 
     def _client(self) -> httpx.AsyncClient:
@@ -65,20 +64,17 @@ class ServiceNowTicketClient(TicketSystemClient):
         resp.raise_for_status()
         rows = resp.json().get("result", [])
         return TicketRef(ticket_id=rows[0]["number"], native_id=rows[0]["sys_id"]) if rows else None
-
-    async def _find_user_sys_id(self, client: httpx.AsyncClient, user_param: str) -> str | None:
-        # order_now wants sys_user.sys_id, not the login name the orchestrator carries around.
-        resp = await client.get(
-            "/api/now/table/sys_user",
-            params={
-                "sysparm_query": f"user_param={user_param}",
-                "sysparm_fields": "sys_id",
-                "sysparm_limit": 1,
-            },
-        )
-        resp.raise_for_status()
-        rows = resp.json().get("result", [])
-        return str(rows[0]["sys_id"]) if rows else None
+    
+    async def _get_table_record(self, table_name: str, record_key: str, record_value: str) -> dict:
+        async with self._client() as client:
+            resp = await client.get(f"/api/now/table/{table_name}",
+                params = {
+                    'sysparm_query': f'{record_key}={record_value}',
+                    'sysparm_limit': 1
+                }
+            )
+            resp.raise_for_status()
+            return resp.json()
 
     async def open_ticket(
         self, template_id: str, fields: dict[str, Any], requested_by: str, idempotency_key: str
@@ -88,17 +84,18 @@ class ServiceNowTicketClient(TicketSystemClient):
             found = await self._find_ritm(client, idempotency_key)
             if found:  # already ordered -> idempotent
                 return found
-            requested_for = await self._find_user_sys_id(client, requested_by)
+            user_record = await self._get_table_record(table_name='sys_user', record_key='user_param', record_value=requested_by)
+            requested_by_sys_id = user_record['result'][0]['sys_id']
             order = await client.post(
                 f"/api/sn_sc/servicecatalog/items/{template_id}/order_now",
                 json={
                     "variables": fields,
                     "sysparm_quantity": 1,
-                    "sysparm_requested_for": requested_for or requested_by,
+                    "sysparm_requested_for": requested_by_sys_id,
                 },
             )
+            logger.info("Created a new request: {}", order.json())
             order.raise_for_status()
-            logger.info("Ordered catalog item {} for {}", template_id, requested_by)
             request_sys_id = order.json()["result"]["sys_id"]
             ritm = await client.get(
                 "/api/now/table/sc_req_item",
@@ -110,12 +107,14 @@ class ServiceNowTicketClient(TicketSystemClient):
             )
             ritm.raise_for_status()
             r = ritm.json()["result"][0]
-            logger.info("Created RITM {}", r["number"])
+            logger.info("Created RITM: {}", r["number"])
+
             await client.patch(
                 f"/api/now/table/sc_req_item/{r['sys_id']}",
                 json={"correlation_id": idempotency_key},
             )
             return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
+
 
     async def get_approval_status(self, ticket: TicketRef) -> ApprovalStatus:
         async with self._client() as client:
@@ -124,6 +123,7 @@ class ServiceNowTicketClient(TicketSystemClient):
                 params={"sysparm_fields": "approval"},
             )
             resp.raise_for_status()
+            logger.info("RITM Status: {}", resp.json())
             approval = resp.json()["result"].get("approval", "")
         return self._APPROVAL_MAP.get(approval, ApprovalStatus.PENDING)
 
@@ -141,7 +141,6 @@ class ServiceNowTicketClient(TicketSystemClient):
         responsible_group: str,
         flow_type: str | None = None,
         failed_task: str | None = None,
-        comment: str | None = None,
     ) -> TicketRef:
         body: dict[str, Any] = {
             "u_noc": True,
@@ -158,8 +157,6 @@ class ServiceNowTicketClient(TicketSystemClient):
         if flow_type and failed_task:  # DAG-run failures only
             body["u_cloudio_flow_type"] = flow_type
             body["u_cloudio_failed_task"] = failed_task
-        if comment:  # attach the failure detail (exception message) as a work note
-            body["work_notes"] = comment
         async with self._client() as client:
             resp = await client.post("/api/now/table/incident", json=body)
             resp.raise_for_status()
