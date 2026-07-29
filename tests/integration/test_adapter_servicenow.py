@@ -21,6 +21,18 @@ async def test_open_ticket_orders_then_returns_ritm(
     assert ref.ticket_id.startswith("RITM") and ref.native_id
     # The created RITM was tagged with the idempotency key for later lookup.
     assert servicenow.ritms[-1].correlation_id == "run-1:creating_ticket:0"
+    # The login was resolved to a sys_user sys_id before ordering.
+    assert servicenow.ritms[-1].requested_for == servicenow.users["jdoe"]
+
+
+async def test_open_ticket_falls_back_to_login_when_user_unknown(
+    servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
+) -> None:
+    ref = await servicenow_client.open_ticket(
+        template_id="cat-1", fields={}, requested_by="ghost", idempotency_key="k"
+    )
+    ritm = next(r for r in servicenow.ritms if r.sys_id == ref.native_id)
+    assert ritm.requested_for == "ghost"  # no sys_user row → order with the raw login
 
 
 async def test_open_ticket_is_idempotent_on_retry(

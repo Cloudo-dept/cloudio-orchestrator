@@ -8,6 +8,7 @@ with correlation_id and looked up before re-ordering.
 from typing import Any
 
 import httpx
+from loguru import logger
 
 from orchestrator.domain import ApprovalStatus, TicketRef
 from orchestrator.ports import TicketSystemClient
@@ -65,6 +66,20 @@ class ServiceNowTicketClient(TicketSystemClient):
         rows = resp.json().get("result", [])
         return TicketRef(ticket_id=rows[0]["number"], native_id=rows[0]["sys_id"]) if rows else None
 
+    async def _find_user_sys_id(self, client: httpx.AsyncClient, user_param: str) -> str | None:
+        # order_now wants sys_user.sys_id, not the login name the orchestrator carries around.
+        resp = await client.get(
+            "/api/now/table/sys_user",
+            params={
+                "sysparm_query": f"user_param={user_param}",
+                "sysparm_fields": "sys_id",
+                "sysparm_limit": 1,
+            },
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("result", [])
+        return str(rows[0]["sys_id"]) if rows else None
+
     async def open_ticket(
         self, template_id: str, fields: dict[str, Any], requested_by: str, idempotency_key: str
     ) -> TicketRef:
@@ -73,15 +88,17 @@ class ServiceNowTicketClient(TicketSystemClient):
             found = await self._find_ritm(client, idempotency_key)
             if found:  # already ordered -> idempotent
                 return found
+            requested_for = await self._find_user_sys_id(client, requested_by)
             order = await client.post(
                 f"/api/sn_sc/servicecatalog/items/{template_id}/order_now",
                 json={
                     "variables": fields,
                     "sysparm_quantity": 1,
-                    "sysparm_requested_for": requested_by,
+                    "sysparm_requested_for": requested_for or requested_by,
                 },
             )
             order.raise_for_status()
+            logger.info("Ordered catalog item {} for {}", template_id, requested_by)
             request_sys_id = order.json()["result"]["sys_id"]
             ritm = await client.get(
                 "/api/now/table/sc_req_item",
@@ -93,6 +110,7 @@ class ServiceNowTicketClient(TicketSystemClient):
             )
             ritm.raise_for_status()
             r = ritm.json()["result"][0]
+            logger.info("Created RITM {}", r["number"])
             await client.patch(
                 f"/api/now/table/sc_req_item/{r['sys_id']}",
                 json={"correlation_id": idempotency_key},
