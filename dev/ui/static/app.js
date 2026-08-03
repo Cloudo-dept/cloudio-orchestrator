@@ -61,36 +61,84 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
-// A param value is sent as JSON when it parses (numbers, bools, objects, arrays),
-// otherwise kept as a plain string — so both `3` and `hello` do the right thing.
-function coerce(raw) {
-  const v = raw.trim();
-  if (v === "") return "";
-  try { return JSON.parse(v); } catch { return raw; }
-}
 function csvList(raw) {
   return (raw || "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-// --- key/value param editors -------------------------------------------------
-function kvRow() {
-  const row = document.createElement("div");
-  row.className = "kv-row";
-  row.innerHTML = `<input class="kv-key" placeholder="key" />
-    <input class="kv-val" placeholder="value (json or text)" />
-    <button type="button" class="btn btn-sm btn-ghost kv-del" title="remove">✕</button>`;
-  return row;
-}
-function readKV(name) {
-  const out = {};
-  $$(`.kv[data-kv="${name}"] .kv-row`).forEach((row) => {
-    const key = row.querySelector(".kv-key").value.trim();
-    if (!key) return;
-    out[key] = coerce(row.querySelector(".kv-val").value);
+// --- JSON param editors (Monaco) ---------------------------------------------
+// Every free-form param set the API types as `dict[str, Any]` gets an editor, so payloads are
+// authored as the JSON they are sent as — nested objects and arrays included.
+const jsonEditors = {}; // name -> monaco editor, populated once Monaco finishes loading
+
+// Monaco's language services run in a worker; see static/monaco-worker.js.
+self.MonacoEnvironment = { getWorkerUrl: () => "/monaco-worker.js" };
+
+require.config({ paths: { vs: "/vendor/monaco/vs" } });
+require(["vs/editor/editor.main"], () => {
+  // The console is dark; repaint the editor's chrome in the same palette as styles.css.
+  monaco.editor.defineTheme("orchestrator", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [],
+    colors: { "editor.background": "#0d1117", "editorGutter.background": "#0d1117" },
   });
-  return out;
+  // Every model here is a param set, so one schema covers them all: the API rejects anything
+  // that is not a JSON object, and this surfaces that in the editor instead of on submit.
+  monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
+    validate: true,
+    schemas: [{
+      uri: "https://orchestrator.dev/schemas/params.json",
+      fileMatch: ["*"],
+      schema: { type: "object" },
+    }],
+  });
+  $$(".json-editor").forEach((el) => {
+    jsonEditors[el.dataset.json] = monaco.editor.create(el, {
+      value: "{}",
+      language: "json",
+      theme: "orchestrator",
+      automaticLayout: true, // the trigger form starts hidden — relayout when it is revealed
+      minimap: { enabled: false },
+      scrollBeyondLastLine: false,
+      lineNumbers: "off",
+      folding: false,
+      tabSize: 2,
+      fontSize: 12.5,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      renderLineHighlight: "none",
+      overviewRulerLanes: 0,
+      scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
+    });
+  });
+});
+
+// Read one editor as a param object. Throws with a message naming the field, which the submit
+// handler turns into an inline error — the run is never triggered with a half-written payload.
+function readJSON(name) {
+  const editor = jsonEditors[name];
+  if (!editor) throw new Error(`${name}: editor is still loading — try again in a moment.`);
+  const raw = editor.getValue().trim();
+  if (raw === "") return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`${name}: ${err.message}`);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const got = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed;
+    throw new Error(`${name}: must be a JSON object, got ${got}.`);
+  }
+  return parsed;
 }
-function clearKV(name) { $(`.kv[data-kv="${name}"]`).innerHTML = ""; }
+
+function showJSONError(message) {
+  $$(".json-error").forEach((el) => { el.textContent = ""; });
+  if (!message) return;
+  // Messages are prefixed with the field name (see readJSON) — route it to that field's slot.
+  const el = $(`.json-error[data-json-error="${message.split(":")[0]}"]`);
+  if (el) el.textContent = message.slice(message.indexOf(":") + 1).trim();
+}
 
 // =============================================================================
 // WORKFLOWS
@@ -242,13 +290,17 @@ $("#trigger-form").addEventListener("submit", async (e) => {
   const f = new FormData(e.target);
   const opt = $("#trigger-workflow").selectedOptions[0];
   if (!opt || !opt.value) return fail("Trigger failed", "Select a workflow first.");
+
+  // Parse every JSON editor before touching the API, so a malformed payload is reported
+  // against its own field rather than as a server-side validation error.
+  let body;
   try {
-    const body = {
+    body = {
       workflow_identifier: opt.value,
       created_by: f.get("created_by"),
       max_retries: parseInt(f.get("max_retries"), 10),
-      ticket_params: readKV("ticket_params"),
-      workflow_params: readKV("workflow_params"),
+      ticket_params: readJSON("ticket_params"),
+      workflow_params: readJSON("workflow_params"),
     };
     if (opt.dataset.runType === "resource") {
       body.resource = {
@@ -260,12 +312,19 @@ $("#trigger-form").addEventListener("submit", async (e) => {
         description: f.get("res_description") || "",
         tags: csvList(f.get("res_tags")),
         alert_groups: csvList(f.get("res_alert_groups")),
-        data: readKV("res_data"),
+        data: readJSON("res_data"),
       };
       // Only for update/delete of an existing record — a create is assigned the run id server-side.
       const vendorId = (f.get("res_vendor_id") || "").trim();
       if (vendorId) body.resource.vendor_id = vendorId;
     }
+    showJSONError(null);
+  } catch (err) {
+    showJSONError(err.message);
+    return fail("Invalid JSON", err);
+  }
+
+  try {
     const run = await api("POST", "/workflow-runs", body);
     ok("Run triggered", `Run ${run.run_id.slice(0, 8)}… is ${run.status}.`);
     e.target.hidden = true;
@@ -291,15 +350,17 @@ $("#trigger-workflow").addEventListener("change", toggleResourceFields);
 
 document.addEventListener("click", async (e) => {
   const t = e.target.closest(
-    "[data-tab],[data-act],[data-wf-view],[data-wf-edit],[data-run-view],[data-kv-add],.kv-del");
+    "[data-tab],[data-act],[data-wf-view],[data-wf-edit],[data-run-view],[data-json-format]");
   if (!t) return;
   const d = t.dataset;
 
   if (d.tab) return selectTab(d.tab);
 
-  // key/value editor row controls (no try/catch needed — pure DOM)
-  if (d.kvAdd) return void $(`.kv[data-kv="${d.kvAdd}"]`).appendChild(kvRow());
-  if (t.classList.contains("kv-del")) return void t.closest(".kv-row").remove();
+  // Same as Shift+Alt+F in the editor, surfaced as a button for discoverability.
+  if (d.jsonFormat) {
+    const editor = jsonEditors[d.jsonFormat];
+    return void (editor && editor.getAction("editor.action.formatDocument").run());
+  }
 
   try {
     if (d.act === "new-workflow") openWorkflowForm(null);
@@ -326,10 +387,6 @@ document.addEventListener("click", async (e) => {
 // =============================================================================
 // BOOT
 // =============================================================================
-// Seed one empty row in each param editor so the fields are discoverable.
-["ticket_params", "workflow_params", "res_data"].forEach((name) =>
-  $(`.kv[data-kv="${name}"]`).appendChild(kvRow()));
-
 renderWorkflows();
 renderRuns();
 tick();

@@ -108,6 +108,9 @@ This starts:
   standalone stdlib server (`dev/ui/`) that serves the static GUI and reverse-proxies `/api` to the
   orchestrator, so the API stays untouched. Run it outside compose with
   `python dev/ui/server.py` (set `ORCH_API_BASE` if the API isn't on `localhost:8000`).
+  `ticket_params`, `workflow_params`, and `resource.data` are authored as JSON in a Monaco editor —
+  vendored under `dev/ui/static/vendor/monaco/` (see its README) so the console needs no CDN, no
+  npm, and no build step.
 
 `ORCH_DATABASE_URL`, `ORCH_AIRFLOW_BASE_URL`, and `ORCH_PM_BASE_URL` are set by compose to point at
 those services, overriding `.env` (only the Airflow/ServiceNow/PM *credentials* come from `.env`).
