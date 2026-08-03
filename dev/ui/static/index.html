@@ -95,14 +95,20 @@
 
         <fieldset class="params">
           <legend>ticket_params <span class="muted small">— template variables sent to the ticket system</span></legend>
-          <div class="kv" data-kv="ticket_params"></div>
-          <button type="button" class="btn btn-sm" data-kv-add="ticket_params">+ add field</button>
+          <div class="json-editor" data-json="ticket_params"></div>
+          <div class="json-foot">
+            <span class="json-error" data-json-error="ticket_params"></span>
+            <button type="button" class="btn btn-sm btn-ghost" data-json-format="ticket_params">Format</button>
+          </div>
         </fieldset>
 
         <fieldset class="params">
-          <legend>workflow_params <span class="muted small">— conf passed through to the engine (DAG run)</span></legend>
-          <div class="kv" data-kv="workflow_params"></div>
-          <button type="button" class="btn btn-sm" data-kv-add="workflow_params">+ add field</button>
+          <legend>workflow_params <span class="muted small">— the payload passed through to the engine, verbatim (Airflow: the DAG run conf)</span></legend>
+          <div class="json-editor" data-json="workflow_params"></div>
+          <div class="json-foot">
+            <span class="json-error" data-json-error="workflow_params"></span>
+            <button type="button" class="btn btn-sm btn-ghost" data-json-format="workflow_params">Format</button>
+          </div>
         </fieldset>
 
         <fieldset class="params" id="resource-fields" hidden>
@@ -123,8 +129,11 @@
           </div>
           <fieldset class="params">
             <legend>data <span class="muted small">— free-form resource attributes</span></legend>
-            <div class="kv" data-kv="res_data"></div>
-            <button type="button" class="btn btn-sm" data-kv-add="res_data">+ add field</button>
+            <div class="json-editor" data-json="res_data"></div>
+            <div class="json-foot">
+              <span class="json-error" data-json-error="res_data"></span>
+              <button type="button" class="btn btn-sm btn-ghost" data-json-format="res_data">Format</button>
+            </div>
           </fieldset>
         </fieldset>
 
@@ -148,9 +157,11 @@
     </section>
 
     <p class="footnote muted small">
-      Tables load the full server-side lists automatically every 5s. Values you type into a param
-      field are sent as JSON when they parse as JSON (numbers, <code>true</code>, objects), otherwise
-      as a plain string. The API exposes no update/delete, so rows have no edit/remove action.
+      Tables load the full server-side lists automatically every 5s. Param editors send their
+      contents as JSON exactly as written — nested objects and arrays reach the engine untouched.
+      Each must be a JSON object (<code>{…}</code>); errors are flagged inline and the trigger is
+      refused. <code>Shift+Alt+F</code> formats. The API exposes no delete, so rows have no
+      remove action.
     </p>
   </main>
 
@@ -166,6 +177,7 @@
   <!-- Toasts -->
   <div id="toasts" class="toasts"></div>
 
+  <script src="vendor/monaco/vs/loader.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

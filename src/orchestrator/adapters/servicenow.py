@@ -76,6 +76,17 @@ class ServiceNowTicketClient(TicketSystemClient):
             resp.raise_for_status()
             return resp.json()
 
+    async def _get_table_record(self, table_name: str, record_key: str, record_value: str) -> dict:
+        async with self._client() as client:
+            resp = await client.get(f"api/now/table/{table_name}",
+                params= {
+                    'sysparm_query': f'{record_key}={record_value}',
+                    'sysparm_limit': 1
+                }
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     async def open_ticket(
         self, template_id: str, fields: dict[str, Any], requested_by: str, idempotency_key: str
     ) -> TicketRef:
