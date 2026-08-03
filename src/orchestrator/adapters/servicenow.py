@@ -84,7 +84,7 @@ class ServiceNowTicketClient(TicketSystemClient):
             found = await self._find_ritm(client, idempotency_key)
             if found:  # already ordered -> idempotent
                 return found
-            user_record = await self._get_table_record(table_name='sys_user_list')
+            user_record = await self._get_table_record(table_name='sys_user', record_key='user_name', record_value=requested_by)
             requested_by_sys_id = user_record['result'][0]['sys_id']
             order = await client.post(
                 f"/api/sn_sc/servicecatalog/items/{template_id}/order_now",
