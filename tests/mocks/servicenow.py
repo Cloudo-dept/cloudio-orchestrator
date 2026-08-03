@@ -18,6 +18,7 @@ class Ritm:
     state: int | None = None
     approval: str = "requested"  # ServiceNow RITM approval field: requested/approved/rejected
     work_notes: list[str] = field(default_factory=list)
+    requested_for: str | None = None  # sysparm_requested_for the order was placed with
 
 
 @dataclass
@@ -34,6 +35,7 @@ class ServiceNowMock:
     overrides: list[Override] = field(default_factory=list)
     requests: list[tuple[str, str]] = field(default_factory=list)
     default_approval: str = "approved"  # approval state ordered RITMs come back with
+    users: dict[str, str] = field(default_factory=lambda: {"jdoe": "usersys0000001"})
     _seq: int = 0
 
     def _mint(self, prefix: str) -> tuple[str, str]:
@@ -77,6 +79,13 @@ def _build(mock: ServiceNowMock) -> FastAPI:
             hits = []
         return {"result": [{"number": r.number, "sys_id": r.sys_id} for r in hits[:1]]}
 
+    @app.get("/api/now/table/sys_user")
+    async def query_user(sysparm_query: str = "") -> dict[str, Any]:
+        # user_param=<login>; unknown logins return no rows, like the real table
+        field_name, _, value = sysparm_query.partition("=")
+        sys_id = mock.users.get(value) if field_name == "user_param" else None
+        return {"result": [{"sys_id": sys_id}] if sys_id else []}
+
     @app.get("/api/now/table/sc_req_item/{sys_id}")
     async def get_ritm(sys_id: str) -> dict[str, Any]:
         r = next(r for r in mock.ritms if r.sys_id == sys_id)
@@ -92,6 +101,7 @@ def _build(mock: ServiceNowMock) -> FastAPI:
                 sys_id=sys_id,
                 request_sys_id=request_sys_id,
                 approval=mock.default_approval,
+                requested_for=body.get("sysparm_requested_for"),
             )
         )
         return {"result": {"sys_id": request_sys_id}}
