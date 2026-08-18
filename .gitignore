@@ -9,3 +9,4 @@ __pycache__/
 # Local config & scratch
 .env
 tmp/
+config/log-config.json

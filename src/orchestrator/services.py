@@ -1,9 +1,8 @@
 """Use-cases the API delegates to."""
 
+import logging
 import uuid
 from typing import Any
-
-from loguru import logger
 
 from orchestrator.domain import (
     ResolvedWorkflow,
@@ -19,6 +18,8 @@ from orchestrator.domain import (
     WorkflowRun,
 )
 from orchestrator.ports import WorkflowRepository, WorkflowRunRepository
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowService:
@@ -54,20 +55,20 @@ class WorkflowRunService:
         resource: ResourceSpec | None,
         ticket: TicketRef | None,
     ) -> WorkflowRun:
-        logger.info("Trigger requested for workflow '{}' by {}.", workflow_identifier, created_by)
+        logger.info("Trigger requested for workflow '%s' by %s.", workflow_identifier, created_by)
         wf = await self.workflows.get_by_identifier(workflow_identifier)
         if wf is None:
-            logger.warning("Trigger rejected: unknown workflow '{}'.", workflow_identifier)
+            logger.warning("Trigger rejected: unknown workflow '%s'.", workflow_identifier)
             raise UnknownWorkflowError(workflow_identifier)
         if wf.run_type is RunType.RESOURCE and resource is None:
             logger.warning(
-                "Trigger rejected: workflow '{}' is a resource run but no resource was supplied.",
+                "Trigger rejected: workflow '%s' is a resource run but no resource was supplied.",
                 workflow_identifier,
             )
             raise ResourceParamsRequired(workflow_identifier)
         if wf.run_type is RunType.AUTOMATION and ticket is None:
             logger.warning(
-                "Trigger rejected: workflow '{}' is an automation run but no ticket was supplied.",
+                "Trigger rejected: workflow '%s' is an automation run but no ticket was supplied.",
                 workflow_identifier,
             )
             raise TicketRefRequired(workflow_identifier)
@@ -96,7 +97,7 @@ class WorkflowRunService:
         )
         created = await self.runs.create(run)
         logger.info(
-            "Created run {} (type={}) for workflow '{}'; queued for immediate pickup.",
+            "Created run %s (type=%s) for workflow '%s'; queued for immediate pickup.",
             created.run_id,
             created.run_type,
             wf.identifier,
@@ -129,13 +130,13 @@ class RunCallbackService:
     async def wake_by_ticket(self, ticket_id: str) -> int:
         runs = await self.runs.find_by_ticket_id(ticket_id)
         woken = await self._wake_all(runs)
-        logger.info("Ticket callback for {}: woke {} run(s) to re-poll now.", ticket_id, woken)
+        logger.info("Ticket callback for %s: woke %s run(s) to re-poll now.", ticket_id, woken)
         return woken
 
     async def wake_by_engine_run(self, engine_run_id: str) -> int:
         runs = await self.runs.find_by_engine_run_id(engine_run_id)
         woken = await self._wake_all(runs)
-        logger.info("Engine callback for {}: woke {} run(s) to re-poll now.", engine_run_id, woken)
+        logger.info("Engine callback for %s: woke %s run(s) to re-poll now.", engine_run_id, woken)
         return woken
 
     async def _wake_all(self, runs: list[WorkflowRun]) -> int:

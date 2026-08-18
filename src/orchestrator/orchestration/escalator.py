@@ -1,9 +1,11 @@
 """The failure model: on permanent step failure, open an Incident and note the RITM. No rollback."""
 
-from loguru import logger
+import logging
 
 from orchestrator.domain import WorkflowRun
 from orchestrator.ports import TicketSystemClient
+
+logger = logging.getLogger(__name__)
 
 
 class FailureEscalator:
@@ -26,7 +28,7 @@ class FailureEscalator:
             title = "Run execution failure"
             group = self.default_team
         logger.info(
-            "Escalating run {} failure to group '{}' (opening incident).", run.run_id, group
+            "Escalating run %s failure to group '%s' (opening incident).", run.run_id, group
         )
         try:
             inc = await self.ticket.open_incident(
@@ -38,13 +40,13 @@ class FailureEscalator:
                 comment=detail,
             )
             st.incident_id = inc.ticket_id
-            logger.info("Opened incident {} for run {}.", inc.ticket_id, run.run_id)
+            logger.info("Opened incident %s for run %s.", inc.ticket_id, run.run_id)
             if st.ticket is not None:
                 await self.ticket.annotate_ticket(
                     st.ticket, f"Incident {inc.ticket_id} opened for failure: {error}"
                 )
                 logger.debug(
-                    "Annotated ticket {} with incident {}.", st.ticket.ticket_id, inc.ticket_id
+                    "Annotated ticket %s with incident %s.", st.ticket.ticket_id, inc.ticket_id
                 )
         except Exception as e:  # never let escalation crash the worker
-            logger.exception("Failed to escalate run {} failure: {}", run.run_id, e)
+            logger.exception("Failed to escalate run %s failure: %s", run.run_id, e)

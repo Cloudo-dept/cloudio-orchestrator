@@ -10,7 +10,7 @@ straight from the run store (`scheduled_at` + `FOR UPDATE SKIP LOCKED`) and driv
 lease provides at-least-once and crash recovery. The full design lives in **[docs/](docs/README.md)**.
 
 - **Stack:** Python 3.12 · [uv](https://docs.astral.sh/uv/) · FastAPI · Pydantic v2 · SQLModel ·
-  SQLAlchemy (async) + asyncpg · Alembic · Typer.
+  SQLAlchemy (async) + asyncpg · Alembic · Typer · ecs-logging.
 - **Gates:** `ruff` (lint + format), `mypy --strict`, `pytest`.
 
 ## Requirements
@@ -44,6 +44,20 @@ cp .env.example .env
 ```
 
 See [.env.example](.env.example) for every setting and its default.
+
+### Logging
+
+Logs go to **stdout only** — there are no log files, and the log shipper owns everything
+downstream. Mount a `logging.config.dictConfig` document at
+**`/opt/app/config/log-config.json`** to get ECS-compatible JSON
+(`ecs_logging.StdlibFormatter`); [config/log-config.example.json](config/log-config.example.json)
+is a ready-to-use copy, and docker-compose mounts it for you. Without that file the process
+falls back to a plain readable one-line format, still on stdout — which is what you get from a
+local `uv run`. `ORCH_LOG_LEVEL` sets the threshold either way.
+
+Records logged while serving a request also carry `cloudio.operation.http.url`,
+`.query_params` and `.path_params`. Query strings are logged verbatim, so treat the URL field
+as a disclosure surface. See [docs/08-entrypoints.md](docs/08-entrypoints.md#logging).
 
 ## Run
 
@@ -161,6 +175,7 @@ All three must be clean; `mypy` runs in strict mode.
 ```text
 src/orchestrator/
 ├── config.py          # Settings (pydantic-settings)
+├── log.py             # configure_logging · LOG_CONFIG_PATH · request log context
 ├── domain.py          # enums · value objects · RunState · WorkflowRun/Workflow (SQLModel)
 ├── ports.py           # the five ABCs (two repositories, three clients)
 ├── services.py        # WorkflowService · WorkflowRunService

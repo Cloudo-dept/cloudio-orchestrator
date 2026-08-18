@@ -15,7 +15,7 @@ dependencies = [
     "httpx",
     "alembic",
     "typer",
-    "loguru",
+    "ecs-logging==2.1.0",
 ]
 
 [dependency-groups]
@@ -43,7 +43,7 @@ line-length = 100
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ASYNC"]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "G", "LOG"]
 # `class X(str, Enum)` is the deliberate idiom here (native-enum persistence relies on the values);
 # StrEnum (UP042) is not adopted.
 ignore = ["UP042"]

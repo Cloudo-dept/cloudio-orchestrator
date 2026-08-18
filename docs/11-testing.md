@@ -429,15 +429,16 @@ The happy paths need no scripting; error paths flip one knob:
 ```python
 async def test_open_ticket_orders_then_returns_ritm(servicenow, servicenow_client):
     ref = await servicenow_client.open_ticket(template_id="cat-1", fields={"size": "L"},
-                                              requested_by="jdoe", idempotency_key="run-1:ticket:0")
+                                              requested_by="jdoe",
+                                              idempotency_key="run-1:creating_ticket")
     assert ref.ticket_id.startswith("RITM") and ref.native_id
-    assert servicenow.ritms[-1].correlation_id == "run-1:ticket:0"      # tagged for idempotency
+    assert servicenow.ritms[-1].correlation_id == "run-1:creating_ticket"  # tagged for idempotency
 
 
 async def test_open_ticket_is_idempotent_on_retry(servicenow, servicenow_client):
-    servicenow.seed_ritm(correlation_id="run-1:ticket:0")               # pretend already ordered
+    servicenow.seed_ritm(correlation_id="run-1:creating_ticket")        # pretend already ordered
     await servicenow_client.open_ticket(template_id="cat-1", fields={}, requested_by="jdoe",
-                                        idempotency_key="run-1:ticket:0")
+                                        idempotency_key="run-1:creating_ticket")
     assert not any(m == "POST" and "servicecatalog" in p for m, p in servicenow.requests)
 
 

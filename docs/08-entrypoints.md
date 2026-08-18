@@ -349,25 +349,40 @@ async def build(settings: Settings) -> Container:
 ```python
 import asyncio
 
+import logging
+
 import typer
 import uvicorn
 
 from orchestrator.bootstrap import build
 from orchestrator.config import Settings
+from orchestrator.log import LOG_CONFIG_PATH, configure_logging, log_config_exists
 
 app = typer.Typer(help="CloudIO orchestrator")
+logger = logging.getLogger(__name__)
 
 
 @app.command()
-def api(host: str = "0.0.0.0", port: int = 8000) -> None:
+def api(host: str = "0.0.0.0", port: int = 8000, reload: bool = False) -> None:
     """Serve the HTTP API."""
-    uvicorn.run("orchestrator.api:app", host=host, port=port, factory=False)
+    settings = Settings()
+    configure_logging(settings.log_level)
+    # Present -> uvicorn's own records join the same ECS stream. Absent -> None, which makes
+    # uvicorn skip dictConfig, leaving the root configuration just installed. This cannot be a
+    # `uvicorn --log-config` flag: uvicorn open()s the path unguarded and dies when it is missing.
+    uvicorn.run(
+        "orchestrator.api:app",
+        host=host, port=port, factory=False, reload=reload,
+        log_config=str(LOG_CONFIG_PATH) if log_config_exists() else None,
+    )
 
 
 @app.command()
 def worker() -> None:
     """Run the daemon (claims due runs and drives them)."""
     async def _main() -> None:
+        settings = Settings()
+        configure_logging(settings.log_level)   # no uvicorn here — this is the whole config
         container = await build(Settings())
         await container.worker.start()
 
@@ -375,7 +390,47 @@ def worker() -> None:
 ```
 
 *(The API process attaches the container in a lifespan hook: `app.state.container = await
-build(Settings())`.)*
+build(Settings())`, and calls `configure_logging` there too — that is what covers a container
+started with a bare `uvicorn` command instead of the CLI.)*
+
+## Logging
+
+Stdlib `logging` throughout; modules do `logger = logging.getLogger(__name__)` and log with
+`%`-style lazy args. Nothing configures logging except `configure_logging` at an entrypoint.
+
+The *shape* of logging is a `logging.config.dictConfig` document mounted at
+**`/opt/app/config/log-config.json`** (`LOG_CONFIG_PATH`): `ecs_logging.StdlibFormatter` on one
+`StreamHandler` bound to `ext://sys.stdout`. There is no file handler anywhere — stdout is the
+only sink, and the log shipper owns everything downstream. When the mount is absent (local
+`uv run`) the process falls back to a plain readable one-line format, still on stdout.
+`ORCH_LOG_LEVEL` sets the threshold in both cases and is applied *after* the document, so it wins.
+
+The document re-declares `uvicorn`, `uvicorn.error` and `uvicorn.access` with no handlers and
+`propagate: true`. That is load-bearing, not decoration: uvicorn's own default config gives those
+loggers dedicated handlers and `propagate: false`, so without the override its startup and access
+lines never reach the ECS handler.
+
+Request-scoped records carry the in-flight request under a `cloudio` namespace:
+
+| Field | Source |
+|---|---|
+| `cloudio.operation.http.url` | `request.url` |
+| `cloudio.operation.http.query_params` | `request.query_params` |
+| `cloudio.operation.http.path_params` | `request.path_params` (omitted on untemplated routes) |
+
+`RequestContextMiddleware` (pure ASGI, registered in `api.py`) publishes the `Request` in a
+ContextVar; `RequestContextFilter` on the handler reads it. Two details are deliberate:
+
+- The three values are read **lazily, at log-emit time**, not snapshotted in the middleware.
+  Starlette only fills `scope["path_params"]` while *routing*, which happens after middleware
+  runs, so a snapshot would always be empty.
+- `query_params` is emitted as a urlencoded **string**, not a mapping. ecs-logging de-dots extra
+  keys, so a mapping whose keys contain dots (`?a=1&a.b=2` — caller-controlled) raises `TypeError`
+  inside its `merge_dicts`; `logging` swallows that in `handleError`, silently dropping the record.
+  `path_params` is safe as an object because its keys come from route templates.
+
+Query strings are logged verbatim, so treat the URL field as a disclosure surface if callers ever
+start appending credentials to it.
 
 ## Example — register once, then trigger
 

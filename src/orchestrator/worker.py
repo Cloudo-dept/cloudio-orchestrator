@@ -7,13 +7,14 @@ what makes a crash re-drive.
 
 import asyncio
 import itertools
+import logging
 
-from loguru import logger
-
+from orchestrator.log import worker_log_context
 from orchestrator.orchestration.executor import RunExecutor
 from orchestrator.ports import WorkflowRunRepository
 
 _worker_ids = itertools.count()  # stable per-loop tag for log correlation
+logger = logging.getLogger(__name__)
 
 
 class RunWorker:
@@ -35,36 +36,56 @@ class RunWorker:
         self._stop = asyncio.Event()
 
     def request_stop(self) -> None:
-        logger.debug("Worker loop #{} stop requested.", self.worker_id)
+        logger.debug("Worker loop #%s stop requested.", self.worker_id)
         self._stop.set()
 
     async def run(self) -> None:
-        logger.info("Worker loop #{} started; polling for due runs.", self.worker_id)
-        while not self._stop.is_set():
-            run_ids = await self.runs.claim_due(1, self.lease_seconds)  # 0 or 1 due run
-            if not run_ids:  # nothing due → wait a tick
-                logger.trace(
-                    "Worker loop #{} found no due run; sleeping {}s.",
-                    self.worker_id,
-                    self.poll_interval,
-                )
+        with worker_log_context(self.worker_id):
+            logger.info("Worker loop #%s started; polling for due runs.", self.worker_id)
+            while not self._stop.is_set():
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=self.poll_interval)
-                except TimeoutError:
-                    pass
-                continue
-            run_id = run_ids[0]
-            logger.info("Worker loop #{} claimed run {}; driving it.", self.worker_id, run_id)
-            try:
-                await self.executor.handle(run_id)
-                logger.debug("Worker loop #{} finished driving run {}.", self.worker_id, run_id)
-            except Exception:
-                logger.exception(
-                    "Worker loop #{}: run {} crashed mid-drive; the lease will re-drive it.",
-                    self.worker_id,
-                    run_id,
-                )
-        logger.info("Worker loop #{} stopped.", self.worker_id)
+                    run_ids = await self.runs.claim_due(1, self.lease_seconds)  # 0 or 1 due run
+                except Exception:
+                    # The claim used to sit outside any try. A transient database error escaped
+                    # this loop, propagated through the gather in OrchestratorWorker.start (no
+                    # return_exceptions) and out of asyncio.run, killing the whole daemon with a
+                    # raw interpreter traceback on stderr — never through logging, so no ECS
+                    # record at all: the log stream simply stopped. A failed claim is a retryable
+                    # condition, not a reason to take the process down.
+                    logger.exception(
+                        "Worker loop #%s: claim failed; retrying in %ss.",
+                        self.worker_id,
+                        self.poll_interval,
+                    )
+                    await self._idle()
+                    continue
+                if not run_ids:  # nothing due → wait a tick
+                    logger.debug(
+                        "Worker loop #%s found no due run; sleeping %ss.",
+                        self.worker_id,
+                        self.poll_interval,
+                    )
+                    await self._idle()
+                    continue
+                run_id = run_ids[0]
+                logger.info("Worker loop #%s claimed run %s; driving it.", self.worker_id, run_id)
+                try:
+                    await self.executor.handle(run_id)
+                    logger.debug("Worker loop #%s finished driving run %s.", self.worker_id, run_id)
+                except Exception:
+                    logger.exception(
+                        "Worker loop #%s: run %s crashed mid-drive; the lease will re-drive it.",
+                        self.worker_id,
+                        run_id,
+                    )
+            logger.info("Worker loop #%s stopped.", self.worker_id)
+
+    async def _idle(self) -> None:
+        """Wait one poll interval, returning early if a stop was requested."""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=self.poll_interval)
+        except TimeoutError:
+            pass
 
 
 class OrchestratorWorker:
@@ -91,11 +112,11 @@ class OrchestratorWorker:
         ]
 
     def request_stop(self) -> None:
-        logger.warning("Stopping daemon: signalling all {} worker loops.", len(self._workers))
+        logger.warning("Stopping daemon: signalling all %s worker loops.", len(self._workers))
         for worker in self._workers:
             worker.request_stop()
 
     async def start(self) -> None:
-        logger.info("Daemon started; {} loops claiming + driving runs.", len(self._workers))
+        logger.info("Daemon started; %s loops claiming + driving runs.", len(self._workers))
         await asyncio.gather(*(worker.run() for worker in self._workers))
         logger.info("Daemon stopped; all worker loops drained.")

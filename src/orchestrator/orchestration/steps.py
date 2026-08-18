@@ -15,10 +15,9 @@ RUN_ENGINE launches a fresh engine run rather than re-attaching to the failed on
 """
 
 import abc
+import logging
 from collections.abc import Mapping
 from typing import Any
-
-from loguru import logger
 
 from orchestrator.domain import (
     ApprovalStatus,
@@ -36,6 +35,9 @@ from orchestrator.ports import (
     TicketSystemClient,
     WorkflowEngineClient,
 )
+
+logger = logging.getLogger(__name__)
+
 
 # Named engine output (Airflow: an XCom) carrying the vendor id the run actually provisioned.
 FINAL_VENDOR_ID_OUTPUT = "final_vendor_id"
@@ -75,11 +77,11 @@ class CreateTicketStep(StepHandler):
         st = run.run_state
         if st.ticket is not None:
             logger.debug(
-                "Run {}: ticket {} already open; skipping.", run.run_id, st.ticket.ticket_id
+                "Run %s: ticket %s already open; skipping.", run.run_id, st.ticket.ticket_id
             )
             return True
         logger.info(
-            "Run {}: opening ticket from template {}.", run.run_id, st.workflow.ticket_template_id
+            "Run %s: opening ticket from template %s.", run.run_id, st.workflow.ticket_template_id
         )
         st.ticket = await self.ticket_client.open_ticket(
             template_id=st.workflow.ticket_template_id,
@@ -87,7 +89,7 @@ class CreateTicketStep(StepHandler):
             requested_by=run.created_by,
             idempotency_key=idem_key(run, StepName.CREATE_TICKET),
         )
-        logger.info("Run {}: opened ticket {}.", run.run_id, st.ticket.ticket_id)
+        logger.info("Run %s: opened ticket %s.", run.run_id, st.ticket.ticket_id)
         return True
 
 
@@ -108,7 +110,7 @@ class AwaitApprovalStep(StepHandler):
         assert st.ticket is not None  # CREATE_TICKET ran first
         status = await self.ticket_client.get_approval_status(st.ticket)
         logger.info(
-            "Run {}: approval status for ticket {} is {}.",
+            "Run %s: approval status for ticket %s is %s.",
             run.run_id,
             st.ticket.ticket_id,
             status,
@@ -134,12 +136,12 @@ class ConfigureResourceStep(StepHandler):
     async def execute(self, run: WorkflowRun) -> bool:
         st = run.run_state
         if st.resource_configured:
-            logger.debug("Run {}: resource already configured; skipping.", run.run_id)
+            logger.debug("Run %s: resource already configured; skipping.", run.run_id)
             return True
         resource = st.resource
         assert resource is not None  # guaranteed by the trigger validation
         logger.info(
-            "Run {}: configuring resource (operation={}, type={}, project={}).",
+            "Run %s: configuring resource (operation=%s, type=%s, project=%s).",
             run.run_id,
             resource.operation,
             resource.resource_type,
@@ -157,7 +159,7 @@ class ConfigureResourceStep(StepHandler):
                 body=body,
                 idempotency_key=idem_key(run, StepName.CONFIGURE_RESOURCE),
             )
-            logger.info("Run {}: created resource record {}.", run.run_id, resource.vendor_id)
+            logger.info("Run %s: created resource record %s.", run.run_id, resource.vendor_id)
         else:  # UPDATE / DELETE — the record already exists; just mark it in-progress.
             await self.resource_client.update_resource(
                 resource.project_id,
@@ -166,7 +168,7 @@ class ConfigureResourceStep(StepHandler):
                 {"in_progress": True},
             )
             logger.info(
-                "Run {}: marked existing resource {} in-progress.", run.run_id, resource.vendor_id
+                "Run %s: marked existing resource %s in-progress.", run.run_id, resource.vendor_id
             )
         st.resource_configured = True
         return True
@@ -182,7 +184,7 @@ class RunEngineStep(StepHandler):
 
         if st.engine_run_id is None:  # not triggered yet → trigger, then poll later
             logger.info(
-                "Run {}: triggering engine workflow '{}' on {}.",
+                "Run %s: triggering engine workflow '%s' on %s.",
                 run.run_id,
                 st.workflow.automation_id,
                 st.workflow.engine_type,
@@ -193,14 +195,14 @@ class RunEngineStep(StepHandler):
                 idempotency_key=engine_run_key(run),  # attempt-scoped → fresh run per retry
             )
             logger.info(
-                "Run {}: engine run {} triggered; will poll for completion.",
+                "Run %s: engine run %s triggered; will poll for completion.",
                 run.run_id,
                 st.engine_run_id,
             )
             return False
 
         status = await client.query_run_status(st.workflow.automation_id, st.engine_run_id)
-        logger.info("Run {}: engine run {} status is {}.", run.run_id, st.engine_run_id, status)
+        logger.info("Run %s: engine run %s status is %s.", run.run_id, st.engine_run_id, status)
         if status is EngineRunStatus.SUCCESS:
             await self._capture_final_vendor_id(run, client)
             return True
@@ -210,12 +212,12 @@ class RunEngineStep(StepHandler):
                     st.workflow.automation_id, st.engine_run_id
                 )
                 logger.warning(
-                    "Run {}: engine failure detail — failed_task={}.",
+                    "Run %s: engine failure detail — failed_task=%s.",
                     run.run_id,
                     st.engine_failure.failed_task if st.engine_failure else None,
                 )
             except Exception as e:
-                logger.warning("Could not fetch failure detail for run {}: {}", run.run_id, e)
+                logger.warning("Could not fetch failure detail for run %s: %s", run.run_id, e)
             raise RuntimeError(
                 f"Engine run {st.engine_run_id} of '{st.workflow.automation_id}' failed."
             )
@@ -235,11 +237,11 @@ class RunEngineStep(StepHandler):
             )
         except Exception as e:  # optional enrichment — never fail a succeeded run over it
             logger.warning(
-                "Could not read {} for run {}: {}", FINAL_VENDOR_ID_OUTPUT, run.run_id, e
+                "Could not read %s for run %s: %s", FINAL_VENDOR_ID_OUTPUT, run.run_id, e
             )
             return
         if final_vendor_id is not None:
-            logger.info("Run {}: engine reported final vendor id {}.", run.run_id, final_vendor_id)
+            logger.info("Run %s: engine reported final vendor id %s.", run.run_id, final_vendor_id)
             st.step_results[StepName.RUN_ENGINE] = StepResult(final_vendor_id=final_vendor_id)
 
     def reset_for_retry(self, state: RunState) -> None:  # noqa: B027 (optional hook; default no-op)
@@ -259,7 +261,7 @@ class FinalizeResourceStep(StepHandler):
     async def execute(self, run: WorkflowRun) -> bool:
         st = run.run_state
         if st.resource is None or st.resource_finalized:
-            logger.debug("Run {}: no resource to finalize (or already done).", run.run_id)
+            logger.debug("Run %s: no resource to finalize (or already done).", run.run_id)
             return True
         # Target the record where ConfigureResourceStep created/targeted it (resource.vendor_id —
         # the run id for a CREATE). If the engine reported the id it actually provisioned (the
@@ -272,12 +274,12 @@ class FinalizeResourceStep(StepHandler):
         if engine_vendor_id and engine_vendor_id != vendor_id:
             fields["vendor_id"] = engine_vendor_id
             logger.info(
-                "Run {}: re-keying resource {} -> {} on finalize.",
+                "Run %s: re-keying resource %s -> %s on finalize.",
                 run.run_id,
                 vendor_id,
                 engine_vendor_id,
             )
-        logger.info("Run {}: finalizing resource {} (in_progress=False).", run.run_id, vendor_id)
+        logger.info("Run %s: finalizing resource %s (in_progress=False).", run.run_id, vendor_id)
         await self.resource_client.update_resource(
             st.resource.project_id,
             st.resource.resource_type,
@@ -297,7 +299,7 @@ class CloseTicketStep(StepHandler):
     async def execute(self, run: WorkflowRun) -> bool:
         st = run.run_state
         if st.ticket_closed:
-            logger.debug("Run {}: ticket already closed; skipping.", run.run_id)
+            logger.debug("Run %s: ticket already closed; skipping.", run.run_id)
             return True
         assert st.ticket is not None
         note = (
@@ -305,7 +307,7 @@ class CloseTicketStep(StepHandler):
             if st.resource is not None
             else "CloudIO automation completed."
         )
-        logger.info("Run {}: closing ticket {}.", run.run_id, st.ticket.ticket_id)
+        logger.info("Run %s: closing ticket %s.", run.run_id, st.ticket.ticket_id)
         await self.ticket_client.close_ticket(st.ticket, note=note)
         st.ticket_closed = True
         return True

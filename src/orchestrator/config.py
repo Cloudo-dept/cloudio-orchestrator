@@ -15,7 +15,9 @@ class Settings(BaseSettings):
     # The run store and the workflow registry both live in this database.
     database_url: str
 
-    # Logging (loguru): threshold for the stderr sink. TRACE/DEBUG/INFO/WARNING/ERROR/CRITICAL.
+    # Logging: threshold for the stdout sink installed by log.configure_logging().
+    # DEBUG/INFO/WARNING/ERROR/CRITICAL; applied after the log config document, so it always
+    # wins. An unrecognised name degrades to INFO with a warning rather than failing startup.
     log_level: str = "INFO"
 
     # Retry policy (application-owned; expressed as WorkflowRun.scheduled_at, never a queue delay).

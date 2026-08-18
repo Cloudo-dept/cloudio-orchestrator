@@ -51,8 +51,12 @@ def build_handlers(
 ## `orchestration/steps.py` — the step handlers
 
 Every handler is idempotent on its typed state markers: a re-driven step first checks whether its
-work already happened. Side-effecting calls carry a per-attempt idempotency key
-`(run_id, step, attempt)`.
+work already happened. Side-effecting calls carry an idempotency key, and there are two kinds.
+Ticket and resource creation use `idem_key(run, step)` — `(run_id, step)`, stable across re-drives
+*and* retries, so a provider that dedups on it returns the existing side effect instead of creating
+a duplicate. The engine trigger uses `engine_run_key(run)` — `(run_id, running_engine, attempt)`,
+deliberately attempt-scoped so a retry starts a fresh engine run instead of re-attaching to (and
+re-reading) the failed one.
 
 ```python
 import abc
@@ -70,8 +74,16 @@ FINAL_VENDOR_ID_OUTPUT = "final_vendor_id"
 
 
 def idem_key(run: WorkflowRun, step: StepName) -> str:
-    attempt = run.run_state.step_attempts.get(step, 0)
-    return f"{run.run_id}:{step.value}:{attempt}"
+    """Stable per (run, step): a re-driven OR retried step reuses the same key, so a provider that
+    dedups on it returns the existing side effect instead of creating a duplicate."""
+    return f"{run.run_id}:{step.value}"
+
+
+def engine_run_key(run: WorkflowRun) -> str:
+    """The engine run id (Airflow: dag_run_id). Attempt-scoped, so a RUN_ENGINE *retry* triggers a
+    fresh engine run instead of re-attaching to (and re-reading) the failed one."""
+    attempt = run.run_state.step_attempts.get(StepName.RUN_ENGINE, 0)
+    return f"{run.run_id}:{StepName.RUN_ENGINE.value}:{attempt}"
 
 
 class StepHandler(abc.ABC):
@@ -140,7 +152,7 @@ class RunEngineStep(StepHandler):
             st.engine_run_id = await client.trigger_workflow(
                 automation_id=st.workflow.automation_id,
                 params=st.workflow_params,
-                idempotency_key=idem_key(run, StepName.RUN_ENGINE))
+                idempotency_key=engine_run_key(run))  # attempt-scoped → fresh run per retry
             return False
 
         status = await client.query_run_status(st.workflow.automation_id, st.engine_run_id)
@@ -255,7 +267,7 @@ class FailureEscalator:
                 await self.ticket.annotate_ticket(
                     st.ticket, f"Incident {inc.ticket_id} opened for failure: {error}")
         except Exception as e:      # never let escalation crash the worker
-            logger.error("Failed to escalate run %s failure: %s", run.run_id, e)
+            logger.exception("Failed to escalate run %s failure: %s", run.run_id, e)
 ```
 
 ## `orchestration/executor.py` — the run driver

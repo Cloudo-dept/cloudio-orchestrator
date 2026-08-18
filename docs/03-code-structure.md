@@ -55,10 +55,13 @@ cloudio-orchestrator/
 │       ├── test_worker_claim.py        # testcontainers: claim_due + drive, SKIP LOCKED disjoint, lease re-drive
 │       ├── test_api.py
 │       └── test_end_to_end.py          # full run over the 3 mocks + real Postgres
+├── config/
+│   └── log-config.example.json     # dictConfig: ecs_logging.StdlibFormatter → stdout
 └── src/
     └── orchestrator/
         ├── __init__.py
         ├── config.py                   # Settings (pydantic-settings) — single database_url
+        ├── log.py                      # configure_logging + LOG_CONFIG_PATH + request log context
         ├── domain.py                   # enums · TicketRef/ResourceSpec/RunState · WorkflowRun/Workflow (SQLModel) · exceptions
         ├── ports.py                    # WorkflowRunRepository · WorkflowRepository ·
         │                               # TicketSystemClient · ResourceManagerClient · WorkflowEngineClient
@@ -103,6 +106,7 @@ package out of the repo root so tests import the *installed* copy.
 | FastAPI app, HTTP schemas, routers | `api.py` |
 | `OrchestratorWorker`, `RunWorker` | `worker.py` |
 | typer CLI | `cli.py` |
+| `configure_logging`, `RequestContextFilter`, `RequestContextMiddleware` | `log.py` |
 | `build()` / `Container` | `bootstrap.py` |
 
 ### Toolchain (uv + modern stack)

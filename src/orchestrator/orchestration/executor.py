@@ -5,11 +5,10 @@ wake-up, and either complete it, schedule it for a later poll/retry (by setting 
 a worker re-drives it), or mark it ``FAILED`` and escalate. It only reads and writes the run store.
 """
 
+import logging
 import random
 import uuid
 from datetime import timedelta
-
-from loguru import logger
 
 from orchestrator.config import Settings
 from orchestrator.domain import (
@@ -21,10 +20,13 @@ from orchestrator.domain import (
     WorkflowRun,
     utcnow,
 )
+from orchestrator.log import run_log_context
 from orchestrator.orchestration.escalator import FailureEscalator
 from orchestrator.orchestration.plans import RUN_PLANS
 from orchestrator.orchestration.steps import StepHandler
 from orchestrator.ports import WorkflowRunRepository
+
+logger = logging.getLogger(__name__)
 
 
 class RunExecutor:
@@ -43,19 +45,27 @@ class RunExecutor:
     async def handle(self, run_id: uuid.UUID) -> None:
         run = await self.runs.get(run_id)
         if run is None:
-            logger.warning("Run {} not found; dropping message.", run_id)
+            logger.warning("Run %s not found; dropping message.", run_id)
             return
         if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.REJECTED):
             logger.debug(
-                "Run {} already terminal ({}); ignoring stale delivery.", run_id, run.status
+                "Run %s already terminal (%s); ignoring stale delivery.", run_id, run.status
             )
             return  # terminal: ignore a duplicate/stale delivery
 
+        # Bind before anything else runs. Every record emitted from here down — this executor, the
+        # step handlers, the adapters they call, the escalator — carries cloudio.run.*, without a
+        # single signature change and without run vocabulary crossing a port.
+        with run_log_context(run):
+            await self._drive(run)
+
+    async def _drive(self, run: WorkflowRun) -> None:
         plan = RUN_PLANS[run.run_type]
         step = StepName(run.current_step) if run.current_step else plan[0]
         run.status = RunStatus.RUNNING
+        run.current_step = step  # so the very first record already carries cloudio.run.step
         logger.info(
-            "Driving run {} (type={}) starting at step {}; plan has {} steps.",
+            "Driving run %s (type=%s) starting at step %s; plan has %s steps.",
             run.run_id,
             run.run_type,
             step,
@@ -68,7 +78,7 @@ class RunExecutor:
             started = run.run_state.step_started_at.setdefault(step, utcnow())
             attempt = run.run_state.step_attempts.get(step, 0)
             logger.info(
-                "Run {} executing step {} (attempt {}, elapsed {:.0f}s).",
+                "Run %s executing step %s (attempt %s, elapsed %.0fs).",
                 run.run_id,
                 step,
                 attempt + 1,
@@ -81,14 +91,31 @@ class RunExecutor:
             except RunRejected as rejection:
                 await self._reject(run, step, rejection)
                 return
+            except StepDeadlineExceeded as deadline:
+                # Distinct from a step that merely raised: the step never got to finish inside its
+                # budget. Folded into the generic handler this was indistinguishable from a
+                # provider error, which sends you looking at the wrong system.
+                logger.warning(
+                    "Run %s step %s exceeded its %.0fs wall-clock budget after %s attempt(s).",
+                    run.run_id,
+                    step,
+                    handler.max_step_duration_seconds,
+                    attempt + 1,
+                    exc_info=deadline,
+                )
+                await self._on_step_error(run, step, handler, deadline)
+                return
             except Exception as error:
-                logger.warning("Run {} step {} raised: {}", run.run_id, step, error)
+                # exc_info matters here: this is the *only* place an adapter exception is ever
+                # logged, and str(IndexError) is "list index out of range" — no type, no stack, no
+                # indication of which provider call produced it.
+                logger.warning("Run %s step %s raised: %s", run.run_id, step, error, exc_info=error)
                 await self._on_step_error(run, step, handler, error)
                 return
 
             if not done:  # async wait → schedule a later poll
                 logger.info(
-                    "Run {} step {} not done yet; will poll again in {}s.",
+                    "Run %s step %s not done yet; will poll again in %ss.",
                     run.run_id,
                     step,
                     handler.poll_interval_seconds,
@@ -96,17 +123,17 @@ class RunExecutor:
                 await self._schedule(run, delay=handler.poll_interval_seconds)
                 return
 
-            logger.info("Run {} step {} completed.", run.run_id, step)
+            logger.info("Run %s step %s completed.", run.run_id, step)
             run.run_state.step_attempts.pop(step, None)
             run.run_state.step_started_at.pop(step, None)
             idx = plan.index(step)
             if idx + 1 < len(plan):
                 step = plan[idx + 1]
-                logger.debug("Run {} advancing to next step {}.", run.run_id, step)
+                logger.debug("Run %s advancing to next step %s.", run.run_id, step)
                 continue  # run the next synchronous step now
             run.status, run.current_step, run.scheduled_at = RunStatus.COMPLETED, None, None
             await self._save(run)
-            logger.success("Run {} completed all {} steps.", run.run_id, len(plan))
+            logger.info("Run %s completed all %s steps.", run.run_id, len(plan))
             return
 
     async def _on_step_error(
@@ -122,27 +149,31 @@ class RunExecutor:
             )
             await self._schedule(run, delay=backoff)
             logger.warning(
-                "Run {} step {} failed (attempt {}/{}); retry in {:.0f}s: {}",
+                "Run %s step %s failed (attempt %s/%s); retry in %.0fs: %s",
                 run.run_id,
                 step,
                 attempts[step],
                 run.max_retries,
                 backoff,
                 error,
+                exc_info=error,
             )
             return
         # exhausted → terminal FAILED + escalate (Incident + RITM note). Nothing is rolled back.
         run.run_state.errors[step] = str(error)
         run.status, run.scheduled_at = RunStatus.FAILED, None
         logger.error(
-            "Run {} step {} exhausted {} retries; escalating and marking FAILED.",
+            "Run %s step %s exhausted %s retries; escalating and marking FAILED.",
             run.run_id,
             step,
             run.max_retries,
+            exc_info=error,
         )
         await self.escalator.escalate(run, error)
         await self._save(run)
-        logger.critical("Run {} step {} permanently FAILED: {}", run.run_id, step, error)
+        logger.critical(
+            "Run %s step %s permanently FAILED: %s", run.run_id, step, error, exc_info=error
+        )
 
     async def _reject(self, run: WorkflowRun, step: StepName, rejection: RunRejected) -> None:
         # The request was denied in the ticket system — a clean terminal stop, not a failure:
@@ -150,22 +181,29 @@ class RunExecutor:
         run.run_state.errors[step] = str(rejection)
         run.status, run.scheduled_at = RunStatus.REJECTED, None
         await self._save(run)
-        logger.info("Run {} REJECTED at step {}: {}", run.run_id, step, rejection)
+        logger.info("Run %s REJECTED at step %s: %s", run.run_id, step, rejection)
 
     async def _schedule(self, run: WorkflowRun, delay: float) -> None:
         run.scheduled_at = utcnow() + timedelta(seconds=delay)  # a worker re-drives when due
-        logger.debug("Run {} rescheduled for {} (in {:.0f}s).", run.run_id, run.scheduled_at, delay)
+        logger.debug("Run %s rescheduled for %s (in %.0fs).", run.run_id, run.scheduled_at, delay)
         await self._save(run)
 
     async def _save(self, run: WorkflowRun) -> None:
         try:
             await self.runs.save(run)
-            logger.trace(
-                "Run {} saved (status={}, step={}).", run.run_id, run.status, run.current_step
+            logger.debug(
+                "Run %s saved (status=%s, step=%s).", run.run_id, run.status, run.current_step
             )
-        except StaleRunError:
+        except StaleRunError as stale:
             # Lost to a concurrent writer (an overlapping re-drive) — its save already carries
-            # equivalent-or-newer state, and a worker re-drives if anything is left to do.
+            # equivalent-or-newer state, and a worker re-drives if anything is left to do. Log the
+            # discarded state: without it you cannot tell what was lost, and a terminal status set
+            # just above may never have been persisted.
             logger.info(
-                "Run {} save lost to a concurrent writer; a worker will re-drive.", run.run_id
+                "Run %s save lost to a concurrent writer (discarded status=%s step=%s v%s): %s",
+                run.run_id,
+                run.status.value,
+                run.current_step,
+                run.version,
+                stale,
             )

@@ -16,6 +16,9 @@ x-app: &app
   volumes:
     - ./src:/app/src          # editable install → code edits hot-reload
     - ./alembic.ini:/app/alembic.ini
+    # ECS JSON logging. Absent -> the app falls back to plain text on stdout (see log.py).
+    # A real deployment mounts its own document over this same target path.
+    - ./config/log-config.example.json:/opt/app/config/log-config.json:ro
   depends_on:
     postgres:
       condition: service_healthy
@@ -112,7 +115,9 @@ services:
 
   api:
     <<: *app
-    command: ["uvicorn", "orchestrator.api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # The CLI, not raw uvicorn: it decides whether to hand uvicorn --log-config based on
+    # whether the mount is there. `uvicorn --log-config <missing path>` dies on open().
+    command: ["orchestrator", "api", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     ports:
       - "8000:8000"
     healthcheck:

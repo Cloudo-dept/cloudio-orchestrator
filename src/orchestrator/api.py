@@ -5,6 +5,7 @@ Completion is polled; the callbacks router is a wake-early optimization that co-
 poll — an external notification only makes the waiting run due now so it re-polls immediately.
 """
 
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -26,8 +27,11 @@ from orchestrator.domain import (
     WorkflowAlreadyExistsError,
     WorkflowEngineType,
 )
+from orchestrator.log import RequestContextMiddleware, configure_logging
 from orchestrator.ports import HealthCheck
 from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
+
+logger = logging.getLogger(__name__)
 
 # --- HTTP schemas ---
 
@@ -116,13 +120,12 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Built lazily so importing this module (e.g. in tests) does not require a database.
-    from loguru import logger
-
     from orchestrator.bootstrap import build
     from orchestrator.config import Settings
-    from orchestrator.log import configure_logging
 
     settings = Settings()
+    # Also covers the container that runs `uvicorn` directly and never executes cli.py: this is
+    # the last dictConfig to run, so it wins over uvicorn's own default configuration.
     configure_logging(settings.log_level)
     logger.info("API lifespan startup: building container.")
     app.state.container = await build(settings)
@@ -132,6 +135,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Orchestrator Core API", lifespan=lifespan)
+# Publishes the current Request for RequestContextFilter (see log.py). Registered here rather
+# than in bootstrap.build(): it takes no injected dependency, and Starlette freezes the
+# middleware stack on first request, so build() — which runs inside lifespan — is too late.
+app.add_middleware(RequestContextMiddleware)
 
 
 def get_workflow_service(request: Request) -> WorkflowService:
@@ -167,6 +174,10 @@ async def readyz(health_check: HealthCheck = Depends(get_health_check)) -> Healt
     try:
         await health_check.ping()
     except Exception:
+        # Log before converting: `from None` deliberately hides the cause from the client, but it
+        # also hid it from us — a database outage produced a 503 body and no diagnostic output
+        # anywhere, since nothing reached uvicorn's error logger either.
+        logger.exception("Readiness probe failed: run store unreachable.")
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, detail="run store unreachable"
         ) from None

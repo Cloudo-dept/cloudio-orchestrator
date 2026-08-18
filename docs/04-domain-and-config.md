@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     # The run store and the workflow registry both live in this database.
     database_url: str
 
+    # Logging: threshold for the stdout sink installed by log.configure_logging().
+    # DEBUG/INFO/WARNING/ERROR/CRITICAL; applied after the log config document, so it always
+    # wins. An unrecognised name degrades to INFO with a warning rather than failing startup.
+    log_level: str = "INFO"
+
     # Retry policy (application-owned; expressed as WorkflowRun.scheduled_at, never a queue delay).
     # Poll intervals live on the step handlers themselves (StepHandler.poll_interval_seconds).
     retry_base_seconds: float = 10.0             # base for per-step exponential backoff
