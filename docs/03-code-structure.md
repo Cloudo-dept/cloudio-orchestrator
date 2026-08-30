@@ -46,7 +46,8 @@ cloudio-orchestrator/
 │   │   ├── test_domain.py
 │   │   ├── test_orchestration.py       # executor, steps, retry/failure paths
 │   │   ├── test_worker.py              # RunWorker loop: claims 1 → drives → empty-poll backoff
-│   │   └── test_services.py
+│   │   ├── test_services.py
+│   │   └── test_dag_callbacks.py       # the DAG-side callbacks in airflow/dags/cloudio_callbacks.py
 │   └── integration/                    # wire-level: real adapters + real Postgres
 │       ├── test_adapter_airflow.py     # real client vs AirflowMock
 │       ├── test_adapter_servicenow.py
@@ -55,6 +56,10 @@ cloudio-orchestrator/
 │       ├── test_worker_claim.py        # testcontainers: claim_due + drive, SKIP LOCKED disjoint, lease re-drive
 │       ├── test_api.py
 │       └── test_end_to_end.py          # full run over the 3 mocks + real Postgres
+├── airflow/
+│   └── dags/                           # DAG side of the engine contract (mounted into Airflow)
+│       ├── cloudio_callbacks.py        # wake-early + exception-publishing callbacks for CloudIO DAGs
+│       └── provision_vm.py             # dev DAG using them
 ├── config/
 │   └── log-config.example.json     # dictConfig: ecs_logging.StdlibFormatter → stdout
 └── src/
@@ -70,6 +75,7 @@ cloudio-orchestrator/
         │   ├── __init__.py
         │   ├── steps.py                # StepHandler ABC + CreateTicketStep/ConfigureResourceStep/RunEngineStep/FinalizeResourceStep/CloseTicketStep
         │   ├── plans.py                # RUN_PLANS (RunType → ordered StepNames) + build_handlers()
+        │   ├── failure_policy.py       # FAILURE_POLICIES (FailureKind → retry? incident? ticket comment)
         │   ├── executor.py             # RunExecutor (drives one run per call)
         │   └── escalator.py            # FailureEscalator
         ├── adapters/
@@ -102,6 +108,7 @@ package out of the repo root so tests import the *installed* copy.
 | `RUN_PLANS`, `build_handlers` | `orchestration/plans.py` |
 | `RunExecutor` | `orchestration/executor.py` |
 | `FailureEscalator` | `orchestration/escalator.py` |
+| `FailurePolicy`, `FAILURE_POLICIES`, `policy_for` | `orchestration/failure_policy.py` |
 | `WorkflowService`, `WorkflowRunService` | `services.py` |
 | FastAPI app, HTTP schemas, routers | `api.py` |
 | `OrchestratorWorker`, `RunWorker` | `worker.py` |

@@ -19,6 +19,7 @@ class Ritm:
     approval: str = "requested"  # ServiceNow RITM approval field: requested/approved/rejected
     work_notes: list[str] = field(default_factory=list)
     requested_for: str | None = None  # sysparm_requested_for the order was placed with
+    assignment_group: str | None = None  # sys_user_group sys_id the RITM was assigned to
 
 
 @dataclass
@@ -36,6 +37,11 @@ class ServiceNowMock:
     requests: list[tuple[str, str]] = field(default_factory=list)
     default_approval: str = "approved"  # approval state ordered RITMs come back with
     users: dict[str, str] = field(default_factory=lambda: {"jdoe": "usersys0000001"})
+    # sys_user_group rows: group name -> sys_id. What the adapter resolves an unmapped name against;
+    # clear it to model a name that exists nowhere. "cloudio" is the default incident team.
+    groups: dict[str, str] = field(
+        default_factory=lambda: {"CloudIO NetOps": "grpsys0000002", "cloudio": "grpsys0000003"}
+    )
     _seq: int = 0
 
     def _mint(self, prefix: str) -> tuple[str, str]:
@@ -86,6 +92,13 @@ def _build(mock: ServiceNowMock) -> FastAPI:
         sys_id = mock.users.get(value) if field_name == "user_param" else None
         return {"result": [{"sys_id": sys_id}] if sys_id else []}
 
+    @app.get("/api/now/table/sys_user_group")
+    async def query_group(sysparm_query: str = "") -> dict[str, Any]:
+        # name=<group name>; a group nobody created returns no rows
+        field_name, _, value = sysparm_query.partition("=")
+        sys_id = mock.groups.get(value) if field_name == "name" else None
+        return {"result": [{"sys_id": sys_id}] if sys_id else []}
+
     @app.get("/api/now/table/sc_req_item/{sys_id}")
     async def get_ritm(sys_id: str) -> dict[str, Any]:
         r = next(r for r in mock.ritms if r.sys_id == sys_id)
@@ -115,6 +128,8 @@ def _build(mock: ServiceNowMock) -> FastAPI:
             r.state = body["state"]
         if "work_notes" in body:
             r.work_notes.append(body["work_notes"])
+        if "assignment_group" in body:
+            r.assignment_group = body["assignment_group"]
         return {"result": {"number": r.number, "sys_id": r.sys_id}}
 
     @app.post("/api/now/table/incident")

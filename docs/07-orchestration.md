@@ -2,8 +2,9 @@
 
 # Orchestration — steps, run plans, executor, escalator
 
-The run's step order is **data** (`RUN_PLANS`), handlers are small classes behind one ABC, the
-executor is what a worker invokes per run, and the escalator implements the failure model.
+The run's step order is **data** (`RUN_PLANS`), what each kind of failure costs the requester is
+data too (`FAILURE_POLICIES`), handlers are small classes behind one ABC, the executor is what a
+worker invokes per run, and the escalator applies the failure model.
 There is **no compensation** — permanent failure ends the run at `FAILED` and escalates.
 
 Both flows start by creating the ticket. `ConfigureResourceStep` configures the resource for its operation — a
@@ -111,7 +112,8 @@ class CreateTicketStep(StepHandler):
             template_id=st.workflow.ticket_template_id,
             fields=st.ticket_params,
             requested_by=run.created_by,
-            idempotency_key=idem_key(run, StepName.CREATE_TICKET))
+            idempotency_key=idem_key(run, StepName.CREATE_TICKET),
+            approval_group=st.approval_group)   # the team whose approval this request needs
         return True
 
 
@@ -160,13 +162,17 @@ class RunEngineStep(StepHandler):
             await self._capture_final_vendor_id(run, client)
             return True
         if status is EngineRunStatus.FAILED:
-            try:                                # best-effort typed failure detail for the escalator
+            try:                # best-effort typed detail for the executor and the escalator
                 st.engine_failure = await client.get_failure(
                     st.workflow.automation_id, st.engine_run_id)
             except Exception as e:
                 logger.warning("Could not fetch failure detail for run %s: %s", run.run_id, e)
-            raise RuntimeError(
-                f"Engine run {st.engine_run_id} of '{st.workflow.automation_id}' failed.")
+            # Classified, so the failure policy decides whether this is worth another engine run
+            # and what the requester is told. Unknown detail → TASK: retried, then an incident.
+            kind = st.engine_failure.kind if st.engine_failure else FailureKind.TASK
+            raise StepFailure(
+                f"Engine run {st.engine_run_id} of '{st.workflow.automation_id}' failed.",
+                kind=kind)
         return False                            # still running → poll again later
 
     async def _capture_final_vendor_id(self, run: WorkflowRun,
@@ -230,44 +236,111 @@ class CloseTicketStep(StepHandler):
         return True
 ```
 
-## `orchestration/escalator.py` — the failure model
+## `orchestration/failure_policy.py` — what a failure costs the requester, as data
+
+Not every failure deserves an Incident. A DAG that rejects a malformed request has nothing for an
+on-call engineer to do; a DAG whose provisioning call broke does. One row per `FailureKind`, read by
+two consumers — the executor asks *may I retry this*, the escalator asks *incident? which ticket
+comment?* — so adding a kind (or moving a non-engine failure onto the table later) is a row, not a
+branch.
 
 ```python
-import logging
-
-from orchestrator.domain import WorkflowRun
-from orchestrator.ports import TicketSystemClient
-
-logger = logging.getLogger(__name__)
+class FailurePolicy(BaseModel):
+    retryable: bool         # False → terminal on the first failure, no backoff, no second run
+    open_incident: bool     # True → an Incident to the responsible group before closing the ticket
+    close_comment: str      # note the ticket is closed with; may reference {incident_id}
 
 
+VALIDATION_COMMENT = "Your request was closed due to a validation error"
+
+FAILURE_POLICIES: dict[FailureKind, FailurePolicy] = {
+    FailureKind.VALIDATION:     FailurePolicy(retryable=False, open_incident=False,
+                                              close_comment=VALIDATION_COMMENT),
+    FailureKind.INFRA_PRECHECK: FailurePolicy(retryable=False, open_incident=False,
+                                              close_comment=VALIDATION_COMMENT),
+    FailureKind.TASK:           FailurePolicy(retryable=True, open_incident=True,
+                                              close_comment="An error occurred. "
+                                                            "Incident {incident_id} was created"),
+}
+
+
+def policy_for(kind: FailureKind) -> FailurePolicy:
+    """The policy for `kind`, defaulting to TASK's (incident + retries) for anything unmapped."""
+    return FAILURE_POLICIES.get(kind, FAILURE_POLICIES[FailureKind.TASK])
+```
+
+The kind comes from the engine: a CloudIO DAG raises `ValidationException` /
+`InfraPrecheckException` / `TaskException`, the DAG's failure callback publishes the class name, and
+[`adapters/airflow.py`](06-external-clients.md) maps that name to a `FailureKind` — so DAG
+vocabulary stops at the adapter and only the classification crosses the port. An unclassified
+failure is a `TASK` failure: retried, then an Incident.
+
+## `orchestration/escalator.py` — the failure model
+
+Every incident it opens is titled and bodied the same way, so a responder sees which automation
+broke and what it reported without opening the run store:
+
+```python
+def incident_summary(run: WorkflowRun) -> str:                       # short_description
+    title = f"Error in {run.run_state.workflow.label} automation"     # name, else identifier
+    ticket = run.run_state.ticket        # omitted when the run failed before its RITM existed
+    return f"{title} ({ticket.ticket_id})" if ticket is not None else title
+
+
+def incident_description(run: WorkflowRun, detail: str) -> str:      # description
+    return f"Run {run.run_id} has failed with the following error:\n{detail}"
+```
+
+`detail` is the failing task's own exception (`"TaskException: quota exceeded"`), not the
+orchestrator's wrapper message, and it is sent **twice** — as the description and as a work note.
+
+A **classified** failure (`StepFailure`) is escalated by its policy; everything else — an adapter
+that exhausted its retries, a step that blew its deadline — keeps the older behaviour (Incident to
+the default team, work note, ticket left open). That is the only branch, and it is transitional:
+those failures move onto the policy table by raising `StepFailure` with a kind.
+
+```python
 class FailureEscalator:
-    """On permanent step failure: open an Incident to the responsible group (default team when
-    unknown) and note it on the RITM if one exists. Runs once, when the run transitions to
-    FAILED — there is no rollback afterwards."""
+    """Runs once, when a run transitions to FAILED, and never raises — escalation must not crash
+    the worker. There is no rollback afterwards."""
 
     def __init__(self, ticket_client: TicketSystemClient, default_team: str) -> None:
         self.ticket = ticket_client
         self.default_team = default_team
 
     async def escalate(self, run: WorkflowRun, error: Exception) -> None:
-        st = run.run_state
-        failure = st.engine_failure
-        group = (failure.responsible_group if failure and failure.responsible_group
-                 else self.default_team)
         try:
-            inc = await self.ticket.open_incident(
-                summary=f"CloudIO run {run.run_id} failed at '{run.current_step}': {error}",
-                requested_by=run.created_by,
-                responsible_group=group,
-                flow_type=st.workflow.automation_id if failure and failure.failed_task else None,
-                failed_task=failure.failed_task if failure else None)
-            st.incident_id = inc.ticket_id
-            if st.ticket is not None:
-                await self.ticket.annotate_ticket(
-                    st.ticket, f"Incident {inc.ticket_id} opened for failure: {error}")
+            if isinstance(error, StepFailure):
+                await self._escalate_by_policy(run, error, policy_for(error.kind))
+            else:
+                await self._escalate_unclassified(run, error)
         except Exception as e:      # never let escalation crash the worker
             logger.exception("Failed to escalate run %s failure: %s", run.run_id, e)
+
+    async def _escalate_by_policy(self, run: WorkflowRun, error: StepFailure,
+                                  policy: FailurePolicy) -> None:
+        st, failure = run.run_state, run.run_state.engine_failure
+        if policy.open_incident:
+            group = (failure.responsible_group if failure else None) or self.default_team
+            # What the failing task reported — the orchestrator's own wrapper message says
+            # nothing a responder can act on.
+            detail = str(error)
+            if failure is not None and failure.detail:
+                detail = f"{failure.exception_name or 'Failure'}: {failure.detail}"
+            inc = await self.ticket.open_incident(
+                summary=incident_summary(run), requested_by=run.created_by,
+                responsible_group=group,
+                flow_type=st.workflow.automation_id if failure and failure.failed_task else None,
+                failed_task=failure.failed_task if failure else None, comment=detail,
+                description=incident_description(run, detail))
+            st.incident_id = inc.ticket_id     # the team we *asked* for; where it landed is the
+                                               # adapter's business (it resolves and may fall back)
+        if st.ticket is None:       # failed before the ticket existed — nobody to tell
+            return
+        note = policy.close_comment.format(incident_id=st.incident_id)
+        await self.ticket.close_ticket(st.ticket, note=note,
+                                       outcome=TicketOutcome.UNSUCCESSFUL)
+        st.ticket_closed = True
 ```
 
 ## `orchestration/executor.py` — the run driver
@@ -345,7 +418,12 @@ class RunExecutor:
                              handler: StepHandler, error: Exception) -> None:
         attempts = run.run_state.step_attempts
         attempts[step] = attempts.get(step, 0) + 1
-        if attempts[step] <= run.max_retries:
+        # A classified failure can be one there is no point retrying (a validation error fails
+        # identically on every re-run, and each RUN_ENGINE retry costs a whole fresh engine run).
+        # Anything unclassified is a TASK failure: retried, exactly as before.
+        kind = error.kind if isinstance(error, StepFailure) else FailureKind.TASK
+        retryable = policy_for(kind).retryable
+        if retryable and attempts[step] <= run.max_retries:
             handler.reset_for_retry(run.run_state)
             run.run_state.step_started_at.pop(step, None)
             backoff = (self.settings.retry_base_seconds * 2 ** (attempts[step] - 1)
@@ -354,7 +432,8 @@ class RunExecutor:
             logger.warning("Run %s step %s failed (attempt %s); retry in %.0fs: %s",
                            run.run_id, step, attempts[step], backoff, error)
             return
-        # exhausted → terminal FAILED + escalate (Incident + RITM note). Nothing is rolled back.
+        # Exhausted (or never retryable) → terminal FAILED + escalate per the failure policy.
+        # Nothing is rolled back.
         run.run_state.errors[step] = str(error)
         run.status, run.scheduled_at = RunStatus.FAILED, None
         await self.escalator.escalate(run, error)

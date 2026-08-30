@@ -10,11 +10,13 @@ from orchestrator.domain import (
     ApprovalStatus,
     EngineFailure,
     EngineRunStatus,
+    FailureKind,
     ResourceOperation,
     RunRejected,
     RunStatus,
     RunType,
     StepName,
+    TicketOutcome,
     TicketRef,
     WorkflowEngineType,
 )
@@ -75,12 +77,19 @@ class FlakyTicketClient(FakeTicketSystemClient):
         self._remaining = fail_times
 
     async def open_ticket(
-        self, template_id: str, fields: dict[str, Any], requested_by: str, idempotency_key: str
+        self,
+        template_id: str,
+        fields: dict[str, Any],
+        requested_by: str,
+        idempotency_key: str,
+        approval_group: str | None = None,
     ) -> TicketRef:
         if self._remaining > 0:
             self._remaining -= 1
             raise RuntimeError("ServiceNow unavailable")
-        return await super().open_ticket(template_id, fields, requested_by, idempotency_key)
+        return await super().open_ticket(
+            template_id, fields, requested_by, idempotency_key, approval_group
+        )
 
 
 async def test_automation_run_completes(runs, tickets, resources, engine, settings) -> None:
@@ -94,8 +103,10 @@ async def test_automation_run_completes(runs, tickets, resources, engine, settin
     assert final.scheduled_at is None
     assert tickets.open_ticket_calls == []  # attaches to the caller's RITM — never opens one
     assert len(engine.trigger_calls) == 1  # engine triggered exactly once
-    # It closes the caller's pre-existing RITM (from make_run) at the end.
-    assert tickets.closed == [("RITM0000001", "CloudIO automation completed.")]
+    # It closes the caller's pre-existing RITM (from make_run) at the end, as fulfilled.
+    assert tickets.closed == [
+        ("RITM0000001", "CloudIO automation completed.", TicketOutcome.SUCCESSFUL)
+    ]
     assert final.run_state.ticket_closed is True
 
 
@@ -150,6 +161,42 @@ async def test_create_ticket_step_is_idempotent(tickets) -> None:
     assert len(tickets.open_ticket_calls) == 1  # the provider was hit only once
 
 
+async def test_create_ticket_step_passes_the_approval_group(tickets) -> None:
+    step = CreateTicketStep(tickets)
+    run = make_run(run_type=RunType.RESOURCE)
+    run.run_state.ticket = None
+    run.run_state.approval_group = "CloudIO NetOps"  # from the trigger request
+
+    assert await step.execute(run) is True
+    assert tickets.approval_groups == ["CloudIO NetOps"]  # the adapter resolves the name
+
+
+async def test_approval_group_and_dag_group_never_feed_each_other(
+    runs, tickets, resources, settings
+) -> None:
+    """The two group inputs are independent: the trigger's approval_group assigns the RITM, the
+    DAG's responsible_group routes the incident. Conflating them is the mistake this guards."""
+    engine = FakeWorkflowEngineClient(status=EngineRunStatus.FAILED)
+    engine.failure = EngineFailure(  # what the DAG published in its exception XCom
+        failed_task="provision_vm",
+        responsible_group="netops",
+        detail="quota exceeded",
+        exception_name="TaskException",
+        kind=FailureKind.TASK,
+    )
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = make_run(run_type=RunType.RESOURCE, max_retries=0)
+    run.run_state.ticket = None  # this run opens its own RITM
+    run.run_state.approval_group = "Approvers"  # what the trigger asked for
+    await runs.create(run)
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert tickets.approval_groups == ["Approvers"]  # RITM ← the request, not the DAG's group
+    assert tickets.incidents[-1]["responsible_group"] == "netops"  # INC ← the DAG, not the request
+
+
 async def test_transient_failure_retries_then_completes(runs, resources, engine, settings) -> None:
     tickets = FlakyTicketClient(fail_times=2)  # fails twice, then succeeds
     executor, _ = build_executor(runs, tickets, resources, engine, settings)
@@ -179,21 +226,40 @@ async def test_permanent_failure_marks_failed_and_escalates(
     # Escalation opened an Incident routed to the default team (no engine failure detail).
     assert len(tickets.incidents) == 1
     assert tickets.incidents[0]["responsible_group"] == "cloudio"
-    assert tickets.incidents[0]["summary"] == "Run execution failure"  # non-engine title
-    # description = exception type + message
+    # An unnamed workflow falls back to its identifier, and there is no RITM in the title:
+    # this run failed at CREATE_TICKET, so it never got one.
+    assert tickets.incidents[0]["summary"] == "Error in provision-vm automation"
+    # The exception type + message reaches the responder twice: as the body and as a work note.
     assert tickets.incidents[0]["comment"] == "RuntimeError: ServiceNow unavailable"
+    assert tickets.incidents[0]["description"] == (
+        f"Run {final.run_id} has failed with the following error:\n"
+        "RuntimeError: ServiceNow unavailable"
+    )
     assert final.run_state.incident_id is not None
 
 
-async def test_engine_failure_escalates_to_responsible_group(
-    runs, tickets, resources, settings
-) -> None:
+def engine_failing_with(
+    kind: FailureKind, *, exception_name: str, detail: str = "quota exceeded"
+) -> FakeWorkflowEngineClient:
     engine = FakeWorkflowEngineClient(status=EngineRunStatus.FAILED)
     engine.failure = EngineFailure(
-        failed_task="provision_vm", responsible_group="netops", detail="quota exceeded"
+        failed_task="provision_vm",
+        responsible_group="netops",
+        detail=detail,
+        exception_name=exception_name,
+        kind=kind,
     )
+    return engine
+
+
+async def test_task_exception_opens_incident_and_closes_ticket_naming_it(
+    runs, tickets, resources, settings
+) -> None:
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
     executor, _ = build_executor(runs, tickets, resources, engine, settings)
-    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=0))
+    run = await runs.create(
+        make_run(run_type=RunType.AUTOMATION, max_retries=0, workflow_name="Provision VM")
+    )
 
     final = await drive(runs, executor, run.run_id, iters=20)
 
@@ -202,12 +268,69 @@ async def test_engine_failure_escalates_to_responsible_group(
     assert final.run_state.engine_failure.responsible_group == "netops"
     inc = tickets.incidents[-1]
     assert inc["responsible_group"] == "netops"
-    assert inc["summary"] == "Automation failure"  # engine-failure title
-    assert inc["comment"].startswith("RuntimeError: ")  # exception type + message
+    # The workflow's name (not its identifier), and the RITM a responder will search by.
+    assert inc["summary"] == "Error in Provision VM automation (RITM0000001)"
+    assert inc["comment"] == "TaskException: quota exceeded"  # the DAG's own exception, not ours
+    assert inc["description"] == (
+        f"Run {final.run_id} has failed with the following error:\nTaskException: quota exceeded"
+    )
     assert inc["failed_task"] == "provision_vm"
     assert inc["flow_type"] == "dag-x"  # automation_id, since a task failed
-    # The caller's attached RITM gets a work note about the incident.
-    assert tickets.notes and "Incident" in tickets.notes[-1][1]
+    # The caller's RITM is closed unsuccessful, naming the incident that was opened.
+    assert tickets.closed == [
+        (
+            "RITM0000001",
+            f"An error occurred. Incident {inc['ticket_id']} was created",
+            TicketOutcome.UNSUCCESSFUL,
+        )
+    ]
+    assert final.run_state.incident_id == inc["ticket_id"]
+    assert final.run_state.ticket_closed is True
+
+
+async def test_task_exception_is_retried_before_escalating(
+    runs, tickets, resources, settings
+) -> None:
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=2))
+
+    final = await drive(runs, executor, run.run_id, iters=30)
+
+    assert final.status is RunStatus.FAILED
+    assert len(engine.trigger_calls) == 3  # the first run + two retries, each a fresh engine run
+    assert len(tickets.incidents) == 1
+
+
+@pytest.mark.parametrize(
+    ("kind", "exception_name"),
+    [
+        (FailureKind.VALIDATION, "ValidationException"),
+        (FailureKind.INFRA_PRECHECK, "InfraPrecheckException"),
+    ],
+)
+async def test_validation_and_precheck_close_the_ticket_without_an_incident(
+    kind, exception_name, runs, tickets, resources, settings
+) -> None:
+    engine = engine_failing_with(kind, exception_name=exception_name, detail="region 'xx' unknown")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    # max_retries=3 (the API default) — the policy, not the budget, is what stops the retrying.
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=3))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert tickets.incidents == []  # the requester's mistake — nobody is paged
+    assert final.run_state.incident_id is None
+    assert tickets.closed == [
+        (
+            "RITM0000001",
+            "Your request was closed due to a validation error",
+            TicketOutcome.UNSUCCESSFUL,
+        )
+    ]
+    assert len(engine.trigger_calls) == 1  # not retryable: exactly one engine run, no backoff
+    assert final.run_state.ticket_closed is True
 
 
 async def test_deadline_exceeded_fails_the_step(runs, tickets, resources, engine, settings) -> None:
@@ -410,7 +533,9 @@ async def test_close_ticket_step(tickets) -> None:
 
     assert await step.execute(run) is True
     assert run.run_state.ticket_closed is True
-    assert tickets.closed == [("RITM0000001", "Resource provisioned; request closed.")]
+    assert tickets.closed == [
+        ("RITM0000001", "Resource provisioned; request closed.", TicketOutcome.SUCCESSFUL)
+    ]
     assert await step.execute(run) is True  # re-drive: marker short-circuits
     assert len(tickets.closed) == 1
 

@@ -22,9 +22,11 @@ from typing import Any
 from orchestrator.domain import (
     ApprovalStatus,
     EngineRunStatus,
+    FailureKind,
     ResourceOperation,
     RunRejected,
     RunState,
+    StepFailure,
     StepName,
     StepResult,
     WorkflowEngineType,
@@ -88,6 +90,7 @@ class CreateTicketStep(StepHandler):
             fields=st.ticket_params,
             requested_by=run.created_by,
             idempotency_key=idem_key(run, StepName.CREATE_TICKET),
+            approval_group=st.approval_group,  # the team whose approval this request needs
         )
         logger.info("Run %s: opened ticket %s.", run.run_id, st.ticket.ticket_id)
         return True
@@ -207,19 +210,25 @@ class RunEngineStep(StepHandler):
             await self._capture_final_vendor_id(run, client)
             return True
         if status is EngineRunStatus.FAILED:
-            try:  # best-effort typed failure detail for the escalator
+            try:  # best-effort typed failure detail for the executor and the escalator
                 st.engine_failure = await client.get_failure(
                     st.workflow.automation_id, st.engine_run_id
                 )
                 logger.warning(
-                    "Run %s: engine failure detail — failed_task=%s.",
+                    "Run %s: engine failure detail — failed_task=%s, exception=%s, kind=%s.",
                     run.run_id,
-                    st.engine_failure.failed_task if st.engine_failure else None,
+                    st.engine_failure.failed_task,
+                    st.engine_failure.exception_name,
+                    st.engine_failure.kind.value,
                 )
             except Exception as e:
                 logger.warning("Could not fetch failure detail for run %s: %s", run.run_id, e)
-            raise RuntimeError(
-                f"Engine run {st.engine_run_id} of '{st.workflow.automation_id}' failed."
+            # Classified, so the failure policy decides whether this is worth another engine run
+            # and what the requester is told. Unknown detail → TASK: retried, then an incident.
+            kind = st.engine_failure.kind if st.engine_failure else FailureKind.TASK
+            raise StepFailure(
+                f"Engine run {st.engine_run_id} of '{st.workflow.automation_id}' failed.",
+                kind=kind,
             )
         return False  # still running → poll again later
 

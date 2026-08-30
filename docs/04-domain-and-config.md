@@ -47,7 +47,8 @@ class Settings(BaseSettings):
     servicenow_base_url: str
     servicenow_username: str
     servicenow_password: SecretStr
-    # team-name -> full ServiceNow assignment-group name; unknown names are used verbatim.
+    # group name -> sys_user_group sys_id. An override/pre-seed, not a requirement: a name that
+    # is not here is looked up in ServiceNow by name and remembered.
     servicenow_responsible_groups: dict[str, str] = Field(default_factory=dict)
     servicenow_incident_team: str = "cloudio"    # default team for failure incidents
 
@@ -111,11 +112,33 @@ class EngineRunStatus(str, Enum):
     IN_PROGRESS = "in_progress"
 
 
+class FailureKind(str, Enum):
+    """What kind of failure ended a run — the classification that selects a FailurePolicy
+    (see 07-orchestration). Named for the failure, not for the engine that reported it."""
+    VALIDATION = "validation"           # the request is wrong — no incident, close the ticket
+    INFRA_PRECHECK = "infra_precheck"   # a precheck refused it — same handling
+    TASK = "task"                       # the work broke — incident to the responsible group
+
+
+class TicketOutcome(str, Enum):
+    """How a ticket is being closed; the adapter maps it to the provider's close state
+    (ServiceNow: RITM state 3 Closed Complete vs 4 Closed Incomplete)."""
+    SUCCESSFUL = "successful"
+    UNSUCCESSFUL = "unsuccessful"
+
+
 # --- Exceptions ---
 
 class StaleRunError(Exception):
     """A save targeted a run version that changed underneath us (an overlapping re-drive).
     The executor drops the save; a worker re-drives the run."""
+
+
+class StepFailure(Exception):
+    """A step failure that carries its classification, so the executor can decide whether to
+    retry it and the escalator how to escalate it. Raised today only by RUN_ENGINE, for a
+    failure the engine classified; unclassified exceptions are treated as FailureKind.TASK."""
+    def __init__(self, message: str, kind: FailureKind = FailureKind.TASK) -> None: ...
 
 
 class StepDeadlineExceeded(Exception):
@@ -163,16 +186,25 @@ class ResourceSpec(BaseModel):
 class ResolvedWorkflow(BaseModel):
     """The registry mapping, snapshotted into the run at trigger time."""
     identifier: str
+    name: str | None = None   # human-readable label; falls back to the identifier where shown
     engine_type: WorkflowEngineType
     automation_id: str        # Airflow: DAG id
     ticket_template_id: str   # provider ticket template (ServiceNow: catalog item sys_id)
 
+    @property
+    def label(self) -> str:
+        """What a human should see this workflow called — on a ticket, in a message."""
+        return self.name or self.identifier
+
 
 class EngineFailure(BaseModel):
-    """What the engine reported about a failed run (drives incident routing)."""
+    """What the engine reported about a failed run (drives the failure policy and incident
+    routing). `kind` is resolved by the engine adapter from the exception the run raised."""
     failed_task: str | None = None
     responsible_group: str | None = None
-    detail: str | None = None
+    detail: str | None = None            # the exception's message
+    exception_name: str | None = None    # the exception's class name, e.g. "ValidationException"
+    kind: FailureKind = FailureKind.TASK
 
 
 class RunState(BaseModel):
@@ -183,6 +215,10 @@ class RunState(BaseModel):
     ticket_params: dict[str, Any] = PyField(default_factory=dict)    # provider template variables (pass-through)
     workflow_params: dict[str, Any] = PyField(default_factory=dict)  # engine conf (pass-through)
     resource: ResourceSpec | None = None                             # resource runs only
+    # Team whose approval the request's ticket needs; it is assigned to them. A group name,
+    # resolved by the ticket adapter. Distinct from EngineFailure.responsible_group, which routes
+    # the *incident* a DAG failure raises — the two never feed each other.
+    approval_group: str | None = None
 
     # step progress / idempotency markers
     ticket: TicketRef | None = None

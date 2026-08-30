@@ -33,7 +33,8 @@ async def _assemble(pg_session_factory, servicenow, airflow, project_manager):
         base_url="http://sn.local",
         username="u",
         password="p",
-        responsible_groups={"netops": "CloudIO NetOps"},
+        responsible_groups={"netops": "grpsys-netops"},
+        default_group="cloudio",
         transport=asgi(servicenow.app),
     )
     engine = AirflowWorkflowEngineClient(
@@ -143,7 +144,9 @@ async def test_engine_failure_run_fails_and_escalates(
         pg_session_factory, servicenow, airflow, project_manager
     )
     await workflows.register(
-        make_workflow(identifier="run-automation", run_type=RunType.AUTOMATION)
+        make_workflow(
+            identifier="run-automation", run_type=RunType.AUTOMATION, name="Run Automation"
+        )
     )
     # The automation run attaches to a pre-existing RITM (as ServiceNow would supply on trigger).
     seeded = servicenow.seed_ritm(correlation_id="user-created")
@@ -166,6 +169,13 @@ async def test_engine_failure_run_fails_and_escalates(
 
     assert final is not None and final.status is RunStatus.FAILED
     inc = servicenow.incidents[-1].body
-    assert inc["assignment_group"] == "CloudIO NetOps"  # routed to the responsible group
+    # Routed to the responsible group as a sys_id — reference fields never carry names.
+    assert inc["assignment_group"] == "grpsys-netops"
+    assert inc["caller_id"] == servicenow.users["jdoe"]  # and the caller as a sys_user sys_id
     assert inc["u_cloudio_failed_task"] == "provision_vm"
-    assert any(r.work_notes for r in servicenow.ritms)  # RITM annotated with the incident
+    # The DAG's own error reaches the responder as the incident body, titled by the workflow.
+    assert inc["short_description"] == f"Error in Run Automation automation ({seeded.number})"
+    assert inc["description"] == (
+        f"Run {run.run_id} has failed with the following error:\nTaskException: quota"
+    )
+    assert any(r.work_notes for r in servicenow.ritms)  # RITM closed with a note about the incident

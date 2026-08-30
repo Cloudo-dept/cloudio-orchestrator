@@ -38,7 +38,9 @@ class Settings(BaseSettings):
     servicenow_base_url: str
     servicenow_username: str
     servicenow_password: SecretStr
-    # team-name -> full ServiceNow assignment-group name; unknown names are used verbatim.
+    # group name -> sys_user_group sys_id. An override/pre-seed, not a requirement: a name that is
+    # not here is looked up in ServiceNow by name and remembered. Use it for names that differ from
+    # what a DAG raises (DAG says "netops", the group is "CloudIO NetOps") and to skip the lookup.
     servicenow_responsible_groups: dict[str, str] = Field(default_factory=dict)
     servicenow_incident_team: str = "cloudio"  # default team for failure incidents
 

@@ -12,6 +12,7 @@ from orchestrator.domain import (
     ApprovalStatus,
     EngineFailure,
     EngineRunStatus,
+    TicketOutcome,
     TicketRef,
     Workflow,
     WorkflowRun,
@@ -93,17 +94,31 @@ class TicketSystemClient(abc.ABC):
 
     @abc.abstractmethod
     async def open_ticket(
-        self, template_id: str, fields: dict[str, Any], requested_by: str, idempotency_key: str
+        self,
+        template_id: str,
+        fields: dict[str, Any],
+        requested_by: str,
+        idempotency_key: str,
+        approval_group: str | None = None,
     ) -> TicketRef:
-        """Open a ticket from a provider template (idempotent on the key)."""
+        """Open a ticket from a provider template (idempotent on the key). ``approval_group`` names
+        the team whose approval the request needs, and the ticket is assigned to them — the adapter
+        resolves the name to whatever the provider needs; None leaves routing to the provider."""
 
     @abc.abstractmethod
     async def get_approval_status(self, ticket: TicketRef) -> ApprovalStatus:
         """Current approval state of the ticket (pending until a human approves/rejects)."""
 
     @abc.abstractmethod
-    async def close_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
-        """Mark the ticket complete, optionally attaching a note."""
+    async def close_ticket(
+        self,
+        ticket: TicketRef,
+        note: str | None = None,
+        outcome: TicketOutcome = TicketOutcome.SUCCESSFUL,
+    ) -> None:
+        """Close the ticket, optionally attaching a note. ``outcome`` says whether the request was
+        fulfilled — a run that failed closes its ticket UNSUCCESSFUL, so a failed request is not
+        indistinguishable from a completed one."""
 
     @abc.abstractmethod
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
@@ -118,9 +133,14 @@ class TicketSystemClient(abc.ABC):
         flow_type: str | None = None,
         failed_task: str | None = None,
         comment: str | None = None,
+        description: str | None = None,
     ) -> TicketRef:
-        """Raise an incident for a failure, routed to the responsible group. ``comment``, when
-        given, is attached to the incident as a note (e.g. the failure's exception message)."""
+        """Raise an incident for a failure, routed to the responsible group.
+
+        ``summary`` is the one-line title. ``description`` is the body a responder reads first —
+        what failed and why. ``comment``, when given, is attached as a note; it carries the same
+        failure detail, so the detail survives even where a provider treats the body as immutable.
+        """
 
 
 class ResourceManagerClient(abc.ABC):

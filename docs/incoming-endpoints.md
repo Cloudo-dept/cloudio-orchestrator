@@ -186,8 +186,10 @@ error. **Auth: network-trust** (no HMAC/token). See [01-external-contracts](01-e
 
 ### `POST /api/v1/callbacks/engine-run`  → `202 Accepted`
 - **Source:** **Airflow** — the DAG's best-effort `on_success_callback` / `on_failure_callback`
-  POSTs the DAG run id (see [`airflow/dags/provision_vm.py`](../airflow/dags/provision_vm.py)).
-  Enabled by setting `ORCHESTRATOR_BASE_URL` in the Airflow environment.
+  POSTs the DAG run id (`notify_orchestrator` in
+  [`airflow/dags/cloudio_callbacks.py`](../airflow/dags/cloudio_callbacks.py), wired up by
+  [`provision_vm.py`](../airflow/dags/provision_vm.py)). Enabled by setting `ORCHESTRATOR_BASE_URL`
+  in the Airflow environment.
 - **Request — `EngineRunCallbackRequest`:**
 
   | Field | Type | Notes |

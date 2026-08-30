@@ -1,5 +1,6 @@
 """Stateful Airflow mock: faithful routes + scenario knobs (fail / complete / token-expiry)."""
 
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,7 +17,7 @@ class DagRun:
     conf: dict[str, Any]
     state: str = "success"  # queued | running | success | failed
     failed_task: str | None = None
-    exception: dict[str, Any] = field(default_factory=dict)  # {message, exception, group}
+    exception: dict[str, Any] = field(default_factory=dict)  # exception XCom; empty = none pushed
     xcoms: dict[str, str] = field(default_factory=dict)  # key -> value, on the "run_task" task
 
 
@@ -45,14 +46,23 @@ class AirflowMock:
         task: str,
         responsible_group: str | None = None,
         message: str = "boom",
+        exception: str = "TaskException",
+        publish_exception: bool = True,
     ) -> None:
+        """Fail a run. `exception` is the class name the DAG raised — what the orchestrator
+        classifies the failure by. publish_exception=False models a task that died without its
+        failure callback publishing the exception XCom (the entry then 404s, as in real Airflow)."""
         r = self.runs[dag_run_id]
         r.state, r.failed_task = "failed", task
-        r.exception = {
-            "message": message,
-            "exception": "RuntimeError",
-            "responsible_group": responsible_group,
-        }
+        r.exception = (
+            {
+                "message": message,
+                "exception": exception,
+                "responsible_group": responsible_group,
+            }
+            if publish_exception
+            else {}
+        )
 
     @property
     def app(self) -> FastAPI:
@@ -110,8 +120,13 @@ def _build(mock: AirflowMock) -> FastAPI:
     @app.get(
         "/api/v2/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/xcomEntries/exception_type"
     )
-    async def exception(dag_id: str, run_id: str, task_id: str) -> dict[str, Any]:
-        return mock.runs[run_id].exception
+    async def exception(dag_id: str, run_id: str, task_id: str) -> JSONResponse:
+        exc = mock.runs[run_id].exception
+        if not exc:  # the failing task published no exception XCom
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        # Faithful shape: the entry is wrapped and the value comes back stringified — the DAG-side
+        # failure callback pushes JSON, so the value is the JSON string the adapter parses.
+        return JSONResponse({"key": "exception_type", "value": json.dumps(exc)})
 
     @app.get(
         "/api/v2/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/xcomEntries/{xcom_key}"

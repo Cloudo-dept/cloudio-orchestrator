@@ -55,6 +55,7 @@ async def build(settings: Settings) -> Container:
         settings.servicenow_username,
         settings.servicenow_password.get_secret_value(),
         settings.servicenow_responsible_groups,
+        settings.servicenow_incident_team,
         settings.external_call_timeout_seconds,
         transport=FailureLoggingTransport("ServiceNow", httpx.AsyncHTTPTransport()),
     )

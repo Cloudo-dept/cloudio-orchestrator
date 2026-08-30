@@ -21,13 +21,19 @@ class TicketSystemClient(abc.ABC):
     """Domain-level ticket operations (ServiceNow is one implementation)."""
 
     @abc.abstractmethod
-    async def open_ticket(self, template_id: str, fields: dict[str, Any],
-                          requested_by: str, idempotency_key: str) -> TicketRef:
-        """Open a ticket from a provider template (idempotent on the key)."""
+    async def open_ticket(self, template_id: str, fields: dict[str, Any], requested_by: str,
+                          idempotency_key: str,
+                          approval_group: str | None = None) -> TicketRef:
+        """Open a ticket from a provider template (idempotent on the key). `approval_group` names
+        the team whose approval the request needs, and the ticket is assigned to them — the adapter
+        resolves the name to whatever the provider needs; None leaves routing to the provider."""
 
     @abc.abstractmethod
-    async def close_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
-        """Mark the ticket complete, optionally attaching a note."""
+    async def close_ticket(self, ticket: TicketRef, note: str | None = None,
+                           outcome: TicketOutcome = TicketOutcome.SUCCESSFUL) -> None:
+        """Close the ticket, optionally attaching a note. `outcome` says whether the request was
+        fulfilled — a run that failed closes its ticket UNSUCCESSFUL, so a failed request is not
+        indistinguishable from a completed one."""
 
     @abc.abstractmethod
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
@@ -35,9 +41,12 @@ class TicketSystemClient(abc.ABC):
 
     @abc.abstractmethod
     async def open_incident(self, summary: str, requested_by: str, responsible_group: str,
-                            flow_type: str | None = None,
-                            failed_task: str | None = None) -> TicketRef:
-        """Raise an incident for a failure, routed to the responsible group."""
+                            flow_type: str | None = None, failed_task: str | None = None,
+                            comment: str | None = None,
+                            description: str | None = None) -> TicketRef:
+        """Raise an incident for a failure, routed to the responsible group. `summary` is the
+        one-line title, `description` the body a responder reads first, and `comment` the same
+        failure detail as a note — so it survives where a provider treats the body as immutable."""
 
 
 class ResourceManagerClient(abc.ABC):
@@ -85,13 +94,59 @@ WorkflowEngineClient]` built in `bootstrap.py`. (The previous revision's
 REST API v2, token auth, `verify=False` per the plugin spec. `automation_id` == DAG id;
 the engine run id == `dag_run_id`.
 
+`get_failure` reads what the **DAG** published: the failure detail behind an incident comes from an
+XCom named `exception_type` on the failed task instance, carrying
+`{message, exception, responsible_group}`. Publishing it is the DAG author's side of the contract —
+[`airflow/dags/cloudio_callbacks.py`](../airflow/dags/cloudio_callbacks.py) ships the task-level
+`on_failure_callback` (`exception_callback(...)`) that does it, plus the DAG-level
+`notify_orchestrator` wake-early callback. Airflow wraps an XCom entry in `{"key", "value", ...}`
+and hands the value back stringified, so the callback pushes JSON and `_failure_from_xcom` parses
+it. A DAG that publishes nothing is not an error — the entry 404s, the incident still opens, and it
+falls back to the default team with no message.
+
+`exception` (the class name of what the task raised) is what **classifies** the failure. The payload
+schema is fixed, so the name is the only thing there is to classify by, and `_FAILURE_KINDS` maps it
+to a `FailureKind` — the sole piece of that vocabulary that crosses the port. An unrecognised or
+missing name stays `TASK`, so an unclassified DAG failure still opens an incident; the
+[failure policy](07-orchestration.md) then decides retries, incident, and what the requester is told.
+
 ```python
+import json
 from typing import Any
 
 import httpx
 
 from orchestrator.domain import EngineFailure, EngineRunStatus
 from orchestrator.ports import WorkflowEngineClient
+
+
+# The exception classes a CloudIO DAG raises, mapped to the domain classification. Matching is by
+# exact class name — the payload carries a name, not a type.
+_FAILURE_KINDS: dict[str, FailureKind] = {
+    "ValidationException": FailureKind.VALIDATION,
+    "InfraPrecheckException": FailureKind.INFRA_PRECHECK,
+    "TaskException": FailureKind.TASK,
+}
+
+
+def _failure_from_xcom(failed_task: str, body: Any) -> EngineFailure:
+    """The {message, exception, responsible_group} payload the DAG's failure callback pushed.
+    Anything that is not that shape degrades to a bare failure rather than raising."""
+    value: Any = body.get("value") if isinstance(body, dict) else None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:             # a plain string value is the message itself
+            return EngineFailure(failed_task=failed_task, detail=value)
+    if not isinstance(value, dict):
+        return EngineFailure(failed_task=failed_task)
+    raw_name = value.get("exception")
+    exception_name = raw_name if isinstance(raw_name, str) else None
+    return EngineFailure(failed_task=failed_task,
+                         responsible_group=value.get("responsible_group"),
+                         detail=value.get("message"),
+                         exception_name=exception_name,
+                         kind=_FAILURE_KINDS.get(exception_name or "", FailureKind.TASK))
 
 
 class AirflowWorkflowEngineClient(WorkflowEngineClient):
@@ -167,11 +222,10 @@ class AirflowWorkflowEngineClient(WorkflowEngineClient):
             "GET",
             f"/api/v2/dags/{automation_id}/dagRuns/{run_id}/taskInstances/{tasks[0]}"
             f"/xcomEntries/exception_type")
+        if exc.status_code == 404:      # the task died before its failure callback published
+            return EngineFailure(failed_task=tasks[0])
         exc.raise_for_status()
-        data = exc.json()                            # {message, exception, responsible_group}
-        return EngineFailure(failed_task=tasks[0],
-                             responsible_group=data.get("responsible_group"),
-                             detail=data.get("message"))
+        return _failure_from_xcom(tasks[0], exc.json())
 
     async def get_output(self, automation_id: str, run_id: str, key: str) -> str | None:
         # XComs live on task instances; probe each task of the run for an entry named `key`.
@@ -198,6 +252,17 @@ Templates are catalog items, tickets are RITMs (`sc_req_item`), incidents are IN
 vocabulary is confined to this class. Create idempotency is orchestrator-added: the RITM is tagged
 with `correlation_id` and looked up before re-ordering.
 
+**Reference fields carry sys_ids, never names.** Teams and users cross the port as *names* — the
+`approval_group` from the trigger request (assigns the RITM), the `responsible_group` from the DAG
+that failed (routes the INC), a login for the requester — and this class resolves them:
+`_group_sys_id` checks the configured `responsible_groups` map (which is also its memo cache, and
+serves both kinds of name) and otherwise looks the name up in `sys_user_group`, remembering it;
+`_user_sys_id` does the same against `sys_user`. A name that resolves nowhere is never written into
+the field: an incident falls back to the default incident team and, failing that, opens unassigned
+for ServiceNow to triage; a RITM keeps whatever group its catalog workflow assigned. The one
+exception is `caller_id` / `sysparm_requested_for`, which fall back to the raw login, since
+ServiceNow accepts one there.
+
 ```python
 from typing import Any
 
@@ -210,14 +275,18 @@ from orchestrator.ports import TicketSystemClient
 class ServiceNowTicketClient(TicketSystemClient):
     _BUSINESS_SERVICE = "רשת יחידה"
     _SERVICE_OFFERING = "שירותי פיתוח"
-    _RITM_CLOSED = 3
+    _RITM_CLOSED = 3                # Closed Complete
+    _RITM_CLOSED_INCOMPLETE = 4     # Closed Incomplete — the request ended in failure
+    _CLOSE_STATES = {TicketOutcome.SUCCESSFUL: _RITM_CLOSED,
+                     TicketOutcome.UNSUCCESSFUL: _RITM_CLOSED_INCOMPLETE}
 
     def __init__(self, base_url: str, username: str, password: str,
-                 responsible_groups: dict[str, str], timeout: float = 10.0,
+                 responsible_groups: dict[str, str], default_group: str, timeout: float = 10.0,
                  transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._base = base_url.rstrip("/")
         self._auth = (username, password)
-        self._groups = responsible_groups
+        self._groups = dict(responsible_groups)   # group name -> sys_id; also the memo cache
+        self._default_group = default_group       # incident fallback when a name resolves nowhere
         self._timeout = timeout
         self._transport = transport     # test seam: inject an ASGITransport (11-testing); None in prod
 
@@ -225,8 +294,34 @@ class ServiceNowTicketClient(TicketSystemClient):
         return httpx.AsyncClient(base_url=self._base, timeout=self._timeout, auth=self._auth,
                                  headers={"Accept": "application/json"}, transport=self._transport)
 
-    def _group(self, name: str) -> str:
-        return self._groups.get(name, name)     # fall back to the exact name if unregistered
+    async def _group_sys_id(self, name: str) -> str | None:
+        """The configured map first, then ServiceNow. None when the name resolves nowhere — the
+        caller decides; never write the name itself into a reference field."""
+        known = self._groups.get(name)
+        if known:
+            return known
+        sys_id = await self._lookup_sys_id("sys_user_group", "name", name)
+        if sys_id is None:
+            logger.warning("No ServiceNow group named '%s'.", name)
+            return None
+        self._groups[name] = sys_id             # memoised; a miss is not, so a new group resolves
+        return sys_id
+
+    async def _lookup_sys_id(self, table: str, field: str, value: str) -> str | None:
+        """The sys_id of the first row where `field` == `value`, or None. Every reference field
+        (assignment_group, caller_id, ...) is filled from this."""
+        async with self._client() as client:
+            resp = await client.get(f"/api/now/table/{table}",
+                                    params={"sysparm_query": f"{field}={value}",
+                                            "sysparm_fields": "sys_id", "sysparm_limit": 1})
+            resp.raise_for_status()
+            rows = resp.json().get("result", [])
+        return str(rows[0]["sys_id"]) if rows else None
+
+    async def _user_sys_id(self, login: str) -> str:
+        """The sys_user sys_id for a login, falling back to the login itself when unknown."""
+        sys_id = await self._lookup_sys_id("sys_user", "user_param", login)
+        return sys_id if sys_id is not None else login
 
     async def _patch(self, table: str, sys_id: str, **body: Any) -> None:
         async with self._client() as client:
@@ -241,17 +336,23 @@ class ServiceNowTicketClient(TicketSystemClient):
         rows = resp.json().get("result", [])
         return TicketRef(ticket_id=rows[0]["number"], native_id=rows[0]["sys_id"]) if rows else None
 
-    async def open_ticket(self, template_id: str, fields: dict[str, Any],
-                          requested_by: str, idempotency_key: str) -> TicketRef:
+    async def open_ticket(self, template_id: str, fields: dict[str, Any], requested_by: str,
+                          idempotency_key: str,
+                          approval_group: str | None = None) -> TicketRef:
         # template_id == catalog item sys_id; ticket == RITM.
         async with self._client() as client:
             found = await self._find_ritm(client, idempotency_key)
             if found:                                      # already ordered for this key -> idempotent
                 return found
+            # Both lookups happen BEFORE ordering: every call between the order and the
+            # correlation_id tag widens the double-order window (01-external-contracts).
+            requested_by_sys_id = await self._user_sys_id(requested_by)
+            group_sys_id = (await self._group_sys_id(approval_group)
+                            if approval_group else None)
             order = await client.post(
                 f"/api/sn_sc/servicecatalog/items/{template_id}/order_now",
                 json={"variables": fields, "sysparm_quantity": 1,
-                      "sysparm_requested_for": requested_by})
+                      "sysparm_requested_for": requested_by_sys_id})
             order.raise_for_status()
             request_sys_id = order.json()["result"]["sys_id"]
             ritm = await client.get("/api/now/table/sc_req_item",
@@ -259,13 +360,19 @@ class ServiceNowTicketClient(TicketSystemClient):
                                             "sysparm_fields": "number,sys_id", "sysparm_limit": 1})
             ritm.raise_for_status()
             r = ritm.json()["result"][0]
-            await client.patch(f"/api/now/table/sc_req_item/{r['sys_id']}",
-                               json={"correlation_id": idempotency_key})
+            # One PATCH carries the idempotency tag AND the approving group (the RITM routes to
+            # that team). An unresolvable group leaves the field to the catalog workflow.
+            body = {"correlation_id": idempotency_key}
+            if group_sys_id is not None:
+                body["assignment_group"] = group_sys_id
+            await client.patch(f"/api/now/table/sc_req_item/{r['sys_id']}", json=body)
             return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
 
-    async def close_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
+    async def close_ticket(self, ticket: TicketRef, note: str | None = None,
+                           outcome: TicketOutcome = TicketOutcome.SUCCESSFUL) -> None:
         body = {"work_notes": note} if note else {}
-        await self._patch("sc_req_item", ticket.native_id, state=self._RITM_CLOSED, **body)
+        await self._patch("sc_req_item", ticket.native_id,
+                          state=self._CLOSE_STATES[outcome], **body)
 
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
         await self._patch("sc_req_item", ticket.native_id, work_notes=note)
@@ -276,14 +383,20 @@ class ServiceNowTicketClient(TicketSystemClient):
         body: dict[str, Any] = {
             "u_noc": True,
             "contact_type": "self-service",
-            "short_descriptoin": summary,                  # field name per the plugin spec (sic)
+            "short_description": summary,
             "urgency": 3, "impact": 3,
-            "caller_id": requested_by,
+            "caller_id": await self._user_sys_id(requested_by),
             "business_service": self._BUSINESS_SERVICE,
             "service_offering": self._SERVICE_OFFERING,
             "u_new_subcategory": "CloudIO",
-            "assignment_group": self._group(responsible_group),
         }
+        if description:                                    # what failed and why, as the INC body
+            body["description"] = description
+        # The responsible team, else the default incident team; omitted when neither resolves, so
+        # ServiceNow triages it instead of receiving a broken reference.
+        group_sys_id = await self._assignment_group(responsible_group)
+        if group_sys_id is not None:
+            body["assignment_group"] = group_sys_id
         if flow_type and failed_task:                      # DAG-run failures only
             body["u_cloudio_flow_type"] = flow_type
             body["u_cloudio_failed_task"] = failed_task

@@ -111,8 +111,15 @@ This starts:
 - **api** — the FastAPI app on `http://localhost:8000` (docs at `/docs`), with `--reload`.
 - **worker** — the claim-and-drive daemon.
 - **airflow** — Airflow 3.0.3 standalone (the workflow engine) on `http://localhost:8080`. Drop
-  DAGs in `./airflow/dags`. Login is a fixed **`admin` / `password`** (compose seeds
-  SimpleAuthManager's passwords file so it never generates a random one) — set
+  DAGs in `./airflow/dags`; wire each one to the two callbacks in
+  [`cloudio_callbacks.py`](airflow/dags/cloudio_callbacks.py) — one wakes the waiting run on
+  completion, the other publishes the task's exception, whose **class** decides what the requester
+  gets: `ValidationException` / `InfraPrecheckException` close the ticket with no incident and no
+  retry, `TaskException` (or anything else) is retried and then raises an incident to the
+  responsible group. See the dev DAG [`provision_vm.py`](airflow/dags/provision_vm.py), which takes
+  `conf={"fail": "validation" | "precheck" | "task"}` to exercise each path.
+  Login is a fixed **`admin` / `password`**
+  (compose seeds SimpleAuthManager's passwords file so it never generates a random one) — set
   `ORCH_AIRFLOW_PASSWORD=password` in `.env`. First boot still takes ~a minute to initialize.
 - **project-manager** + **pm-postgres** — a dev-only Project Manager API mock (FastAPI, in
   `dev/project_manager/`) with its **own** Postgres, on `http://localhost:8081`. Beyond the

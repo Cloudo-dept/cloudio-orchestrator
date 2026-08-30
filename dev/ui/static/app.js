@@ -301,6 +301,9 @@ $("#trigger-form").addEventListener("submit", async (e) => {
       max_retries: parseInt(f.get("max_retries"), 10),
       ticket_params: readJSON("ticket_params"),
       workflow_params: readJSON("workflow_params"),
+      // Optional: the group whose approval the RITM needs. A name — the orchestrator resolves it
+      // to a sys_id. Unrelated to the group a failing DAG names for its incident.
+      approval_group: (f.get("approval_group") || "").trim() || null,
     };
     if (opt.dataset.runType === "resource") {
       body.resource = {

@@ -12,16 +12,19 @@ from datetime import timedelta
 
 from orchestrator.config import Settings
 from orchestrator.domain import (
+    FailureKind,
     RunRejected,
     RunStatus,
     StaleRunError,
     StepDeadlineExceeded,
+    StepFailure,
     StepName,
     WorkflowRun,
     utcnow,
 )
 from orchestrator.log import run_log_context
 from orchestrator.orchestration.escalator import FailureEscalator
+from orchestrator.orchestration.failure_policy import policy_for
 from orchestrator.orchestration.plans import RUN_PLANS
 from orchestrator.orchestration.steps import StepHandler
 from orchestrator.ports import WorkflowRunRepository
@@ -141,7 +144,12 @@ class RunExecutor:
     ) -> None:
         attempts = run.run_state.step_attempts
         attempts[step] = attempts.get(step, 0) + 1
-        if attempts[step] <= run.max_retries:
+        # A classified failure can be one there is no point retrying (a validation error fails
+        # identically on every re-run, and each RUN_ENGINE retry costs a whole fresh engine run).
+        # Anything unclassified is a TASK failure: retried, exactly as before.
+        kind = error.kind if isinstance(error, StepFailure) else FailureKind.TASK
+        retryable = policy_for(kind).retryable
+        if retryable and attempts[step] <= run.max_retries:
             handler.reset_for_retry(run.run_state)
             run.run_state.step_started_at.pop(step, None)
             backoff = self.settings.retry_base_seconds * 2 ** (attempts[step] - 1) + random.uniform(
@@ -159,14 +167,16 @@ class RunExecutor:
                 exc_info=error,
             )
             return
-        # exhausted → terminal FAILED + escalate (Incident + RITM note). Nothing is rolled back.
+        # Exhausted (or never retryable) → terminal FAILED + escalate per the failure policy.
+        # Nothing is rolled back.
         run.run_state.errors[step] = str(error)
         run.status, run.scheduled_at = RunStatus.FAILED, None
         logger.error(
-            "Run %s step %s exhausted %s retries; escalating and marking FAILED.",
+            "Run %s step %s %s; escalating a %s failure and marking FAILED.",
             run.run_id,
             step,
-            run.max_retries,
+            f"exhausted {run.max_retries} retries" if retryable else "is not retryable",
+            kind.value,
             exc_info=error,
         )
         await self.escalator.escalate(run, error)

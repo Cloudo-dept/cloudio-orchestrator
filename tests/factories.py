@@ -56,11 +56,13 @@ def make_run(
     max_retries: int = 3,
     automation_id: str = "dag-x",
     ticket_template_id: str = "cat-1",
+    workflow_name: str | None = None,  # None → a shown label falls back to the identifier
 ) -> WorkflowRun:
     with_resource = run_type is RunType.RESOURCE
     state = RunState(
         workflow=ResolvedWorkflow(
             identifier="provision-vm",
+            name=workflow_name,
             engine_type=WorkflowEngineType.AIRFLOW,
             automation_id=automation_id,
             ticket_template_id=ticket_template_id,

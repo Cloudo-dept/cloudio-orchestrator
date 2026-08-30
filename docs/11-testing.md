@@ -34,7 +34,8 @@ tests/
 │   ├── test_domain.py              # enum/JSONB round-trip, RunState validation
 │   ├── test_orchestration.py       # steps/executor/escalator over fakes; retry & idempotency
 │   ├── test_worker.py              # RunWorker loop: claims 1, drives, empty-poll backoff
-│   └── test_services.py            # trigger → WorkflowRun built from the ResolvedWorkflow snapshot
+│   ├── test_services.py            # trigger → WorkflowRun built from the ResolvedWorkflow snapshot
+│   └── test_dag_callbacks.py       # airflow/dags/cloudio_callbacks.py, loaded by path (stdlib only)
 └── integration/
     ├── test_adapter_servicenow.py  # real ServiceNowTicketClient vs ServiceNowMock
     ├── test_adapter_airflow.py
@@ -139,7 +140,7 @@ class DagRun:
     conf: dict[str, Any]
     state: str = "success"                          # queued | running | success | failed
     failed_task: str | None = None
-    exception: dict[str, Any] = field(default_factory=dict)   # {message, exception, responsible_group}
+    exception: dict[str, Any] = field(default_factory=dict)   # exception XCom; empty = none pushed
 
 
 @dataclass
@@ -157,11 +158,15 @@ class AirflowMock:
         self.runs[dag_run_id].state = state
 
     def fail(self, dag_run_id: str, *, task: str, responsible_group: str | None = None,
-             message: str = "boom") -> None:
+             message: str = "boom", exception: str = "TaskException",
+             publish_exception: bool = True) -> None:
+        """`exception` is the class name the DAG raised — what the orchestrator classifies the
+        failure by. publish_exception=False models a task that died without its failure callback
+        publishing the exception XCom (the entry then 404s, as in real Airflow)."""
         r = self.runs[dag_run_id]
         r.state, r.failed_task = "failed", task
-        r.exception = {"message": message, "exception": "RuntimeError",
-                       "responsible_group": responsible_group}
+        r.exception = ({"message": message, "exception": exception,
+                        "responsible_group": responsible_group} if publish_exception else {})
 
     @property
     def app(self) -> FastAPI:
@@ -209,8 +214,13 @@ def _build_airflow(mock: AirflowMock) -> FastAPI:
 
     @app.get("/api/v2/dags/{dag_id}/dagRuns/{run_id}"
              "/taskInstances/{task_id}/xcomEntries/exception_type")
-    async def exception(dag_id: str, run_id: str, task_id: str) -> dict[str, Any]:
-        return mock.runs[run_id].exception
+    async def exception(dag_id: str, run_id: str, task_id: str) -> JSONResponse:
+        exc = mock.runs[run_id].exception
+        if not exc:                                  # the failing task published no exception XCom
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        # Faithful shape: the entry is wrapped and the value comes back stringified — the DAG-side
+        # failure callback pushes JSON, so the value is the JSON string the adapter parses.
+        return JSONResponse({"key": "exception_type", "value": json.dumps(exc)})
 
     return app
 ```
@@ -234,6 +244,7 @@ class Ritm:
     correlation_id: str | None = None
     state: int | None = None
     work_notes: list[str] = field(default_factory=list)
+    assignment_group: str | None = None        # sys_user_group sys_id the RITM was assigned to
 
 
 @dataclass
@@ -249,6 +260,11 @@ class ServiceNowMock:
     incidents: list[Incident] = field(default_factory=list)
     overrides: list[Override] = field(default_factory=list)
     requests: list[tuple[str, str]] = field(default_factory=list)
+    users: dict[str, str] = field(default_factory=lambda: {"jdoe": "usersys0000001"})
+    # sys_user_group rows: name -> sys_id. What an unmapped group name resolves against; clear it
+    # to model a name that exists nowhere. "cloudio" is the default incident team.
+    groups: dict[str, str] = field(
+        default_factory=lambda: {"CloudIO NetOps": "grpsys0000002", "cloudio": "grpsys0000003"})
     _seq: int = 0
 
     def _mint(self, prefix: str) -> tuple[str, str]:
@@ -288,6 +304,13 @@ def _build_servicenow(mock: ServiceNowMock) -> FastAPI:
         else:
             hits = []
         return {"result": [{"number": r.number, "sys_id": r.sys_id} for r in hits[:1]]}
+
+    @app.get("/api/now/table/sys_user_group")
+    async def query_group(sysparm_query: str = "") -> dict[str, Any]:
+        # name=<group name>; a group nobody created returns no rows, like the real table
+        field_name, _, value = sysparm_query.partition("=")
+        sys_id = mock.groups.get(value) if field_name == "name" else None
+        return {"result": [{"sys_id": sys_id}] if sys_id else []}
 
     @app.post("/api/sn_sc/servicecatalog/items/{catalog_sys_id}/order_now")
     async def order(catalog_sys_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -407,7 +430,8 @@ def servicenow() -> ServiceNowMock:
 @pytest.fixture
 def servicenow_client(servicenow: ServiceNowMock) -> ServiceNowTicketClient:
     return ServiceNowTicketClient(base_url="http://servicenow.local", username="u", password="p",
-                                  responsible_groups={"netops": "CloudIO NetOps"},
+                                  responsible_groups={"netops": "grpsys-netops"},
+                                  default_group="cloudio",
                                   transport=asgi(servicenow.app))
 
 
@@ -448,6 +472,19 @@ async def test_get_failure_returns_typed_group(airflow, airflow_client):
     failure = await airflow_client.get_failure("dag-x", "run-1")
     assert (failure.failed_task, failure.responsible_group, failure.detail) == \
            ("provision_vm", "netops", "quota exceeded")
+
+
+@pytest.mark.parametrize(("exception", "kind"), [
+    ("ValidationException", FailureKind.VALIDATION),
+    ("InfraPrecheckException", FailureKind.INFRA_PRECHECK),
+    ("TaskException", FailureKind.TASK),
+    ("ValueError", FailureKind.TASK),                  # unclassified → the incident-opening default
+])
+async def test_get_failure_classifies_by_exception_name(exception, kind, airflow, airflow_client):
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    airflow.fail("run-1", task="provision_vm", exception=exception, message="nope")
+    failure = await airflow_client.get_failure("dag-x", "run-1")
+    assert (failure.kind, failure.exception_name) == (kind, exception)
 
 
 async def test_trigger_unknown_dag_raises(airflow, airflow_client):
@@ -493,7 +530,8 @@ Poll intervals are set to `0` in the fixture so a re-claim is immediate, and
 async def test_resource_run_reaches_completed(pg_session_factory, servicenow, airflow,
                                               project_manager):
     tickets = ServiceNowTicketClient(base_url="http://sn.local", username="u", password="p",
-                                     responsible_groups={}, transport=asgi(servicenow.app))
+                                     responsible_groups={}, default_group="cloudio",
+                                     transport=asgi(servicenow.app))
     engine = AirflowWorkflowEngineClient(base_url="http://af.local", username="u", password="p",
                                          transport=asgi(airflow.app))
     resources = ProjectManagerResourceClient(base_url="http://pm.local", token="t",

@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from orchestrator.adapters.airflow import AirflowWorkflowEngineClient
-from orchestrator.domain import EngineRunStatus
+from orchestrator.domain import EngineRunStatus, FailureKind
 from tests.mocks.airflow import AirflowMock
 from tests.mocks.base import Override
 
@@ -57,6 +57,27 @@ async def test_get_failure_returns_typed_group(
     )
 
 
+@pytest.mark.parametrize(
+    ("exception", "kind"),
+    [
+        ("ValidationException", FailureKind.VALIDATION),
+        ("InfraPrecheckException", FailureKind.INFRA_PRECHECK),
+        ("TaskException", FailureKind.TASK),
+        ("ValueError", FailureKind.TASK),  # unclassified → the incident-opening default
+    ],
+)
+async def test_get_failure_classifies_by_exception_name(
+    exception: str,
+    kind: FailureKind,
+    airflow: AirflowMock,
+    airflow_client: AirflowWorkflowEngineClient,
+) -> None:
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    airflow.fail("run-1", task="provision_vm", exception=exception, message="nope")
+    failure = await airflow_client.get_failure("dag-x", "run-1")
+    assert (failure.kind, failure.exception_name) == (kind, exception)
+
+
 async def test_get_failure_empty_when_no_failed_task(
     airflow: AirflowMock, airflow_client: AirflowWorkflowEngineClient
 ) -> None:
@@ -95,3 +116,34 @@ async def test_get_output_none_when_absent(
 ) -> None:
     await airflow_client.trigger_workflow("dag-x", {}, "run-1")
     assert await airflow_client.get_output("dag-x", "run-1", "final_vendor_id") is None
+
+
+async def test_get_failure_without_exception_xcom_keeps_the_failed_task(
+    airflow: AirflowMock, airflow_client: AirflowWorkflowEngineClient
+) -> None:
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    airflow.fail("run-1", task="provision", publish_exception=False)  # entry 404s
+    failure = await airflow_client.get_failure("dag-x", "run-1")
+    assert (failure.failed_task, failure.responsible_group, failure.detail) == (
+        "provision",
+        None,
+        None,
+    )
+    assert failure.kind is FailureKind.TASK  # nothing to classify by → an incident is opened
+
+
+async def test_get_failure_keeps_a_non_json_xcom_value_as_the_detail(
+    airflow: AirflowMock, airflow_client: AirflowWorkflowEngineClient
+) -> None:
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    airflow.fail("run-1", task="provision")
+    airflow.overrides.append(
+        Override(  # a DAG that pushed a bare string instead of the documented payload
+            path_contains="/xcomEntries/exception_type",
+            method="GET",
+            status=200,
+            json={"key": "exception_type", "value": "disk quota exceeded"},
+        )
+    )
+    failure = await airflow_client.get_failure("dag-x", "run-1")
+    assert (failure.failed_task, failure.detail) == ("provision", "disk quota exceeded")

@@ -43,7 +43,10 @@ def servicenow_client(servicenow: ServiceNowMock) -> ServiceNowTicketClient:
         base_url="http://servicenow.local",
         username="u",
         password="p",
-        responsible_groups={"netops": "CloudIO NetOps"},
+        # "netops" is pre-seeded (no lookup); every other name resolves against the mock's
+        # sys_user_group table, and "cloudio" is the default incident team.
+        responsible_groups={"netops": "grpsys-netops"},
+        default_group="cloudio",
         transport=asgi(servicenow.app),
     )
 

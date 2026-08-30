@@ -1,11 +1,52 @@
 """Airflow workflow-engine adapter — REST API v2, token auth, verify=False per the plugin spec."""
 
+import json
 from typing import Any
 
 import httpx
 
-from orchestrator.domain import EngineFailure, EngineRunStatus
+from orchestrator.domain import EngineFailure, EngineRunStatus, FailureKind
 from orchestrator.ports import WorkflowEngineClient
+
+# The exception classes a CloudIO DAG raises (airflow/dags/cloudio_callbacks.py), mapped to the
+# domain classification. This is the whole reason DAG vocabulary stops here: only FailureKind
+# crosses the port. Matching is by exact class name — the payload carries a name, not a type — so a
+# DAG that defines its own ValidationException instead of importing ours still classifies.
+_FAILURE_KINDS: dict[str, FailureKind] = {
+    "ValidationException": FailureKind.VALIDATION,
+    "InfraPrecheckException": FailureKind.INFRA_PRECHECK,
+    "TaskException": FailureKind.TASK,
+}
+
+
+def _failure_from_xcom(failed_task: str, body: Any) -> EngineFailure:
+    """Turn the exception XCom a DAG's failure callback published into typed failure detail.
+
+    The payload is ``{message, exception, responsible_group}`` (see ``airflow/dags/
+    cloudio_callbacks.py``); `exception` is the class name that classifies the failure. Airflow
+    wraps an XCom entry in ``{"key", "value", ...}`` and hands the value back stringified, so it
+    normally arrives as the JSON string the callback pushed — hence the parse. Anything that is not
+    that shape degrades to a bare failure rather than raising: the escalation still happens, it just
+    loses the message and routing. An unrecognised (or missing) exception name stays TASK, so an
+    unclassified DAG failure still opens an incident.
+    """
+    value: Any = body.get("value") if isinstance(body, dict) else None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:  # a plain string value is the message itself
+            return EngineFailure(failed_task=failed_task, detail=value)
+    if not isinstance(value, dict):
+        return EngineFailure(failed_task=failed_task)
+    raw_name = value.get("exception")
+    exception_name = raw_name if isinstance(raw_name, str) else None
+    return EngineFailure(
+        failed_task=failed_task,
+        responsible_group=value.get("responsible_group"),
+        detail=value.get("message"),
+        exception_name=exception_name,
+        kind=_FAILURE_KINDS.get(exception_name or "", FailureKind.TASK),
+    )
 
 
 class AirflowWorkflowEngineClient(WorkflowEngineClient):
@@ -104,13 +145,10 @@ class AirflowWorkflowEngineClient(WorkflowEngineClient):
             f"/api/v2/dags/{automation_id}/dagRuns/{run_id}/taskInstances/{tasks[0]}"
             f"/xcomEntries/exception_type",
         )
+        if exc.status_code == 404:  # the task died before its failure callback published anything
+            return EngineFailure(failed_task=tasks[0])
         exc.raise_for_status()
-        data = exc.json()  # {message, exception, responsible_group}
-        return EngineFailure(
-            failed_task=tasks[0],
-            responsible_group=data.get("responsible_group"),
-            detail=data.get("message"),
-        )
+        return _failure_from_xcom(tasks[0], exc.json())
 
     async def get_output(self, automation_id: str, run_id: str, key: str) -> str | None:
         # XComs live on task instances; probe each task of the run for an entry named `key`.

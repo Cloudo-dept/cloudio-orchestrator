@@ -13,6 +13,7 @@ from orchestrator.domain import (
     EngineRunStatus,
     RunStatus,
     StaleRunError,
+    TicketOutcome,
     TicketRef,
     Workflow,
     WorkflowAlreadyExistsError,
@@ -161,7 +162,8 @@ class FakeTicketSystemClient(TicketSystemClient):
     def __init__(self) -> None:
         self.tickets_by_key: dict[str, TicketRef] = {}
         self.open_ticket_calls: list[str] = []  # idempotency keys, in order
-        self.closed: list[tuple[str, str | None]] = []  # (ticket_id, note)
+        self.approval_groups: list[str | None] = []  # approval_group per open_ticket call
+        self.closed: list[tuple[str, str | None, TicketOutcome]] = []  # (ticket_id, note, outcome)
         self.notes: list[tuple[str, str]] = []  # (ticket_id, note)
         self.incidents: list[dict[str, Any]] = []
         # default APPROVED so a resource run drives straight through AWAIT_APPROVAL; flip to
@@ -174,9 +176,15 @@ class FakeTicketSystemClient(TicketSystemClient):
         return TicketRef(ticket_id=f"{prefix}{self._seq:07d}", native_id=f"sys{self._seq:07d}")
 
     async def open_ticket(
-        self, template_id: str, fields: dict[str, Any], requested_by: str, idempotency_key: str
+        self,
+        template_id: str,
+        fields: dict[str, Any],
+        requested_by: str,
+        idempotency_key: str,
+        approval_group: str | None = None,
     ) -> TicketRef:
         self.open_ticket_calls.append(idempotency_key)
+        self.approval_groups.append(approval_group)  # the team the ticket routes to for approval
         if idempotency_key in self.tickets_by_key:  # idempotent on the key
             return self.tickets_by_key[idempotency_key]
         ref = self._mint("RITM")
@@ -186,8 +194,13 @@ class FakeTicketSystemClient(TicketSystemClient):
     async def get_approval_status(self, ticket: TicketRef) -> ApprovalStatus:
         return self.approval_status
 
-    async def close_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
-        self.closed.append((ticket.ticket_id, note))
+    async def close_ticket(
+        self,
+        ticket: TicketRef,
+        note: str | None = None,
+        outcome: TicketOutcome = TicketOutcome.SUCCESSFUL,
+    ) -> None:
+        self.closed.append((ticket.ticket_id, note, outcome))
 
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
         self.notes.append((ticket.ticket_id, note))
@@ -200,6 +213,7 @@ class FakeTicketSystemClient(TicketSystemClient):
         flow_type: str | None = None,
         failed_task: str | None = None,
         comment: str | None = None,
+        description: str | None = None,
     ) -> TicketRef:
         ref = self._mint("INC")
         self.incidents.append(
@@ -211,6 +225,7 @@ class FakeTicketSystemClient(TicketSystemClient):
                 "flow_type": flow_type,
                 "failed_task": failed_task,
                 "comment": comment,
+                "description": description,
             }
         )
         return ref
