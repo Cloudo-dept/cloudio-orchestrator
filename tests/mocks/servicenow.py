@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request, Response
 
+from orchestrator.adapters.servicenow import GROUP_LOOKUP_FIELD, USER_LOOKUP_FIELD
 from tests.mocks.base import Override, apply_overrides
 
 
@@ -85,18 +86,20 @@ def _build(mock: ServiceNowMock) -> FastAPI:
             hits = []
         return {"result": [{"number": r.number, "sys_id": r.sys_id} for r in hits[:1]]}
 
+    # Both tables answer only on the column the adapter is configured to query — the instance this
+    # doubles for is the one those constants describe, so a query on anything else finds nothing.
     @app.get("/api/now/table/sys_user")
     async def query_user(sysparm_query: str = "") -> dict[str, Any]:
-        # user_param=<login>; unknown logins return no rows, like the real table
+        # <USER_LOOKUP_FIELD>=<login>; unknown logins return no rows, like the real table
         field_name, _, value = sysparm_query.partition("=")
-        sys_id = mock.users.get(value) if field_name == "user_param" else None
+        sys_id = mock.users.get(value) if field_name == USER_LOOKUP_FIELD else None
         return {"result": [{"sys_id": sys_id}] if sys_id else []}
 
     @app.get("/api/now/table/sys_user_group")
     async def query_group(sysparm_query: str = "") -> dict[str, Any]:
-        # name=<group name>; a group nobody created returns no rows
+        # <GROUP_LOOKUP_FIELD>=<group name>; a group nobody created returns no rows
         field_name, _, value = sysparm_query.partition("=")
-        sys_id = mock.groups.get(value) if field_name == "name" else None
+        sys_id = mock.groups.get(value) if field_name == GROUP_LOOKUP_FIELD else None
         return {"result": [{"sys_id": sys_id}] if sys_id else []}
 
     @app.get("/api/now/table/sc_req_item/{sys_id}")

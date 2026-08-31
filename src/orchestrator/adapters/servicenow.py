@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 # ServiceNow drops it without complaint.
 APPROVAL_GROUP_VARIABLE = "approval_group"
 
+# The columns a name is looked up by. Instance-specific: change them here, in one place, if your
+# ServiceNow identifies groups or users by something other than these (u_group_name, user_name, an
+# email). Everything a group or user name is resolved through goes via these two.
+GROUP_LOOKUP_FIELD = "name"  # sys_user_group column matched against a group name
+USER_LOOKUP_FIELD = "user_param"  # sys_user column matched against a login
+
 
 class ServiceNowTicketClient(TicketSystemClient):
     _BUSINESS_SERVICE = "רשת יחידה"
@@ -75,7 +81,7 @@ class ServiceNowTicketClient(TicketSystemClient):
         known = self._groups.get(name)
         if known:
             return known
-        sys_id = await self._lookup_sys_id("sys_user_group", "name", name)
+        sys_id = await self._lookup_sys_id("sys_user_group", GROUP_LOOKUP_FIELD, name)
         if sys_id is None:
             logger.warning("No ServiceNow group named '%s'.", name)
             return None
@@ -121,7 +127,7 @@ class ServiceNowTicketClient(TicketSystemClient):
         """The sys_user sys_id for a login, falling back to the login itself when there is no such
         user — ServiceNow resolves some references by login, and a ticket opened against a slightly
         wrong caller beats no ticket at all."""
-        sys_id = await self._lookup_sys_id("sys_user", "user_param", login)
+        sys_id = await self._lookup_sys_id("sys_user", USER_LOOKUP_FIELD, login)
         if sys_id is None:
             logger.warning("No ServiceNow user '%s'; using the login as-is.", login)
             return login

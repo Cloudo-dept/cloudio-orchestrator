@@ -272,6 +272,14 @@ from orchestrator.domain import TicketRef
 from orchestrator.ports import TicketSystemClient
 
 
+# The catalog variable naming the group whose approval the request needs — must match the catalog
+# item's own variable. And the columns a name is looked up by: instance-specific, changed here in
+# one place if your ServiceNow identifies groups or users by something else.
+APPROVAL_GROUP_VARIABLE = "approval_group"
+GROUP_LOOKUP_FIELD = "name"         # sys_user_group column matched against a group name
+USER_LOOKUP_FIELD = "user_param"    # sys_user column matched against a login
+
+
 class ServiceNowTicketClient(TicketSystemClient):
     _BUSINESS_SERVICE = "רשת יחידה"
     _SERVICE_OFFERING = "שירותי פיתוח"
@@ -300,7 +308,7 @@ class ServiceNowTicketClient(TicketSystemClient):
         known = self._groups.get(name)
         if known:
             return known
-        sys_id = await self._lookup_sys_id("sys_user_group", "name", name)
+        sys_id = await self._lookup_sys_id("sys_user_group", GROUP_LOOKUP_FIELD, name)
         if sys_id is None:
             logger.warning("No ServiceNow group named '%s'.", name)
             return None
@@ -320,7 +328,7 @@ class ServiceNowTicketClient(TicketSystemClient):
 
     async def _user_sys_id(self, login: str) -> str:
         """The sys_user sys_id for a login, falling back to the login itself when unknown."""
-        sys_id = await self._lookup_sys_id("sys_user", "user_param", login)
+        sys_id = await self._lookup_sys_id("sys_user", USER_LOOKUP_FIELD, login)
         return sys_id if sys_id is not None else login
 
     async def _patch(self, table: str, sys_id: str, **body: Any) -> None:
