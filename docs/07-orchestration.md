@@ -345,6 +345,23 @@ class FailureEscalator:
 
 ## `orchestration/executor.py` — the run driver
 
+**Driving a run is total.** A step's own exception is retried and then escalated by
+`_on_step_error`, but anything raised *around* the steps — an unknown step name, a plan naming a
+handler that does not exist, a save that fails — used to escape to the worker, which logged
+`crashed mid-drive` and let the lease re-drive it forever, with nothing in the ticket system to show
+for it. `handle` wraps the drive and hands such a failure to `_crash`, which marks the run `FAILED`
+and escalates it to the default team on the **first** occurrence: these recur on every re-drive, so
+retrying only hides them for longer. Two details that matter:
+
+- `_crash` skips escalation when the run is already `FAILED` — `_on_step_error` escalates and *then*
+  saves, so a failing save must not open a second Incident for one failure.
+- its own save is best-effort (`_save_quietly`), because the save is often what crashed. The
+  Incident is the part a human acts on; losing the `FAILED` write is survivable, losing the
+  Incident is not.
+
+A `RunRejected` is not a failure and never reaches this path: the run ends `REJECTED`, with no
+Incident.
+
 Given a `run_id`, load the run, advance it through as many synchronous steps as possible this
 wake-up, and either complete it, schedule it for a later poll/retry (by setting `scheduled_at` —
 a worker re-drives it), or mark it `FAILED` and escalate. It only reads and writes the run
@@ -380,9 +397,15 @@ class RunExecutor:
         if run is None:
             logger.warning("Run %s not found; dropping message.", run_id)
             return
-        if run.status in (RunStatus.COMPLETED, RunStatus.FAILED):
+        if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.REJECTED):
             return                                   # terminal: ignore a duplicate/stale delivery
+        with run_log_context(run):
+            try:
+                await self._drive(run)
+            except Exception as error:               # driving a run is total (see below)
+                await self._crash(run, error)
 
+    async def _drive(self, run: WorkflowRun) -> None:
         plan = RUN_PLANS[run.run_type]
         step = StepName(run.current_step) if run.current_step else plan[0]
         run.status = RunStatus.RUNNING

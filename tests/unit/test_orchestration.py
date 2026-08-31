@@ -19,6 +19,7 @@ from orchestrator.domain import (
     TicketOutcome,
     TicketRef,
     WorkflowEngineType,
+    WorkflowRun,
 )
 from orchestrator.orchestration.escalator import FailureEscalator
 from orchestrator.orchestration.executor import RunExecutor
@@ -300,6 +301,71 @@ async def test_task_exception_is_retried_before_escalating(
     assert final.status is RunStatus.FAILED
     assert len(engine.trigger_calls) == 3  # the first run + two retries, each a fresh engine run
     assert len(tickets.incidents) == 1
+
+
+class BrokenRunRepository(FakeWorkflowRunRepository):
+    """save() raises something other than StaleRunError — a database error, not a lost race."""
+
+    def __init__(self, *, break_after: int = 0) -> None:
+        super().__init__()
+        self._remaining = break_after  # saves to let through before breaking
+
+    async def save(self, run: WorkflowRun) -> None:
+        if self._remaining > 0:
+            self._remaining -= 1
+            await super().save(run)
+            return
+        raise RuntimeError("connection reset by peer")
+
+
+async def test_missing_handler_fails_the_run_and_opens_an_incident(
+    runs, tickets, resources, engine, settings
+) -> None:
+    # A plan naming a step with no handler is raised *around* the steps, not by one — the case
+    # that used to escape the executor and be re-driven forever with nothing in ServiceNow.
+    executor, handlers = build_executor(runs, tickets, resources, engine, settings)
+    del handlers[StepName.RUN_ENGINE]
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED  # terminal, so the lease stops re-driving it
+    assert len(tickets.incidents) == 1
+    assert tickets.incidents[0]["responsible_group"] == "cloudio"  # the default team owns it
+    assert "KeyError" in tickets.incidents[0]["comment"]
+    assert final.run_state.incident_id is not None
+
+
+async def test_a_broken_save_fails_the_run_and_opens_an_incident(
+    tickets, resources, engine, settings
+) -> None:
+    # The save is what breaks, so the crash path cannot persist FAILED either. The Incident is the
+    # part a human acts on, and it must still be opened rather than the error escaping the drive.
+    runs = BrokenRunRepository()  # every save raises; create() is not a save
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION))
+
+    await executor.handle(run.run_id)  # must not raise
+
+    assert len(tickets.incidents) == 1
+    assert tickets.incidents[0]["responsible_group"] == "cloudio"
+    assert "RuntimeError: connection reset by peer" in tickets.incidents[0]["comment"]
+
+
+async def test_a_save_failing_after_escalation_does_not_open_a_second_incident(
+    tickets, resources, settings
+) -> None:
+    # _on_step_error escalates and *then* saves; when that save throws, the crash path must not
+    # escalate the same failure again.
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    runs = BrokenRunRepository(break_after=1)  # the first drive saves, then every save breaks
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=0))
+
+    await executor.handle(run.run_id)  # trigger the engine run (saves once)
+    await executor.handle(run.run_id)  # sees FAILED, escalates, then the save breaks
+
+    assert len(tickets.incidents) == 1  # one failure → one Incident
 
 
 @pytest.mark.parametrize(

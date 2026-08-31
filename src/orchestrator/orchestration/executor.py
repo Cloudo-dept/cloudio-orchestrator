@@ -60,7 +60,15 @@ class RunExecutor:
         # step handlers, the adapters they call, the escalator — carries cloudio.run.*, without a
         # single signature change and without run vocabulary crossing a port.
         with run_log_context(run):
-            await self._drive(run)
+            try:
+                await self._drive(run)
+            except Exception as error:
+                # Driving a run is total: a failure anywhere in here ends the run, visibly. Without
+                # this, anything raised *around* the steps (an unknown step name, a plan naming a
+                # handler that does not exist, a save that fails) escaped to the worker, which
+                # logged "crashed mid-drive" and let the lease re-drive it — forever, with nothing
+                # in the ticket system to show for it.
+                await self._crash(run, error)
 
     async def _drive(self, run: WorkflowRun) -> None:
         plan = RUN_PLANS[run.run_type]
@@ -184,6 +192,44 @@ class RunExecutor:
         logger.critical(
             "Run %s step %s permanently FAILED: %s", run.run_id, step, error, exc_info=error
         )
+
+    async def _crash(self, run: WorkflowRun, error: Exception) -> None:
+        """A failure in the driving code itself, not in a step. Terminal on the first occurrence:
+        an unknown step, a missing handler or a broken save recurs on every re-drive, so retrying
+        only hides it for longer."""
+        if run.status is RunStatus.FAILED:
+            # _on_step_error already escalated this drive and then its own save threw. Escalating
+            # again would open a second Incident for one failure; retry the save instead.
+            logger.error(
+                "Run %s failed to persist after escalation: %s", run.run_id, error, exc_info=error
+            )
+            await self._save_quietly(run)
+            return
+        if run.current_step is not None:
+            run.run_state.errors[StepName(run.current_step)] = str(error)
+        run.status, run.scheduled_at = RunStatus.FAILED, None
+        logger.error(
+            "Run %s crashed while being driven at step %s; escalating and marking FAILED.",
+            run.run_id,
+            run.current_step,
+            exc_info=error,
+        )
+        await self.escalator.escalate(run, error)  # never raises
+        await self._save_quietly(run)
+        logger.critical("Run %s permanently FAILED: %s", run.run_id, error, exc_info=error)
+
+    async def _save_quietly(self, run: WorkflowRun) -> None:
+        """Save on the crash path. The save is often *what* crashed, so a second failure here must
+        not escape — the Incident is already open, which is the part a human acts on."""
+        try:
+            await self._save(run)
+        except Exception as save_error:
+            logger.error(
+                "Run %s could not be persisted as FAILED: %s",
+                run.run_id,
+                save_error,
+                exc_info=save_error,
+            )
 
     async def _reject(self, run: WorkflowRun, step: StepName, rejection: RunRejected) -> None:
         # The request was denied in the ticket system — a clean terminal stop, not a failure:
