@@ -83,14 +83,11 @@ class FlakyTicketClient(FakeTicketSystemClient):
         fields: dict[str, Any],
         requested_by: str,
         idempotency_key: str,
-        approval_group: str | None = None,
     ) -> TicketRef:
         if self._remaining > 0:
             self._remaining -= 1
             raise RuntimeError("ServiceNow unavailable")
-        return await super().open_ticket(
-            template_id, fields, requested_by, idempotency_key, approval_group
-        )
+        return await super().open_ticket(template_id, fields, requested_by, idempotency_key)
 
 
 async def test_automation_run_completes(runs, tickets, resources, engine, settings) -> None:
@@ -162,14 +159,16 @@ async def test_create_ticket_step_is_idempotent(tickets) -> None:
     assert len(tickets.open_ticket_calls) == 1  # the provider was hit only once
 
 
-async def test_create_ticket_step_passes_the_approval_group(tickets) -> None:
+async def test_create_ticket_step_passes_ticket_params_through(tickets) -> None:
     step = CreateTicketStep(tickets)
     run = make_run(run_type=RunType.RESOURCE)
     run.run_state.ticket = None
-    run.run_state.approval_group = "CloudIO NetOps"  # from the trigger request
+    run.run_state.ticket_params = {"size": "L", "approval_group": "CloudIO NetOps"}
 
     assert await step.execute(run) is True
-    assert tickets.approval_groups == ["CloudIO NetOps"]  # the adapter resolves the name
+    # Verbatim: approval_group is one template variable among the caller's, and turning its name
+    # into a sys_id is the ticket adapter's business, not this step's.
+    assert tickets.opened_fields == [{"size": "L", "approval_group": "CloudIO NetOps"}]
 
 
 async def test_approval_group_and_dag_group_never_feed_each_other(
@@ -188,13 +187,14 @@ async def test_approval_group_and_dag_group_never_feed_each_other(
     executor, _ = build_executor(runs, tickets, resources, engine, settings)
     run = make_run(run_type=RunType.RESOURCE, max_retries=0)
     run.run_state.ticket = None  # this run opens its own RITM
-    run.run_state.approval_group = "Approvers"  # what the trigger asked for
+    run.run_state.ticket_params = {"approval_group": "Approvers"}  # what the trigger asked for
     await runs.create(run)
 
     final = await drive(runs, executor, run.run_id, iters=20)
 
     assert final.status is RunStatus.FAILED
-    assert tickets.approval_groups == ["Approvers"]  # RITM ← the request, not the DAG's group
+    # RITM ← the request's own variable; INC ← the DAG. Neither is ever fed the other's group.
+    assert tickets.opened_fields == [{"approval_group": "Approvers"}]
     assert tickets.incidents[-1]["responsible_group"] == "netops"  # INC ← the DAG, not the request
 
 

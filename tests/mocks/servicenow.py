@@ -19,7 +19,7 @@ class Ritm:
     approval: str = "requested"  # ServiceNow RITM approval field: requested/approved/rejected
     work_notes: list[str] = field(default_factory=list)
     requested_for: str | None = None  # sysparm_requested_for the order was placed with
-    assignment_group: str | None = None  # sys_user_group sys_id the RITM was assigned to
+    variables: dict[str, Any] = field(default_factory=dict)  # catalog variables it was ordered with
 
 
 @dataclass
@@ -115,6 +115,7 @@ def _build(mock: ServiceNowMock) -> FastAPI:
                 request_sys_id=request_sys_id,
                 approval=mock.default_approval,
                 requested_for=body.get("sysparm_requested_for"),
+                variables=body.get("variables", {}),
             )
         )
         return {"result": {"sys_id": request_sys_id}}
@@ -128,8 +129,6 @@ def _build(mock: ServiceNowMock) -> FastAPI:
             r.state = body["state"]
         if "work_notes" in body:
             r.work_notes.append(body["work_notes"])
-        if "assignment_group" in body:
-            r.assignment_group = body["assignment_group"]
         return {"result": {"number": r.number, "sys_id": r.sys_id}}
 
     @app.post("/api/now/table/incident")

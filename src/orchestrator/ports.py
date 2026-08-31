@@ -99,11 +99,9 @@ class TicketSystemClient(abc.ABC):
         fields: dict[str, Any],
         requested_by: str,
         idempotency_key: str,
-        approval_group: str | None = None,
     ) -> TicketRef:
-        """Open a ticket from a provider template (idempotent on the key). ``approval_group`` names
-        the team whose approval the request needs, and the ticket is assigned to them — the adapter
-        resolves the name to whatever the provider needs; None leaves routing to the provider."""
+        """Open a ticket from a provider template (idempotent on the key). ``fields`` is the
+        caller's free-form template payload, passed through to the provider."""
 
     @abc.abstractmethod
     async def get_approval_status(self, ticket: TicketRef) -> ApprovalStatus:

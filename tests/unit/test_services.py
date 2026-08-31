@@ -1,7 +1,5 @@
 """WorkflowService / WorkflowRunService over the in-memory fakes."""
 
-import logging
-
 import pytest
 
 from orchestrator.domain import (
@@ -83,7 +81,9 @@ async def test_trigger_snapshots_the_workflow_name(runs, workflows) -> None:
     assert run.run_state.workflow.label == "Provision VM"
 
 
-async def test_trigger_carries_the_approval_group(runs, workflows) -> None:
+async def test_trigger_carries_ticket_params_verbatim(runs, workflows) -> None:
+    # ticket_params is a pass-through payload: the approval group travels inside it as one more
+    # template variable, and only the ticket adapter gives that variable any meaning.
     await workflows.register(make_workflow(identifier="new-vm", run_type=RunType.RESOURCE))
     svc = WorkflowRunService(runs, workflows)
 
@@ -91,59 +91,16 @@ async def test_trigger_carries_the_approval_group(runs, workflows) -> None:
         workflow_identifier="new-vm",
         created_by="jdoe",
         max_retries=1,
-        ticket_params={},
+        ticket_params={"size": "L", "approval_group": "CloudIO NetOps"},
         workflow_params={},
         resource=make_resource_spec(),
         ticket=None,
-        approval_group="CloudIO NetOps",  # the team whose approval the RITM needs
     )
 
-    assert run.run_state.approval_group == "CloudIO NetOps"
+    assert run.run_state.ticket_params == {"size": "L", "approval_group": "CloudIO NetOps"}
     persisted = await svc.get(run.run_id)
-    assert persisted is not None and persisted.run_state.approval_group == "CloudIO NetOps"
-
-
-async def test_trigger_drops_the_approval_group_for_an_automation_run(
-    runs, workflows, caplog
-) -> None:
-    # An automation run attaches to a ticket somebody else opened, so there is nothing to route for
-    # approval. Accepted, dropped from the run state, and said out loud rather than ignored quietly.
-    await workflows.register(
-        make_workflow(identifier="run-automation", run_type=RunType.AUTOMATION)
-    )
-    svc = WorkflowRunService(runs, workflows)
-
-    with caplog.at_level(logging.WARNING, logger="orchestrator.services"):
-        run = await svc.trigger(
-            workflow_identifier="run-automation",
-            created_by="jdoe",
-            max_retries=1,
-            ticket_params={},
-            workflow_params={},
-            resource=None,
-            ticket=RITM,
-            approval_group="CloudIO NetOps",
-        )
-
-    assert run.run_state.approval_group is None
-    assert "has no effect" in caplog.text and "CloudIO NetOps" in caplog.text
-
-
-async def test_trigger_without_an_approval_group_leaves_it_unset(runs, workflows) -> None:
-    await workflows.register(make_workflow(identifier="new-vm", run_type=RunType.RESOURCE))
-    svc = WorkflowRunService(runs, workflows)
-
-    run = await svc.trigger(
-        workflow_identifier="new-vm",
-        created_by="jdoe",
-        max_retries=1,
-        ticket_params={},
-        workflow_params={},
-        resource=make_resource_spec(),
-        ticket=None,
-    )
-
-    assert run.run_state.approval_group is None  # routing left to the ticket system
+    assert persisted is not None
+    assert persisted.run_state.ticket_params["approval_group"] == "CloudIO NetOps"
 
 
 async def test_trigger_resource_workflow_carries_spec(runs, workflows) -> None:

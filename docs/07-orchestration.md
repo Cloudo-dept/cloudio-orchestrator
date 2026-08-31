@@ -112,8 +112,7 @@ class CreateTicketStep(StepHandler):
             template_id=st.workflow.ticket_template_id,
             fields=st.ticket_params,
             requested_by=run.created_by,
-            idempotency_key=idem_key(run, StepName.CREATE_TICKET),
-            approval_group=st.approval_group)   # the team whose approval this request needs
+            idempotency_key=idem_key(run, StepName.CREATE_TICKET))
         return True
 
 

@@ -215,10 +215,6 @@ class RunState(BaseModel):
     ticket_params: dict[str, Any] = PyField(default_factory=dict)  # provider template variables
     workflow_params: dict[str, Any] = PyField(default_factory=dict)  # engine conf (pass-through)
     resource: ResourceSpec | None = None  # resource runs only
-    # Team whose approval the request's ticket needs; it is assigned to them. A group name, resolved
-    # by the ticket adapter. Distinct from EngineFailure.responsible_group, which routes the
-    # *incident* a DAG failure raises — the two never feed each other.
-    approval_group: str | None = None
 
     # step progress / idempotency markers
     ticket: TicketRef | None = None

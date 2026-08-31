@@ -78,10 +78,6 @@ class WorkflowRunTriggerRequest(BaseModel):
     workflow_params: dict[str, Any] = Field(default_factory=dict)  # engine conf
     resource: ResourceSpec | None = None  # resource workflows only
     ticket: TicketRef | None = None  # the pre-existing ticket to attach to (automation only)
-    # Team whose approval the created ticket needs; it is assigned to them. A group name, resolved
-    # by the ticket adapter. Resource workflows only — an automation run attaches to a ticket that
-    # already exists. Omit to leave routing to the ticket system.
-    approval_group: str | None = Field(None, max_length=255)
 
 
 class WorkflowRunResponse(BaseModel):
@@ -266,7 +262,6 @@ async def trigger_workflow_run(
             workflow_params=request.workflow_params,
             resource=request.resource,
             ticket=request.ticket,
-            approval_group=request.approval_group,
         )
     except UnknownWorkflowError:
         raise HTTPException(

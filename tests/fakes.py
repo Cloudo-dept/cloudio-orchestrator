@@ -162,7 +162,7 @@ class FakeTicketSystemClient(TicketSystemClient):
     def __init__(self) -> None:
         self.tickets_by_key: dict[str, TicketRef] = {}
         self.open_ticket_calls: list[str] = []  # idempotency keys, in order
-        self.approval_groups: list[str | None] = []  # approval_group per open_ticket call
+        self.opened_fields: list[dict[str, Any]] = []  # template variables per open_ticket call
         self.closed: list[tuple[str, str | None, TicketOutcome]] = []  # (ticket_id, note, outcome)
         self.notes: list[tuple[str, str]] = []  # (ticket_id, note)
         self.incidents: list[dict[str, Any]] = []
@@ -181,10 +181,9 @@ class FakeTicketSystemClient(TicketSystemClient):
         fields: dict[str, Any],
         requested_by: str,
         idempotency_key: str,
-        approval_group: str | None = None,
     ) -> TicketRef:
         self.open_ticket_calls.append(idempotency_key)
-        self.approval_groups.append(approval_group)  # the team the ticket routes to for approval
+        self.opened_fields.append(fields)
         if idempotency_key in self.tickets_by_key:  # idempotent on the key
             return self.tickets_by_key[idempotency_key]
         ref = self._mint("RITM")

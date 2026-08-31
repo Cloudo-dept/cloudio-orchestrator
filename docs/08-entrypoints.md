@@ -124,9 +124,6 @@ class WorkflowRunTriggerRequest(BaseModel):
     workflow_params: dict[str, Any] = Field(default_factory=dict)   # engine conf
     resource: ResourceSpec | None = None                            # resource workflows only
     ticket: TicketRef | None = None                                 # existing RITM (automation only)
-    # Team whose approval the created ticket needs; it is assigned to them. A group name, resolved
-    # by the ticket adapter. Resource workflows only. Omit to leave routing to the ticket system.
-    approval_group: str | None = Field(None, max_length=255)
 
 
 class WorkflowRunResponse(BaseModel):
@@ -181,8 +178,7 @@ async def trigger_workflow_run(request: WorkflowRunTriggerRequest,
         return await svc.trigger(
             workflow_identifier=request.workflow_identifier, created_by=request.created_by,
             max_retries=request.max_retries, ticket_params=request.ticket_params,
-            workflow_params=request.workflow_params, resource=request.resource,
-            approval_group=request.approval_group)
+            workflow_params=request.workflow_params, resource=request.resource)
     except UnknownWorkflowError:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             detail=f"Unknown workflow '{request.workflow_identifier}'.")
@@ -456,9 +452,8 @@ POST /api/v1/workflow-runs
 {
   "workflow_identifier": "provision-vm",
   "created_by": "jdoe",
-  "ticket_params": {"catalog_variable_1": "value"},
+  "ticket_params": {"catalog_variable_1": "value", "approval_group": "CloudIO NetOps"},
   "workflow_params": {"size": "large"},
-  "approval_group": "CloudIO NetOps",
 
   "resource": {
     "project_id": "proj-123", "resource_type": "vm", "vendor_id": "vm-abc-01",
@@ -472,12 +467,12 @@ The orchestrator resolves `provision-vm` → `run_type=resource`, `engine=airflo
 `automation_id=provision_vm_dag`, catalog item to order — and builds the run. `created_by` is the
 ServiceNow `caller_id`/`sysparm_requested_for` and the resource `last_modified_by`.
 `ticket_params` are the catalog-item variables; `resource` is a typed `ResourceSpec` (validated
-at the HTTP boundary, not deep inside a step). `approval_group` is optional: give it a group *name*
-and the RITM is assigned to that group, so it routes for that team's approval — the adapter resolves
-the name to a sys_id, from config or by asking ServiceNow. Omit it and the catalog item's own
-workflow decides. It is **resource-only** and unrelated to incident routing: an automation run
-attaches to a ticket that already exists, so the field is dropped (with a warning), and a DAG
-failure's incident is always routed by the `responsible_group` the DAG published.
+at the HTTP boundary, not deep inside a step). One `ticket_params` variable is not opaque to the
+orchestrator: **`approval_group`**, the group whose approval the ticket needs. Give it a group
+*name* and the ServiceNow adapter resolves it to a `sys_user_group` sys_id on the way out, since the
+catalog variable is a reference; every other variable is forwarded byte for byte. It is unrelated to
+incident routing — a DAG failure's incident is always routed by the `responsible_group` the DAG
+published.
 
 An `automation` workflow omits `resource` and instead supplies `ticket` — a `TicketRef`
 (`{ticket_id, native_id}`) for the RITM the caller already created. ServiceNow triggers these runs:

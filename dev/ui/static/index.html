@@ -91,13 +91,10 @@
           </label>
           <label>created_by <input name="created_by" required value="dev" /></label>
           <label>max_retries <input name="max_retries" type="number" min="0" max="10" value="3" /></label>
-          <label>approval_group <span class="muted small">— group name; the RITM routes to them for approval</span>
-            <input name="approval_group" placeholder="CloudIO NetOps" />
-          </label>
         </div>
 
         <fieldset class="params">
-          <legend>ticket_params <span class="muted small">— template variables sent to the ticket system</span></legend>
+          <legend>ticket_params <span class="muted small">— template variables sent to the ticket system; `approval_group` names the group whose approval the ticket needs</span></legend>
           <div class="json-editor" data-json="ticket_params"></div>
           <div class="json-foot">
             <span class="json-error" data-json-error="ticket_params"></span>

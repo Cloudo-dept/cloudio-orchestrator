@@ -22,11 +22,9 @@ class TicketSystemClient(abc.ABC):
 
     @abc.abstractmethod
     async def open_ticket(self, template_id: str, fields: dict[str, Any], requested_by: str,
-                          idempotency_key: str,
-                          approval_group: str | None = None) -> TicketRef:
-        """Open a ticket from a provider template (idempotent on the key). `approval_group` names
-        the team whose approval the request needs, and the ticket is assigned to them — the adapter
-        resolves the name to whatever the provider needs; None leaves routing to the provider."""
+                          idempotency_key: str) -> TicketRef:
+        """Open a ticket from a provider template (idempotent on the key). `fields` is the
+        caller's free-form template payload, passed through to the provider."""
 
     @abc.abstractmethod
     async def close_ticket(self, ticket: TicketRef, note: str | None = None,
@@ -253,15 +251,17 @@ vocabulary is confined to this class. Create idempotency is orchestrator-added: 
 with `correlation_id` and looked up before re-ordering.
 
 **Reference fields carry sys_ids, never names.** Teams and users cross the port as *names* — the
-`approval_group` from the trigger request (assigns the RITM), the `responsible_group` from the DAG
-that failed (routes the INC), a login for the requester — and this class resolves them:
+`approval_group` variable inside the caller's `ticket_params` (whose approval the RITM needs), the
+`responsible_group` from the DAG that failed (routes the INC), a login for the requester — and this
+class resolves them:
 `_group_sys_id` checks the configured `responsible_groups` map (which is also its memo cache, and
 serves both kinds of name) and otherwise looks the name up in `sys_user_group`, remembering it;
 `_user_sys_id` does the same against `sys_user`. A name that resolves nowhere is never written into
 the field: an incident falls back to the default incident team and, failing that, opens unassigned
-for ServiceNow to triage; a RITM keeps whatever group its catalog workflow assigned. The one
-exception is `caller_id` / `sysparm_requested_for`, which fall back to the raw login, since
-ServiceNow accepts one there.
+for ServiceNow to triage; an unresolvable `approval_group` variable is ordered with the name the
+caller wrote, since silently dropping one of their variables is worse than letting ServiceNow
+reject it. `caller_id` / `sysparm_requested_for` likewise fall back to the raw login, which
+ServiceNow accepts.
 
 ```python
 from typing import Any
@@ -336,9 +336,21 @@ class ServiceNowTicketClient(TicketSystemClient):
         rows = resp.json().get("result", [])
         return TicketRef(ticket_id=rows[0]["number"], native_id=rows[0]["sys_id"]) if rows else None
 
+    async def _resolved_variables(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """The caller's catalog variables, with the approval group turned into a sys_id. A copy:
+        the original is the run's persisted ticket_params. A name that resolves nowhere is sent as
+        it came — deleting a caller's variable is worse than letting ServiceNow reject it."""
+        name = fields.get(APPROVAL_GROUP_VARIABLE)
+        if not isinstance(name, str) or not name:
+            return fields
+        sys_id = await self._group_sys_id(name)
+        if sys_id is None:
+            logger.warning("Ordering with %s='%s' unresolved.", APPROVAL_GROUP_VARIABLE, name)
+            return fields
+        return fields | {APPROVAL_GROUP_VARIABLE: sys_id}
+
     async def open_ticket(self, template_id: str, fields: dict[str, Any], requested_by: str,
-                          idempotency_key: str,
-                          approval_group: str | None = None) -> TicketRef:
+                          idempotency_key: str) -> TicketRef:
         # template_id == catalog item sys_id; ticket == RITM.
         async with self._client() as client:
             found = await self._find_ritm(client, idempotency_key)
@@ -347,11 +359,10 @@ class ServiceNowTicketClient(TicketSystemClient):
             # Both lookups happen BEFORE ordering: every call between the order and the
             # correlation_id tag widens the double-order window (01-external-contracts).
             requested_by_sys_id = await self._user_sys_id(requested_by)
-            group_sys_id = (await self._group_sys_id(approval_group)
-                            if approval_group else None)
+            variables = await self._resolved_variables(fields)
             order = await client.post(
                 f"/api/sn_sc/servicecatalog/items/{template_id}/order_now",
-                json={"variables": fields, "sysparm_quantity": 1,
+                json={"variables": variables, "sysparm_quantity": 1,
                       "sysparm_requested_for": requested_by_sys_id})
             order.raise_for_status()
             request_sys_id = order.json()["result"]["sys_id"]
@@ -360,12 +371,8 @@ class ServiceNowTicketClient(TicketSystemClient):
                                             "sysparm_fields": "number,sys_id", "sysparm_limit": 1})
             ritm.raise_for_status()
             r = ritm.json()["result"][0]
-            # One PATCH carries the idempotency tag AND the approving group (the RITM routes to
-            # that team). An unresolvable group leaves the field to the catalog workflow.
-            body = {"correlation_id": idempotency_key}
-            if group_sys_id is not None:
-                body["assignment_group"] = group_sys_id
-            await client.patch(f"/api/now/table/sc_req_item/{r['sys_id']}", json=body)
+            await client.patch(f"/api/now/table/sc_req_item/{r['sys_id']}",
+                               json={"correlation_id": idempotency_key})
             return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
 
     async def close_ticket(self, ticket: TicketRef, note: str | None = None,

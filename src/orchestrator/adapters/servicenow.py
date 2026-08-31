@@ -15,6 +15,12 @@ from orchestrator.ports import TicketSystemClient
 
 logger = logging.getLogger(__name__)
 
+# The catalog variable naming the group whose approval the request needs. It arrives inside the
+# caller's ticket_params, and this adapter resolves its value from a group name to a sys_id — the
+# variable is a reference to sys_user_group. Must match the catalog item's variable exactly, or
+# ServiceNow drops it without complaint.
+APPROVAL_GROUP_VARIABLE = "approval_group"
+
 
 class ServiceNowTicketClient(TicketSystemClient):
     _BUSINESS_SERVICE = "רשת יחידה"
@@ -121,13 +127,30 @@ class ServiceNowTicketClient(TicketSystemClient):
             return login
         return sys_id
 
+    async def _resolved_variables(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """The caller's catalog variables, with the approval group turned into a sys_id.
+
+        ``fields`` is a pass-through payload and stays untouched apart from that one variable: it
+        names a group, and a reference variable needs the group's sys_id. A copy, because the
+        original is the run's persisted ``ticket_params`` — rewriting it in place would overwrite
+        what the caller asked for with a sys_id. A name that resolves nowhere is sent as it came:
+        deleting a caller's variable is worse than letting ServiceNow reject it.
+        """
+        name = fields.get(APPROVAL_GROUP_VARIABLE)
+        if not isinstance(name, str) or not name:
+            return fields
+        sys_id = await self._group_sys_id(name)
+        if sys_id is None:
+            logger.warning("Ordering with %s='%s' unresolved.", APPROVAL_GROUP_VARIABLE, name)
+            return fields
+        return fields | {APPROVAL_GROUP_VARIABLE: sys_id}
+
     async def open_ticket(
         self,
         template_id: str,
         fields: dict[str, Any],
         requested_by: str,
         idempotency_key: str,
-        approval_group: str | None = None,
     ) -> TicketRef:
         # template_id == catalog item sys_id; ticket == RITM.
         async with self._client() as client:
@@ -138,13 +161,11 @@ class ServiceNowTicketClient(TicketSystemClient):
             # correlation_id tag widens the window where a crash leaves an untagged RITM that the
             # next attempt cannot find and therefore double-orders (01-external-contracts).
             requested_by_sys_id = await self._user_sys_id(requested_by)
-            group_sys_id = await self._group_sys_id(approval_group) if approval_group else None
-            if approval_group and group_sys_id is None:
-                logger.warning("Ordering unassigned: group '%s' did not resolve.", approval_group)
+            variables = await self._resolved_variables(fields)
             order = await client.post(
                 f"/api/sn_sc/servicecatalog/items/{template_id}/order_now",
                 json={
-                    "variables": fields,
+                    "variables": variables,
                     "sysparm_quantity": 1,
                     "sysparm_requested_for": requested_by_sys_id,
                 },
@@ -165,14 +186,10 @@ class ServiceNowTicketClient(TicketSystemClient):
             r = ritm.json()["result"][0]
             logger.info("Created RITM: %s", r["number"])
 
-            # One PATCH carries both the idempotency tag and the approving group (the RITM routes
-            # for that team's approval, and the catalog workflow does not know which team that is).
-            # A group that did not resolve leaves the field alone rather than overwriting what the
-            # workflow assigned — unlike an incident, there is no triage queue to fall back to.
-            body = {"correlation_id": idempotency_key}
-            if group_sys_id is not None:
-                body["assignment_group"] = group_sys_id
-            await client.patch(f"/api/now/table/sc_req_item/{r['sys_id']}", json=body)
+            await client.patch(
+                f"/api/now/table/sc_req_item/{r['sys_id']}",
+                json={"correlation_id": idempotency_key},
+            )
             return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
 
     async def get_approval_status(self, ticket: TicketRef) -> ApprovalStatus:

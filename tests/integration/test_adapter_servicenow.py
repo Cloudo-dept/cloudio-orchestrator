@@ -181,48 +181,59 @@ async def test_open_incident_falls_back_to_the_login_for_an_unknown_caller(
     assert servicenow.incidents[-1].body["caller_id"] == "ghost"
 
 
-async def test_open_ticket_assigns_the_ritm_to_the_approval_group(
+async def test_open_ticket_resolves_the_approval_group_variable(
     servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
 ) -> None:
     ref = await servicenow_client.open_ticket(
         template_id="cat-1",
-        fields={},
+        # A pass-through payload: the approval group names a team, everything else is the
+        # caller's business.
+        fields={"size": "L", "approval_group": "CloudIO NetOps"},
         requested_by="jdoe",
         idempotency_key="k",
-        approval_group="CloudIO NetOps",  # not pre-seeded → resolved against sys_user_group
     )
     ritm = next(r for r in servicenow.ritms if r.sys_id == ref.native_id)
-    # Assigned in the same PATCH that tags the RITM — one call, not two.
-    assert ritm.assignment_group == servicenow.groups["CloudIO NetOps"]
-    assert ritm.correlation_id == "k"
-    assert sum(1 for m, p in servicenow.requests if m == "PATCH") == 1
+    # The group variable is a reference — it goes out as a sys_id; the rest is untouched.
+    assert ritm.variables == {"size": "L", "approval_group": servicenow.groups["CloudIO NetOps"]}
+    assert group_lookups(servicenow) == 1
 
 
-async def test_open_ticket_without_a_group_leaves_the_ritm_unassigned(
+async def test_open_ticket_leaves_an_unresolvable_approval_group_alone(
     servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
 ) -> None:
     ref = await servicenow_client.open_ticket(
-        template_id="cat-1", fields={}, requested_by="jdoe", idempotency_key="k"
+        template_id="cat-1",
+        fields={"approval_group": "no-such-team"},
+        requested_by="jdoe",
+        idempotency_key="k",
     )
     ritm = next(r for r in servicenow.ritms if r.sys_id == ref.native_id)
-    assert ritm.assignment_group is None  # the catalog workflow keeps whatever it assigned
+    # Sent as it came: dropping a caller's variable is worse than letting ServiceNow reject it.
+    assert ritm.variables == {"approval_group": "no-such-team"}
+    assert ritm.correlation_id == "k"  # and the idempotency tag still landed
+
+
+async def test_open_ticket_without_an_approval_group_looks_nothing_up(
+    servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
+) -> None:
+    ref = await servicenow_client.open_ticket(
+        template_id="cat-1", fields={"size": "L"}, requested_by="jdoe", idempotency_key="k"
+    )
+    ritm = next(r for r in servicenow.ritms if r.sys_id == ref.native_id)
+    assert ritm.variables == {"size": "L"}
     assert group_lookups(servicenow) == 0
 
 
-async def test_open_ticket_unknown_group_leaves_the_ritm_unassigned(
+async def test_open_ticket_does_not_rewrite_the_callers_fields(
     servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
 ) -> None:
-    ref = await servicenow_client.open_ticket(
-        template_id="cat-1",
-        fields={},
-        requested_by="jdoe",
-        idempotency_key="k",
-        approval_group="no-such-team",
+    # `fields` is the run's persisted ticket_params — resolving must not overwrite what the
+    # caller asked for with a sys_id.
+    fields = {"approval_group": "CloudIO NetOps"}
+    await servicenow_client.open_ticket(
+        template_id="cat-1", fields=fields, requested_by="jdoe", idempotency_key="k"
     )
-    ritm = next(r for r in servicenow.ritms if r.sys_id == ref.native_id)
-    # No default-team fallback here: an approval group is not an incident triage queue.
-    assert ritm.assignment_group is None
-    assert ritm.correlation_id == "k"  # the tag still landed
+    assert fields == {"approval_group": "CloudIO NetOps"}
 
 
 async def test_incident_open_5xx_is_surfaced(

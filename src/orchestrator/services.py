@@ -54,7 +54,6 @@ class WorkflowRunService:
         workflow_params: dict[str, Any],
         resource: ResourceSpec | None,
         ticket: TicketRef | None,
-        approval_group: str | None = None,
     ) -> WorkflowRun:
         logger.info("Trigger requested for workflow '%s' by %s.", workflow_identifier, created_by)
         wf = await self.workflows.get_by_identifier(workflow_identifier)
@@ -84,8 +83,6 @@ class WorkflowRunService:
             ),
             ticket_params=ticket_params,
             workflow_params=workflow_params,
-            # Only a run that opens its own ticket can assign one an approval group.
-            approval_group=approval_group if wf.run_type is RunType.RESOURCE else None,
             resource=resource if wf.run_type is RunType.RESOURCE else None,
             # Automation runs attach to the caller's existing RITM; resource runs create their own.
             ticket=ticket if wf.run_type is RunType.AUTOMATION else None,
@@ -106,16 +103,6 @@ class WorkflowRunService:
             created.run_type,
             wf.identifier,
         )
-        if approval_group and created.run_state.approval_group is None:
-            # Accepted, but it does nothing: this run attaches to a ticket somebody else already
-            # opened, so there is none for us to route for approval. Say so rather than dropping it
-            # silently, which reads as "the group I asked for was ignored for no reason".
-            logger.warning(
-                "Run %s is an automation run; approval_group '%s' has no effect (it opens no "
-                "ticket).",
-                created.run_id,
-                approval_group,
-            )
         return created
 
     async def get(self, run_id: uuid.UUID) -> WorkflowRun | None:
