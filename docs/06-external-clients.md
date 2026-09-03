@@ -108,6 +108,14 @@ to a `FailureKind` — the sole piece of that vocabulary that crosses the port. 
 missing name stays `TASK`, so an unclassified DAG failure still opens an incident; the
 [failure policy](07-orchestration.md) then decides retries, incident, and what the requester is told.
 
+**A DAG-run `success` is not proof of success.** Production DAGs carry a rollback branch: when tasks
+fail it rolls each one back, and once the rollbacks succeed Airflow marks the *run* `success`. The
+rollback controller publishes what actually happened — `flow_failed` (its verdict) and
+`failed_tasks` (`{task_id: responsible_group}`) — and `query_run_status` checks the first before
+believing a `success`, while `get_failure` reads the second to name the failed task and its owner.
+The failed task instances stay in state `failed`, so a DAG *without* a rollback branch keeps
+resolving through the original `taskInstances?state=failed` path.
+
 ```python
 import json
 from typing import Any
@@ -125,6 +133,12 @@ _FAILURE_KINDS: dict[str, FailureKind] = {
     "InfraPrecheckException": FailureKind.INFRA_PRECHECK,
     "TaskException": FailureKind.TASK,
 }
+
+# What a DAG's rollback branch publishes: its verdict on the run, and the tasks it found failed
+# mapped to the group that owns each.
+FLOW_FAILED_OUTPUT = "flow_failed"
+FAILED_TASKS_OUTPUT = "failed_tasks"
+_TRUTHY = {"true", "1", "yes"}      # XCom values come back stringified
 
 
 def _failure_from_xcom(failed_task: str, body: Any) -> EngineFailure:
@@ -203,27 +217,53 @@ class AirflowWorkflowEngineClient(WorkflowEngineClient):
         resp = await self._request("GET", f"/api/v2/dags/{automation_id}/dagRuns/{run_id}")
         resp.raise_for_status()
         state = resp.json().get("state")            # queued | running | success | failed
-        return {"success": EngineRunStatus.SUCCESS,
-                "failed": EngineRunStatus.FAILED}.get(state, EngineRunStatus.IN_PROGRESS)
+        if state == "success":
+            # A DAG whose rollback branch cleaned up after failed tasks ends this way too.
+            # The controller's verdict outranks the run state.
+            if await self._flow_failed(automation_id, run_id):
+                return EngineRunStatus.FAILED
+            return EngineRunStatus.SUCCESS
+        return {"failed": EngineRunStatus.FAILED}.get(state, EngineRunStatus.IN_PROGRESS)
+
+    async def _flow_failed(self, automation_id: str, run_id: str) -> bool:
+        """A DAG that publishes no such XCom reads as false, so runs without a rollback branch
+        are unaffected."""
+        value = await self.get_output(automation_id, run_id, FLOW_FAILED_OUTPUT)
+        return value is not None and value.strip().lower() in _TRUTHY
 
     async def get_failure(self, automation_id: str, run_id: str) -> EngineFailure:
-        # Airflow needs two calls (failed task instances, then the task's exception XCom);
-        # the port exposes ONE typed result — the two-call dance is an Airflow detail.
+        # Airflow needs several calls (which task failed, then that task's exception XCom);
+        # the port exposes ONE typed result — the dance is an Airflow detail.
+        failed_task, group = await self._first_failed_task(automation_id, run_id)
+        if failed_task is None:
+            return EngineFailure()
+        exc = await self._request(
+            "GET",
+            f"/api/v2/dags/{automation_id}/dagRuns/{run_id}/taskInstances/{failed_task}"
+            f"/xcomEntries/exception_type")
+        if exc.status_code == 404:      # the task died before its failure callback published
+            return EngineFailure(failed_task=failed_task, responsible_group=group)
+        exc.raise_for_status()
+        failure = _failure_from_xcom(failed_task, exc.json())
+        # The exception's own group wins: a task that raised TaskException(responsible_group=…)
+        # named its owner more specifically than the controller's map could.
+        return (failure if failure.responsible_group
+                else failure.model_copy(update={"responsible_group": group}))
+
+    async def _first_failed_task(self, automation_id: str,
+                                 run_id: str) -> tuple[str | None, str | None]:
+        """`failed_tasks` is the controller's own account of what broke — and the only account
+        available once a rollback has run, since the run then reads as `success`. Without it, ask
+        Airflow which task instances are `failed`. Only the first is reported: one run, one
+        incident."""
+        raw = await self.get_output(automation_id, run_id, FAILED_TASKS_OUTPUT)
+        ...     # parse the JSON map, take its first (task_id, group)
         resp = await self._request(
             "GET", f"/api/v2/dags/{automation_id}/dagRuns/{run_id}/taskInstances",
             params={"state": "failed"})
         resp.raise_for_status()
         tasks = [ti["task_id"] for ti in resp.json().get("task_instances", [])]
-        if not tasks:
-            return EngineFailure()
-        exc = await self._request(
-            "GET",
-            f"/api/v2/dags/{automation_id}/dagRuns/{run_id}/taskInstances/{tasks[0]}"
-            f"/xcomEntries/exception_type")
-        if exc.status_code == 404:      # the task died before its failure callback published
-            return EngineFailure(failed_task=tasks[0])
-        exc.raise_for_status()
-        return _failure_from_xcom(tasks[0], exc.json())
+        return (tasks[0], None) if tasks else (None, None)
 
     async def get_output(self, automation_id: str, run_id: str, key: str) -> str | None:
         # XComs live on task instances; probe each task of the run for an entry named `key`.

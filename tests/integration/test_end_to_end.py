@@ -180,3 +180,43 @@ async def test_engine_failure_run_fails_and_escalates(
         f"Run {run.run_id} has failed with the following error:\nTaskException: quota"
     )
     assert any(r.work_notes for r in servicenow.ritms)  # RITM closed with a note about the incident
+
+
+async def test_rolled_back_engine_run_fails_the_run_instead_of_completing_it(
+    pg_session_factory: async_sessionmaker,
+    servicenow: ServiceNowMock,
+    airflow: AirflowMock,
+    project_manager: ProjectManagerMock,
+) -> None:
+    # A DAG whose rollback branch cleaned up reports state `success`. Before the rollback contract
+    # was read, this run completed: resource finalized, RITM closed as fulfilled, no incident —
+    # for work that had been undone.
+    airflow.default_state = "running"  # hold it until the rollback is recorded below
+    runs, run_service, workflows, executor = await _assemble(
+        pg_session_factory, servicenow, airflow, project_manager
+    )
+    await workflows.register(
+        make_workflow(identifier="run-automation", run_type=RunType.AUTOMATION)
+    )
+    seeded = servicenow.seed_ritm(correlation_id="user-created")
+    run = await run_service.trigger(
+        workflow_identifier="run-automation",
+        created_by="jdoe",
+        max_retries=0,
+        ticket_params={},
+        workflow_params={},
+        resource=None,
+        ticket=TicketRef(ticket_id=seeded.number, native_id=seeded.sys_id),
+    )
+
+    await _drive(runs, executor, run.run_id, iters=2)  # trigger the engine run
+    dag_run_id = (await runs.get(run.run_id)).run_state.engine_run_id
+    airflow.rolled_back(dag_run_id, failed_tasks={"provision_vm": "netops"}, message="quota")
+
+    final = await _drive(runs, executor, run.run_id)
+
+    assert final is not None and final.status is RunStatus.FAILED
+    inc = servicenow.incidents[-1].body
+    assert inc["assignment_group"] == "grpsys-netops"  # routed by the controller's map
+    assert inc["u_cloudio_failed_task"] == "provision_vm"
+    assert servicenow.ritms[-1].state == 4  # RITM closed unsuccessful, not fulfilled

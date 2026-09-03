@@ -147,3 +147,64 @@ async def test_get_failure_keeps_a_non_json_xcom_value_as_the_detail(
     )
     failure = await airflow_client.get_failure("dag-x", "run-1")
     assert (failure.failed_task, failure.detail) == ("provision", "disk quota exceeded")
+
+
+async def test_rolled_back_run_is_reported_as_failed(
+    airflow: AirflowMock, airflow_client: AirflowWorkflowEngineClient
+) -> None:
+    # The bug this guards: rollbacks succeed, Airflow calls the run a success, and the
+    # orchestrator would finalize the resource and close the RITM for work that was undone.
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    airflow.rolled_back("run-1", failed_tasks={"provision_vm": "netops"})
+
+    assert airflow.runs["run-1"].state == "success"  # what Airflow itself says
+    assert await airflow_client.query_run_status("dag-x", "run-1") is EngineRunStatus.FAILED
+
+
+async def test_a_genuine_success_is_still_a_success(
+    airflow: AirflowMock, airflow_client: AirflowWorkflowEngineClient
+) -> None:
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    assert await airflow_client.query_run_status("dag-x", "run-1") is EngineRunStatus.SUCCESS
+
+
+async def test_flow_failed_false_is_not_a_failure(
+    airflow: AirflowMock, airflow_client: AirflowWorkflowEngineClient
+) -> None:
+    # A rollback branch that ran and found nothing wrong publishes the key with a falsey value.
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    airflow.output("run-1", "flow_failed", "false")
+    assert await airflow_client.query_run_status("dag-x", "run-1") is EngineRunStatus.SUCCESS
+
+
+async def test_get_failure_reads_the_rollback_controllers_map(
+    airflow: AirflowMock, airflow_client: AirflowWorkflowEngineClient
+) -> None:
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    airflow.rolled_back(
+        "run-1",
+        failed_tasks={"provision_vm": "netops", "attach_disk": "storage"},
+        exception="ValidationException",
+        message="region 'xx' unknown",
+    )
+
+    failure = await airflow_client.get_failure("dag-x", "run-1")
+
+    # First entry only: one run, one incident. The group comes from the controller's map, while
+    # the message and the classification still come from the task's own exception XCom.
+    assert failure.failed_task == "provision_vm"
+    assert failure.responsible_group == "netops"
+    assert failure.detail == "region 'xx' unknown"
+    assert failure.kind is FailureKind.VALIDATION
+
+
+async def test_the_exceptions_own_group_outranks_the_controllers_map(
+    airflow: AirflowMock, airflow_client: AirflowWorkflowEngineClient
+) -> None:
+    await airflow_client.trigger_workflow("dag-x", {}, "run-1")
+    airflow.rolled_back("run-1", failed_tasks={"provision_vm": "netops"})
+    # The task raised TaskException(responsible_group="storage") — more specific than the map.
+    airflow.runs["run-1"].exception["responsible_group"] = "storage"
+
+    failure = await airflow_client.get_failure("dag-x", "run-1")
+    assert failure.responsible_group == "storage"

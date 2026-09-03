@@ -64,6 +64,31 @@ class AirflowMock:
             else {}
         )
 
+    def rolled_back(
+        self,
+        dag_run_id: str,
+        *,
+        failed_tasks: dict[str, str],
+        message: str = "boom",
+        exception: str = "TaskException",
+        publish_exception: bool = True,
+    ) -> None:
+        """A run whose rollback branch cleaned up after failed tasks: the DAG run reports
+        **success**, while the tasks stay failed and the controller publishes its verdict
+        (`flow_failed`) and what it found (`failed_tasks`: task_id -> responsible group)."""
+        self.fail(
+            dag_run_id,
+            task=next(iter(failed_tasks)),
+            responsible_group=None,  # the controller's map is what names the group here
+            message=message,
+            exception=exception,
+            publish_exception=publish_exception,
+        )
+        r = self.runs[dag_run_id]
+        r.state = "success"  # the rollbacks succeeded, so Airflow calls the run a success
+        r.xcoms["flow_failed"] = "true"
+        r.xcoms["failed_tasks"] = json.dumps(failed_tasks)
+
     @property
     def app(self) -> FastAPI:
         return _build(self)

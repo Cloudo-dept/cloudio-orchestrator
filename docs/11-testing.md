@@ -157,6 +157,15 @@ class AirflowMock:
     def complete(self, dag_run_id: str, state: str = "success") -> None:
         self.runs[dag_run_id].state = state
 
+    def rolled_back(self, dag_run_id: str, *, failed_tasks: dict[str, str], ...) -> None:
+        """A run whose rollback branch cleaned up: the DAG run reports **success** while the
+        tasks stay failed and the controller publishes `flow_failed` + `failed_tasks`."""
+        self.fail(dag_run_id, task=next(iter(failed_tasks)), ...)
+        r = self.runs[dag_run_id]
+        r.state = "success"                    # the rollbacks succeeded
+        r.xcoms["flow_failed"] = "true"
+        r.xcoms["failed_tasks"] = json.dumps(failed_tasks)
+
     def fail(self, dag_run_id: str, *, task: str, responsible_group: str | None = None,
              message: str = "boom", exception: str = "TaskException",
              publish_exception: bool = True) -> None:
