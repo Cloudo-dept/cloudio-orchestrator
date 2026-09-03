@@ -232,6 +232,9 @@ async def test_permanent_failure_marks_failed_and_escalates(
     assert tickets.incidents[0]["summary"] == "Error in provision-vm automation"
     # The exception type + message reaches the responder twice: as the body and as a work note.
     assert tickets.incidents[0]["comment"] == "RuntimeError: ServiceNow unavailable"
+    # No DAG task to name, so these describe the orchestrator's own work instead of being omitted.
+    assert tickets.incidents[0]["flow_type"] == "provision-vm"  # the workflow, not a DAG id
+    assert tickets.incidents[0]["failed_task"] == "creating_ticket"  # the StepName it died on
     assert tickets.incidents[0]["description"] == (
         f"Run {final.run_id} has failed with the following error:\n"
         "RuntimeError: ServiceNow unavailable"
@@ -276,7 +279,8 @@ async def test_task_exception_opens_incident_and_closes_ticket_naming_it(
         f"Run {final.run_id} has failed with the following error:\nTaskException: quota exceeded"
     )
     assert inc["failed_task"] == "provision_vm"
-    assert inc["flow_type"] == "dag-x"  # automation_id, since a task failed
+    # The engine that ran it, then the automation — a bare DAG id does not say where to look.
+    assert inc["flow_type"] == "Airflow:dag-x"
     # The caller's RITM is closed unsuccessful, naming the incident that was opened.
     assert tickets.closed == [
         (
@@ -333,6 +337,8 @@ async def test_missing_handler_fails_the_run_and_opens_an_incident(
     assert len(tickets.incidents) == 1
     assert tickets.incidents[0]["responsible_group"] == "cloudio"  # the default team owns it
     assert "KeyError" in tickets.incidents[0]["comment"]
+    assert tickets.incidents[0]["flow_type"] == "provision-vm"
+    assert tickets.incidents[0]["failed_task"] == "running_engine"
     assert final.run_state.incident_id is not None
 
 
@@ -366,6 +372,23 @@ async def test_a_save_failing_after_escalation_does_not_open_a_second_incident(
     await executor.handle(run.run_id)  # sees FAILED, escalates, then the save breaks
 
     assert len(tickets.incidents) == 1  # one failure → one Incident
+
+
+async def test_engine_failure_without_a_task_names_the_step_instead(
+    runs, tickets, resources, settings
+) -> None:
+    # A DAG that failed without publishing its task: there is no task to name, so the incident
+    # falls back to the workflow and the orchestrator step, rather than dropping both fields.
+    engine = FakeWorkflowEngineClient(status=EngineRunStatus.FAILED)
+    engine.failure = EngineFailure(kind=FailureKind.TASK, detail="something broke")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=0))
+
+    await drive(runs, executor, run.run_id, iters=20)
+
+    inc = tickets.incidents[-1]
+    assert inc["flow_type"] == "provision-vm"  # the workflow, since no DAG task was reported
+    assert inc["failed_task"] == "running_engine"
 
 
 @pytest.mark.parametrize(

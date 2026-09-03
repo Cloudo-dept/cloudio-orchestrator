@@ -173,6 +173,7 @@ async def test_engine_failure_run_fails_and_escalates(
     assert inc["assignment_group"] == "grpsys-netops"
     assert inc["caller_id"] == servicenow.users["jdoe"]  # and the caller as a sys_user sys_id
     assert inc["u_cloudio_failed_task"] == "provision_vm"
+    assert inc["u_cloudio_flow_type"] == "Airflow:dag-x"  # engine, then the automation it ran
     # The DAG's own error reaches the responder as the incident body, titled by the workflow.
     assert inc["short_description"] == f"Error in Run Automation automation ({seeded.number})"
     assert inc["description"] == (

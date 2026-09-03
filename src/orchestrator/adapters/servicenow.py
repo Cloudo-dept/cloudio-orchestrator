@@ -271,8 +271,12 @@ class ServiceNowTicketClient(TicketSystemClient):
             body["assignment_group"] = group_sys_id
         if description:  # the body a responder reads first: what failed and why
             body["description"] = description
-        if flow_type and failed_task:  # DAG-run failures only
+        # Independent: a failure outside the engine still names the workflow it belongs to, even
+        # when there is no task to name (and vice versa). Together they answer "which flow, and
+        # what in it" on every incident, not just the ones a DAG raised.
+        if flow_type:
             body["u_cloudio_flow_type"] = flow_type
+        if failed_task:
             body["u_cloudio_failed_task"] = failed_task
         if comment:  # the same failure detail again, as a work note
             body["work_notes"] = comment

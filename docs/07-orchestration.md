@@ -288,7 +288,26 @@ def incident_summary(run: WorkflowRun) -> str:                       # short_des
 
 def incident_description(run: WorkflowRun, detail: str) -> str:      # description
     return f"Run {run.run_id} has failed with the following error:\n{detail}"
+
+
+def incident_flow_type(run, failure) -> str:                         # u_cloudio_flow_type
+    workflow = run.run_state.workflow
+    if failure is not None and failure.failed_task:                  # e.g. "Airflow:provision_vm"
+        return f"{workflow.engine_type.value.capitalize()}:{workflow.automation_id}"
+    return workflow.identifier                           # else the workflow the run belongs to
+
+
+def incident_failed_task(run, failure) -> str | None:                # u_cloudio_failed_task
+    if failure is not None and failure.failed_task:
+        return failure.failed_task                       # the engine task that broke
+    return StepName(run.current_step).value if run.current_step else None    # else the step
 ```
+
+The last two answer "which flow, and what in it" on **every** incident. A DAG failure names the DAG
+and its task, prefixed with the engine that ran it (`Airflow:provision_vm`) — a bare DAG id says
+what broke but not which system to open, and the prefix comes from the run's `engine_type` so a
+second engine labels itself rather than the escalator spelling out a provider name. Anything else — an adapter out of retries, a deadline, a crash in the driving code —
+names the workflow and the orchestrator step it died on, instead of leaving both fields empty.
 
 `detail` is the failing task's own exception (`"TaskException: quota exceeded"`), not the
 orchestrator's wrapper message, and it is sent **twice** — as the description and as a work note.

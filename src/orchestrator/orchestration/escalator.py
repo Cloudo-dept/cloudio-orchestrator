@@ -2,7 +2,7 @@
 
 import logging
 
-from orchestrator.domain import StepFailure, TicketOutcome, WorkflowRun
+from orchestrator.domain import EngineFailure, StepFailure, StepName, TicketOutcome, WorkflowRun
 from orchestrator.orchestration.failure_policy import FailurePolicy, policy_for
 from orchestrator.ports import TicketSystemClient
 
@@ -22,6 +22,30 @@ def incident_description(run: WorkflowRun, detail: str) -> str:
     """The incident's body: which run broke and what it reported. The run id is what ties the
     incident back to the run store, so it leads."""
     return f"Run {run.run_id} has failed with the following error:\n{detail}"
+
+
+def incident_flow_type(run: WorkflowRun, failure: EngineFailure | None) -> str:
+    """Which flow broke, and where to go looking for it.
+
+    A failure from inside the engine names the automation, prefixed by the engine that ran it
+    (``Airflow:provision_vm``) — a bare DAG id tells a responder what broke but not which system to
+    open. The prefix is derived from the run's engine type rather than written literally, both
+    because engine names have no business being spelled out in orchestration code and so a second
+    engine labels itself. Anything else names the workflow the run belongs to: a run that died
+    before (or outside) its engine run has no automation to blame.
+    """
+    workflow = run.run_state.workflow
+    if failure is not None and failure.failed_task:
+        return f"{workflow.engine_type.value.capitalize()}:{workflow.automation_id}"
+    return workflow.identifier
+
+
+def incident_failed_task(run: WorkflowRun, failure: EngineFailure | None) -> str | None:
+    """What broke: the engine task when the engine reported one, otherwise the orchestrator step
+    that was running. `.value` because StepName is an Enum — str() on it yields "StepName.X"."""
+    if failure is not None and failure.failed_task:
+        return failure.failed_task
+    return StepName(run.current_step).value if run.current_step else None
 
 
 class FailureEscalator:
@@ -71,8 +95,8 @@ class FailureEscalator:
                 summary=incident_summary(run),
                 requested_by=run.created_by,
                 responsible_group=group,
-                flow_type=st.workflow.automation_id if failure and failure.failed_task else None,
-                failed_task=failure.failed_task if failure else None,
+                flow_type=incident_flow_type(run, failure),
+                failed_task=incident_failed_task(run, failure),
                 comment=detail,
                 description=incident_description(run, detail),
             )
@@ -108,6 +132,10 @@ class FailureEscalator:
             responsible_group=self.default_team,
             comment=detail,
             description=incident_description(run, detail),
+            # No engine failure to name, so these describe the orchestrator's own work: the
+            # workflow being run, and the step it was on.
+            flow_type=incident_flow_type(run, None),
+            failed_task=incident_failed_task(run, None),
         )
         st.incident_id = inc.ticket_id
         logger.info("Opened incident %s for run %s.", inc.ticket_id, run.run_id)

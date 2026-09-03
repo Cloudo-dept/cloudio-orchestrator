@@ -412,8 +412,12 @@ class ServiceNowTicketClient(TicketSystemClient):
         group_sys_id = await self._assignment_group(responsible_group)
         if group_sys_id is not None:
             body["assignment_group"] = group_sys_id
-        if flow_type and failed_task:                      # DAG-run failures only
+        # Independent: a failure outside the engine still names the workflow it belongs to, even
+        # when there is no task to name. Together they answer "which flow, and what in it" on
+        # every incident, not just the ones a DAG raised.
+        if flow_type:
             body["u_cloudio_flow_type"] = flow_type
+        if failed_task:
             body["u_cloudio_failed_task"] = failed_task
         async with self._client() as client:
             resp = await client.post("/api/now/table/incident", json=body)
