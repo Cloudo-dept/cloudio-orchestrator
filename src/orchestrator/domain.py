@@ -7,9 +7,9 @@ working state via an explicit ``RunState`` model. No untyped dicts with magic ke
 import uuid
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from pydantic import Field as PyField
 from sqlalchemy import Column, DateTime, Integer, String, types
 from sqlalchemy import Enum as SQLEnum
@@ -161,8 +161,8 @@ class ResourceSpec(BaseModel):
     resource_type: str
     operation: ResourceOperation = ResourceOperation.CREATE  # create / update / delete
     # Resource identity. Callers do NOT set this for a CREATE — ConfigureResourceStep assigns the
-    # run id as the new record's identity. Supplied by the caller only to target an existing
-    # record for an UPDATE/DELETE.
+    # run id as the new record's identity. REQUIRED from the caller on an UPDATE/DELETE, which
+    # target a record that already exists (see the validator below).
     vendor_id: str = ""
     name: str
     region: str | None = None
@@ -171,6 +171,16 @@ class ResourceSpec(BaseModel):
     tags: list[str] = PyField(default_factory=list)
     data: dict[str, Any] = PyField(default_factory=dict)
     alert_groups: list[str] = PyField(default_factory=list)
+
+    @model_validator(mode="after")
+    def _existing_record_needs_an_identity(self) -> Self:
+        """An UPDATE/DELETE acts on a record that already exists, so nothing can assign its
+        identity for it — without a vendor_id there is no record to target. Rejected here rather
+        than at the step, so the caller is told at trigger time (422) instead of the run failing
+        halfway through, after it has already opened a ticket."""
+        if self.operation is not ResourceOperation.CREATE and not self.vendor_id:
+            raise ValueError(f"vendor_id is required for a {self.operation.value} operation.")
+        return self
 
 
 class ResolvedWorkflow(BaseModel):

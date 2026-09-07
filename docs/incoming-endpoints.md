@@ -134,14 +134,19 @@ the orchestrator resolves the registration to decide run type and build the run 
   | `ticket` | `TicketRef \| None` | ✗ | The pre-existing RITM to attach to. **Required for `automation` run types**; ignored for `resource` runs. `TicketRef` = `{ ticket_id, native_id }` (RITM number + sys_id). |
 
   `ResourceSpec`: `project_id`, `resource_type`, `operation` (`create`\|`update`\|`delete`, default
-  `create`), `vendor_id` (blank for CREATE — assigned from run id; set only to target an existing
-  record on UPDATE/DELETE), `name`, `region?`, `environment?`, `description`, `tags[]`, `data{}`,
-  `alert_groups[]`.
+  `create`), `vendor_id` (blank for CREATE — assigned from run id; **required** on UPDATE/DELETE,
+  which target a record that already exists), `name`, `region?`, `environment?`, `description`,
+  `tags[]`, `data{}`, `alert_groups[]`.
+
+  On an UPDATE the spec is the resource's **desired state**, the same way it is on a CREATE — send
+  the whole spec, not a delta. `FinalizeResourceStep` writes it to Project Manager once the engine
+  has succeeded; a DELETE removes the record at the same point.
 
 - **Response `201` — `WorkflowRunResponse`:** `run_id` (UUID), `run_type`, `status` (`RunStatus`),
   `current_step` (`str \| None`), `created_by`, `max_retries`, `run_state` (typed `RunState`).
-- **Errors:** `404` — unknown workflow; `422` — `resource` missing for a resource workflow, or
-  `ticket` missing for an automation workflow.
+- **Errors:** `404` — unknown workflow; `422` — `resource` missing for a resource workflow,
+  `ticket` missing for an automation workflow, or a `resource` with `operation` `update`/`delete`
+  and no `vendor_id`.
 
 ### `GET /api/v1/workflow-runs/{run_id}`  → `200`
 Fetch a single run's current status and state. This is the **polling** endpoint requesters use to

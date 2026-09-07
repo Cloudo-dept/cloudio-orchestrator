@@ -173,7 +173,8 @@ class ResourceSpec(BaseModel):
     project_id: str
     resource_type: str
     operation: ResourceOperation = ResourceOperation.CREATE
-    vendor_id: str            # resource identity; a CREATE is assigned the run id when configured
+    vendor_id: str = ""       # resource identity; a CREATE is assigned the run id when configured,
+                              # an UPDATE/DELETE REQUIRES the caller's (validator below)
     name: str
     region: str
     environment: str
@@ -181,6 +182,15 @@ class ResourceSpec(BaseModel):
     tags: list[str] = PyField(default_factory=list)
     data: dict[str, Any] = PyField(default_factory=dict)
     alert_groups: list[str] = PyField(default_factory=list)
+
+    @model_validator(mode="after")
+    def _existing_record_needs_an_identity(self) -> Self:
+        """An UPDATE/DELETE acts on a record that already exists, so nothing can assign its
+        identity for it. Rejected here, so the caller is told at trigger time (422) instead of
+        the run failing halfway through, after it has already opened a ticket."""
+        if self.operation is not ResourceOperation.CREATE and not self.vendor_id:
+            raise ValueError(f"vendor_id is required for a {self.operation.value} operation.")
+        return self
 
 
 class ResolvedWorkflow(BaseModel):

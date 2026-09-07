@@ -10,6 +10,7 @@ from orchestrator.domain import (
     EngineRunStatus,
     PydanticJSONB,
     ResolvedWorkflow,
+    ResourceOperation,
     ResourceSpec,
     RunState,
     RunStatus,
@@ -46,6 +47,33 @@ def make_run_state(*, with_resource: bool = False) -> RunState:
             else None
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "operation", [ResourceOperation.UPDATE, ResourceOperation.DELETE], ids=lambda op: op.value
+)
+def test_resource_spec_requires_vendor_id_for_an_existing_record(
+    operation: ResourceOperation,
+) -> None:
+    # An UPDATE/DELETE targets a record that already exists — nothing can assign its identity.
+    with pytest.raises(ValidationError, match="vendor_id is required"):
+        ResourceSpec(project_id="proj-1", resource_type="vm", operation=operation, name="app-01")
+    # Supplied → accepted.
+    spec = ResourceSpec(
+        project_id="proj-1",
+        resource_type="vm",
+        operation=operation,
+        vendor_id="vm-1",
+        name="app-01",
+    )
+    assert spec.vendor_id == "vm-1"
+
+
+def test_resource_spec_create_needs_no_vendor_id() -> None:
+    # A CREATE is assigned the run id as its identity by ConfigureResourceStep.
+    spec = ResourceSpec(project_id="proj-1", resource_type="vm", name="app-01")
+    assert spec.operation is ResourceOperation.CREATE
+    assert spec.vendor_id == ""
 
 
 def test_enum_values_are_lowercase_strings() -> None:

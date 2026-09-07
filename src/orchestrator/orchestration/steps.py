@@ -24,6 +24,7 @@ from orchestrator.domain import (
     EngineRunStatus,
     FailureKind,
     ResourceOperation,
+    ResourceSpec,
     RunRejected,
     RunState,
     StepFailure,
@@ -128,9 +129,10 @@ class ConfigureResourceStep(StepHandler):
     """Configure the resource for its operation (resource runs only), then hand off to the engine.
 
     A CREATE has no vendor id yet, so the run id becomes the resource's identity and a new
-    record is created. An UPDATE/DELETE acts on a record that already exists, so we only mark
-    the existing record in-progress. Either way FinalizeResourceStep clears in_progress once the
-    engine is done. Idempotent on resource_configured."""
+    record is created. An UPDATE/DELETE acts on a record that already exists (the caller's
+    vendor_id, required by ResourceSpec), so we only mark that record in-progress — the change
+    itself lands in FinalizeResourceStep, once the engine has actually made it.
+    Idempotent on resource_configured."""
 
     def __init__(self, resource_client: ResourceManagerClient) -> None:
         self.resource_client = resource_client
@@ -260,8 +262,18 @@ class RunEngineStep(StepHandler):
 
 
 class FinalizeResourceStep(StepHandler):
-    """Mark the created resource provisioned (resource runs only). Idempotent on
-    resource_finalized; a no-op if the run has no resource."""
+    """Apply the run's outcome to the resource record (resource runs only), now that the engine
+    has done the real work: a CREATE/UPDATE clears in-progress — and an UPDATE also writes the
+    spec as the record's new state — while a DELETE removes the record.
+
+    The record changes *here* rather than at CONFIGURE_RESOURCE on purpose: a run that fails never
+    reaches this step, so Project Manager never advertises a change (or a deletion) the engine did
+    not actually make — and there is no compensation to undo one if it did.
+
+    Idempotent on resource_finalized; a no-op if the run has no resource. The marker is persisted
+    only after the provider call returns, which is why the port's delete has to tolerate a record
+    that is already gone — a crash in between re-drives straight into a second delete.
+    """
 
     def __init__(self, resource_client: ResourceManagerClient) -> None:
         self.resource_client = resource_client
@@ -271,31 +283,50 @@ class FinalizeResourceStep(StepHandler):
         if st.resource is None or st.resource_finalized:
             logger.debug("Run %s: no resource to finalize (or already done).", run.run_id)
             return True
-        # Target the record where ConfigureResourceStep created/targeted it (resource.vendor_id —
-        # the run id for a CREATE). If the engine reported the id it actually provisioned (the
-        # RUN_ENGINE step result's final_vendor_id), record it on that record as we finalize — a
-        # re-key from the run-id placeholder to the real vendor id.
-        vendor_id = st.resource.vendor_id
+        resource = st.resource
+        # The record lives where ConfigureResourceStep created/targeted it (resource.vendor_id —
+        # the run id for a CREATE).
+        if resource.operation is ResourceOperation.DELETE:
+            logger.info("Run %s: deleting resource %s.", run.run_id, resource.vendor_id)
+            await self.resource_client.delete_resource(
+                resource.project_id, resource.resource_type, resource.vendor_id
+            )
+        else:
+            fields = self._finalize_fields(run, resource)
+            logger.info(
+                "Run %s: finalizing resource %s (operation=%s).",
+                run.run_id,
+                resource.vendor_id,
+                resource.operation.value,
+            )
+            await self.resource_client.update_resource(
+                resource.project_id, resource.resource_type, resource.vendor_id, fields
+            )
+        st.resource_finalized = True
+        return True
+
+    def _finalize_fields(self, run: WorkflowRun, resource: ResourceSpec) -> dict[str, Any]:
+        """What to PATCH for a CREATE/UPDATE: always in_progress=False; for an UPDATE also the
+        spec's own fields — the spec is the record's *desired state*, the same way it is on a
+        CREATE, so a caller sends the whole thing rather than a delta. If the engine reported the
+        id it actually provisioned (the RUN_ENGINE step result's final_vendor_id), re-key to it —
+        for a CREATE that replaces the run-id placeholder with the real vendor id."""
         fields: dict[str, Any] = {"in_progress": False}  # done provisioning
-        engine_result = st.step_results.get(StepName.RUN_ENGINE)
+        if resource.operation is ResourceOperation.UPDATE:
+            fields |= resource.model_dump(
+                exclude={"project_id", "resource_type", "operation", "vendor_id"}
+            ) | {"last_modified_by": run.created_by}
+        engine_result = run.run_state.step_results.get(StepName.RUN_ENGINE)
         engine_vendor_id = engine_result.final_vendor_id if engine_result else None
-        if engine_vendor_id and engine_vendor_id != vendor_id:
+        if engine_vendor_id and engine_vendor_id != resource.vendor_id:
             fields["vendor_id"] = engine_vendor_id
             logger.info(
                 "Run %s: re-keying resource %s -> %s on finalize.",
                 run.run_id,
-                vendor_id,
+                resource.vendor_id,
                 engine_vendor_id,
             )
-        logger.info("Run %s: finalizing resource %s (in_progress=False).", run.run_id, vendor_id)
-        await self.resource_client.update_resource(
-            st.resource.project_id,
-            st.resource.resource_type,
-            vendor_id,
-            fields,
-        )
-        st.resource_finalized = True
-        return True
+        return fields
 
 
 class CloseTicketStep(StepHandler):
@@ -311,7 +342,7 @@ class CloseTicketStep(StepHandler):
             return True
         assert st.ticket is not None
         note = (
-            "Resource provisioned; request closed."
+            f"Resource {st.resource.operation.value} completed; request closed."
             if st.resource is not None
             else "CloudIO automation completed."
         )

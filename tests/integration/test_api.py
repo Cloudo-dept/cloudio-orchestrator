@@ -187,6 +187,23 @@ async def test_malformed_resource_spec_is_422_at_boundary(client: httpx.AsyncCli
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("operation", ["update", "delete"])
+async def test_trigger_without_vendor_id_for_an_existing_record_is_422(
+    client: httpx.AsyncClient, operation: str
+) -> None:
+    await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={
+            "workflow_identifier": "provision-vm",
+            "created_by": "jdoe",
+            "resource": {**RESOURCE, "operation": operation},  # no vendor_id
+        },
+    )
+    assert resp.status_code == 422
+    assert "vendor_id is required" in str(resp.json()["detail"])
+
+
 async def test_get_unknown_run_is_404(client: httpx.AsyncClient) -> None:
     resp = await client.get(f"/api/v1/workflow-runs/{'0' * 8}-0000-0000-0000-000000000000")
     assert resp.status_code == 404
@@ -220,9 +237,7 @@ async def test_ticket_approval_callback_wakes_the_run(
     from orchestrator.domain import utcnow
 
     run_id = await _make_waiting_run(runs, ticket_id="RITM0001234")
-    resp = await client.post(
-        "/api/v1/callbacks/ticket-approval", json={"ticket_id": "RITM0001234"}
-    )
+    resp = await client.post("/api/v1/callbacks/ticket-approval", json={"ticket_id": "RITM0001234"})
     assert resp.status_code == 202 and resp.json() == {"woken": 1}
     woken = await runs.get(run_id)
     assert woken is not None and woken.scheduled_at is not None

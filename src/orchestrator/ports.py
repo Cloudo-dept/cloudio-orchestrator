@@ -154,8 +154,12 @@ class ResourceManagerClient(abc.ABC):
     async def update_resource(
         self, project_id: str, resource_type: str, vendor_id: str, fields: dict[str, Any]
     ) -> None:
-        """Partial update (only changed fields) — e.g. in_progress=False on finalize.
-        (There is no delete endpoint in the provider; nothing is ever removed.)"""
+        """Partial update (only changed fields) — e.g. in_progress=False on finalize."""
+
+    @abc.abstractmethod
+    async def delete_resource(self, project_id: str, resource_type: str, vendor_id: str) -> None:
+        """Remove a project resource. Idempotent: a record that is already gone is not an error,
+        so a re-driven finalize cannot fail on the strength of its own earlier success."""
 
 
 class WorkflowEngineClient(abc.ABC):

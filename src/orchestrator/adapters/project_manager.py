@@ -51,3 +51,14 @@ class ProjectManagerResourceClient(ResourceManagerClient):
                 f"/projects/{project_id}/project_resources/{resource_type}/{vendor_id}", json=fields
             )
             resp.raise_for_status()
+
+    async def delete_resource(self, project_id: str, resource_type: str, vendor_id: str) -> None:
+        async with self._client() as client:
+            resp = await client.delete(
+                f"/projects/{project_id}/project_resources/{resource_type}/{vendor_id}"
+            )
+            # Already gone → the delete has happened; a re-driven finalize (delivery is
+            # at-least-once) must not fail on the strength of its own earlier success.
+            if resp.status_code == httpx.codes.NOT_FOUND:
+                return
+            resp.raise_for_status()

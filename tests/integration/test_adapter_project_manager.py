@@ -35,6 +35,33 @@ async def test_finalize_patches_in_progress_false(
     assert project_manager.resources["proj-1/vm/vm-1"]["in_progress"] is False
 
 
+async def test_delete_resource_removes_the_record(
+    project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    await pm_client.create_resource("proj-1", "vm", {"vendor_id": "vm-1"}, "run-1:creating:0")
+    await pm_client.delete_resource("proj-1", "vm", "vm-1")
+    assert project_manager.deletes == ["proj-1/vm/vm-1"]
+    assert "proj-1/vm/vm-1" not in project_manager.resources
+
+
+async def test_delete_resource_tolerates_an_already_deleted_record(
+    project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    # Delivery is at-least-once: a re-driven finalize must not fail on its own earlier success.
+    await pm_client.create_resource("proj-1", "vm", {"vendor_id": "vm-1"}, "run-1:creating:0")
+    await pm_client.delete_resource("proj-1", "vm", "vm-1")
+    await pm_client.delete_resource("proj-1", "vm", "vm-1")  # 404 → treated as done
+    assert project_manager.deletes == ["proj-1/vm/vm-1"]
+
+
+async def test_delete_5xx_is_surfaced(
+    project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    project_manager.overrides.append(Override(path_contains="/project_resources", status=503))
+    with pytest.raises(httpx.HTTPStatusError):
+        await pm_client.delete_resource("proj-1", "vm", "vm-1")
+
+
 async def test_create_5xx_is_surfaced(
     project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
 ) -> None:

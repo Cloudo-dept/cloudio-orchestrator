@@ -125,7 +125,25 @@ async def test_resource_run_completes_and_finalizes(
     assert final.run_state.resource.vendor_id == str(run.run_id)
     # ...and finalize PATCHes in_progress=False on that resource, then closes the RITM.
     assert resources.updated[-1] == ("proj-1", "vm", str(run.run_id), {"in_progress": False})
-    assert tickets.closed and tickets.closed[0][1] == "Resource provisioned; request closed."
+    assert tickets.closed and tickets.closed[0][1] == "Resource create completed; request closed."
+
+
+async def test_delete_resource_run_removes_the_record_end_to_end(
+    runs, tickets, resources, engine, settings
+) -> None:
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = make_run(run_type=RunType.RESOURCE)
+    run.run_state.resource = make_resource_spec(operation=ResourceOperation.DELETE)
+    created = await runs.create(run)
+
+    final = await drive(runs, executor, created.run_id)
+
+    assert final.status is RunStatus.COMPLETED
+    assert resources.create_calls == []  # a delete provisions nothing
+    # Configure marks the caller's record in-progress; finalize removes it once the engine is done.
+    assert resources.updated == [("proj-1", "vm", "vm-1", {"in_progress": True})]
+    assert resources.deleted == [("proj-1", "vm", "vm-1")]
+    assert tickets.closed and tickets.closed[0][1] == "Resource delete completed; request closed."
 
 
 async def test_engine_polls_until_success(runs, tickets, resources, settings) -> None:
@@ -615,6 +633,49 @@ async def test_finalize_resource_step(resources) -> None:
     assert len(resources.updated) == 1
 
 
+async def test_finalize_resource_step_update_writes_the_spec_as_desired_state(resources) -> None:
+    step = FinalizeResourceStep(resources)
+    run = make_run(run_type=RunType.RESOURCE)
+    run.run_state.resource = make_resource_spec(operation=ResourceOperation.UPDATE)
+
+    assert await step.execute(run) is True
+    assert run.run_state.resource_finalized is True
+    # The engine has done the real work, so the record now takes the spec's own fields — not just
+    # in_progress=False. vendor_id is the target, not a field, so it is not in the body.
+    assert resources.deleted == []
+    assert resources.updated == [
+        (
+            "proj-1",
+            "vm",
+            "vm-1",
+            {
+                "in_progress": False,
+                "name": "app-01",
+                "region": "gvt",
+                "environment": "prod",
+                "description": "",
+                "tags": [],
+                "data": {},
+                "alert_groups": [],
+                "last_modified_by": "jdoe",
+            },
+        )
+    ]
+
+
+async def test_finalize_resource_step_delete_removes_the_record(resources) -> None:
+    step = FinalizeResourceStep(resources)
+    run = make_run(run_type=RunType.RESOURCE)
+    run.run_state.resource = make_resource_spec(operation=ResourceOperation.DELETE)
+
+    assert await step.execute(run) is True
+    assert run.run_state.resource_finalized is True
+    assert resources.deleted == [("proj-1", "vm", "vm-1")]
+    assert resources.updated == []  # a delete does not clear in_progress — the record is gone
+    assert await step.execute(run) is True  # re-drive: marker short-circuits
+    assert len(resources.deleted) == 1
+
+
 async def test_close_ticket_step(tickets) -> None:
     step = CloseTicketStep(tickets)
     run = make_run(run_type=RunType.RESOURCE)
@@ -623,7 +684,7 @@ async def test_close_ticket_step(tickets) -> None:
     assert await step.execute(run) is True
     assert run.run_state.ticket_closed is True
     assert tickets.closed == [
-        ("RITM0000001", "Resource provisioned; request closed.", TicketOutcome.SUCCESSFUL)
+        ("RITM0000001", "Resource create completed; request closed.", TicketOutcome.SUCCESSFUL)
     ]
     assert await step.execute(run) is True  # re-drive: marker short-circuits
     assert len(tickets.closed) == 1
