@@ -24,6 +24,7 @@ the callbacks** — they are network-trust only (see
 | `POST /api/v1/workflow-runs` | Trigger a run of a workflow | **Automation:** ServiceNow (RITM outbound REST). **Resource:** self-service portal / upstream automation |
 | `GET /api/v1/workflow-runs/{run_id}` | Fetch one run's status/state | Requester / console UI polling for completion |
 | `GET /api/v1/workflow-runs` | List/search runs (by ticket or resource) | Console UI / operator / integrating systems |
+| `POST /api/v1/workflow-runs/{run_id}/retry` | Resume a **failed** run at the step it stopped at | Operator (console UI “Retry” on a failed row) |
 | `POST /api/v1/callbacks/ticket-approval` | Wake-early nudge on approval change | **ServiceNow** (business rule on approval change) |
 | `POST /api/v1/callbacks/engine-run` | Wake-early nudge on engine completion | **Airflow** (DAG `on_success`/`on_failure_callback`) |
 
@@ -161,6 +162,43 @@ List recent runs, or search by ticket / resource.
   - `resource_id: str` — return runs tied to that resource (`vendor_id`).
   - Neither → most recent runs, newest first.
 - **Response `200`:** `list[WorkflowRunResponse]`.
+
+### `POST /api/v1/workflow-runs/{run_id}/retry`  → `202 Accepted`
+Resume a **failed** run from the step it stopped at. The run is not re-created and nothing is
+re-triggered from the top: the failed step's own bookkeeping (attempt count, wall-clock deadline,
+recorded error, and whatever its handler considers stale — for `running_engine`, the failed engine
+run id) is cleared, `manual_retries` is incremented, and the run is set back to `running` with
+`scheduled_at = now`, so a worker claims it and drives it from `current_step`. Steps that already
+completed short-circuit on their own idempotency markers (`ticket`, `resource_configured`, …), so
+no second RITM and no second resource record are created. `202` because the re-drive is
+asynchronous — the body is the run as it was just re-scheduled, not its outcome.
+
+Two things happen outside the run store:
+
+- **The ticket is told.** The run's RITM goes back to an in-progress state (ServiceNow: state 2)
+  with a work note naming the retry and the step it resumes at — for **both** run types, including
+  an automation run whose RITM the caller owns. Best-effort: a ticket system that is down is
+  logged and the run resumes anyway. If the ticket had been closed, `ticket_closed` is cleared so
+  `closing_ticket` closes it again at the end.
+- **The incident is left open**, deliberately. What becomes of it is decided by the *next*
+  failure, in the escalator — same step → a comment on it; different step → closed as resolved by
+  the retry, and a new one opened. See
+  [07-orchestration](07-orchestration.md#resuming-a-failed-run).
+
+- **Source:** an operator, from the dev console's **Retry** action (offered only on failed rows).
+- **Path param:** `run_id: uuid.UUID`.
+- **Request:** no body. The retry is attributed to the run's existing `created_by`.
+- **Response `202` — `WorkflowRunResponse`:** the re-scheduled run (`status = "running"`,
+  `current_step` = the step it will resume at).
+- **Errors:**
+  - `404 Not Found` — unknown run.
+  - `409 Conflict` — the run is not `failed` (a completed run has nothing left to do, a rejected
+    one was denied rather than failed, and a pending/running one is already being driven), or it
+    changed concurrently between the read and the write.
+
+> **Retry vs. the automatic per-step retries.** `max_retries` is the *transient* budget the
+> executor spends by itself with exponential backoff. This endpoint is the operator's move after
+> that budget is gone and the failure was escalated: the incident stays open, and the run resumes.
 
 ---
 

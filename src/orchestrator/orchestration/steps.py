@@ -11,7 +11,8 @@ Every handler is idempotent two ways:
    creating a duplicate (a second ticket, a second resource).
 
 The one exception is the engine run id (``engine_run_key``): it is attempt-scoped so a *retry* of
-RUN_ENGINE launches a fresh engine run rather than re-attaching to the failed one.
+RUN_ENGINE — automatic or operator-initiated — launches a fresh engine run rather than
+re-attaching to the failed one.
 """
 
 import abc
@@ -49,9 +50,12 @@ def idem_key(run: WorkflowRun, step: StepName) -> str:
 
 def engine_run_key(run: WorkflowRun) -> str:
     """The engine run id (Airflow: dag_run_id). Attempt-scoped, so a RUN_ENGINE *retry* triggers a
-    fresh engine run instead of re-attaching to (and re-reading) the failed one."""
-    attempt = run.run_state.step_attempts.get(StepName.RUN_ENGINE, 0)
-    return f"{run.run_id}:{StepName.RUN_ENGINE.value}:{attempt}"
+    fresh engine run instead of re-attaching to (and re-reading) the failed one. An operator retry
+    of a FAILED run resets the attempt counter, so ``manual_retries`` is part of the key too —
+    without it the first attempt after a retry would reuse the very first attempt's key."""
+    st = run.run_state
+    attempt = st.step_attempts.get(StepName.RUN_ENGINE, 0)
+    return f"{run.run_id}:{StepName.RUN_ENGINE.value}:{st.manual_retries}:{attempt}"
 
 
 class StepHandler(abc.ABC):

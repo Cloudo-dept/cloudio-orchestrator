@@ -190,6 +190,14 @@ function toggleResourceFields() {
 // =============================================================================
 function renderRuns() {
   $("#run-count").textContent = runList.length;
+  // Only a failed run can be retried, and the retry resumes at the step it stopped at — so the
+  // button is offered on exactly those rows, and says which step it will resume at.
+  const retryButton = (run, i) => {
+    if (run.status !== "failed") return "";
+    const at = esc(run.current_step) || "its first step";
+    const hint = `Resume this run at ${at} — steps that already completed are not re-run`;
+    return `<button class="btn btn-sm" data-run-retry="${i}" title="${hint}">Retry</button>`;
+  };
   const rows = runList.map((run, i) => `<tr>
       <td class="mono" title="${esc(run.run_id)}">${esc(run.run_id.slice(0, 8))}…</td>
       <td>${esc(run.run_type)}</td>
@@ -197,7 +205,7 @@ function renderRuns() {
       <td>${esc(run.current_step) || "—"}</td>
       <td>${esc(run.created_by) || "—"}</td>
       <td class="mono">${esc(run.max_retries)}</td>
-      <td class="actions"><button class="btn btn-sm" data-run-view="${i}">View</button></td>
+      <td class="actions">${retryButton(run, i)}<button class="btn btn-sm" data-run-view="${i}">View</button></td>
     </tr>`);
   $("#runs-table tbody").innerHTML = rows.join("") ||
     `<tr class="empty-row"><td colspan="7">No runs yet — trigger one.</td></tr>`;
@@ -350,7 +358,8 @@ $("#trigger-workflow").addEventListener("change", toggleResourceFields);
 
 document.addEventListener("click", async (e) => {
   const t = e.target.closest(
-    "[data-tab],[data-act],[data-wf-view],[data-wf-edit],[data-run-view],[data-json-format]");
+    "[data-tab],[data-act],[data-wf-view],[data-wf-edit],[data-run-view],[data-run-retry]," +
+    "[data-json-format]");
   if (!t) return;
   const d = t.dataset;
 
@@ -377,6 +386,19 @@ document.addEventListener("click", async (e) => {
     else if (d.act === "cancel-run") { $("#trigger-form").hidden = true; }
     else if (d.runView !== undefined) openDrawer(
       `Run · ${runList[d.runView].run_id}`, runList[d.runView]);
+
+    else if (d.runRetry !== undefined) {
+      const run = runList[d.runRetry];
+      t.disabled = true; // one POST per click; the refresh below re-renders the row either way
+      try {
+        const retried = await api("POST", `/workflow-runs/${run.run_id}/retry`);
+        ok("Retry queued",
+           `Run ${run.run_id.slice(0, 8)}… resumes at ${retried.current_step || "its first step"}.`);
+      } catch (err) {
+        fail("Retry failed", err);
+      }
+      await refreshRuns();
+    }
 
     else if (d.act === "close-drawer") closeDrawer();
   } catch (err) {

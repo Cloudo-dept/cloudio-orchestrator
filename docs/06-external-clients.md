@@ -30,14 +30,31 @@ class TicketSystemClient(abc.ABC):
         """Mark the ticket complete, optionally attaching a note."""
 
     @abc.abstractmethod
+    async def reopen_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
+        """Return the ticket to an in-progress state (the inverse of close_ticket), optionally
+        attaching a note. Used when a failed run is retried."""
+
+    @abc.abstractmethod
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
         """Attach a note to the ticket without changing its state."""
 
     @abc.abstractmethod
     async def open_incident(self, summary: str, requested_by: str, responsible_group: str,
-                            flow_type: str | None = None,
-                            failed_task: str | None = None) -> TicketRef:
+                            flow_type: str | None = None, failed_task: str | None = None,
+                            comment: str | None = None) -> TicketRef:
         """Raise an incident for a failure, routed to the responsible group."""
+
+    @abc.abstractmethod
+    async def annotate_incident(self, incident: TicketRef, note: str,
+                                flow_type: str | None = None,
+                                failed_task: str | None = None) -> None:
+        """Attach a note to an open incident without changing its state — how a repeat of the
+        failure it was raised for is recorded, instead of raising a duplicate. Fresh failure
+        detail passed here brings the incident's failure fields up to the new state."""
+
+    @abc.abstractmethod
+    async def close_incident(self, incident: TicketRef, note: str) -> None:
+        """Resolve/close an incident, attaching `note` as the closing comment."""
 
 
 class ResourceManagerClient(abc.ABC):
@@ -267,8 +284,29 @@ class ServiceNowTicketClient(TicketSystemClient):
         body = {"work_notes": note} if note else {}
         await self._patch("sc_req_item", ticket.native_id, state=self._RITM_CLOSED, **body)
 
+    async def reopen_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
+        body = {"work_notes": note} if note else {}
+        await self._patch("sc_req_item", ticket.native_id, state=self._RITM_IN_PROGRESS, **body)
+
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
         await self._patch("sc_req_item", ticket.native_id, work_notes=note)
+
+    async def annotate_incident(self, incident: TicketRef, note: str,
+                                flow_type: str | None = None,
+                                failed_task: str | None = None) -> None:
+        # One PATCH: the note, plus the same u_cloudio_* pair open_incident set, moved to this
+        # failure — so the incident describes the latest failure, not only the first.
+        body: dict[str, Any] = {"work_notes": note}
+        if flow_type and failed_task:
+            body["u_cloudio_flow_type"] = flow_type
+            body["u_cloudio_failed_task"] = failed_task
+        await self._patch("incident", incident.native_id, **body)
+
+    async def close_incident(self, incident: TicketRef, note: str) -> None:
+        # state 6 = Resolved; close_code is left to the instance default (UI policies that make
+        # it mandatory do not apply to REST writes — see 01-external-contracts).
+        await self._patch("incident", incident.native_id,
+                          state=self._INCIDENT_RESOLVED, close_notes=note)
 
     async def open_incident(self, summary: str, requested_by: str, responsible_group: str,
                             flow_type: str | None = None,

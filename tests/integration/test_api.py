@@ -8,17 +8,38 @@ import httpx
 import pytest
 
 from orchestrator.api import app
-from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
-from tests.fakes import FakeHealthCheck, FakeWorkflowRepository, FakeWorkflowRunRepository
+from orchestrator.domain import WorkflowEngineType
+from orchestrator.orchestration.plans import build_handlers
+from orchestrator.services import (
+    RunCallbackService,
+    RunRetryService,
+    WorkflowRunService,
+    WorkflowService,
+)
+from tests.fakes import (
+    FakeHealthCheck,
+    FakeResourceManagerClient,
+    FakeTicketSystemClient,
+    FakeWorkflowEngineClient,
+    FakeWorkflowRepository,
+    FakeWorkflowRunRepository,
+)
 
 
 @pytest.fixture
 async def client(
     runs: FakeWorkflowRunRepository, workflows: FakeWorkflowRepository
 ) -> AsyncIterator[httpx.AsyncClient]:
+    tickets = FakeTicketSystemClient()
+    handlers = build_handlers(
+        tickets,
+        FakeResourceManagerClient(),
+        {WorkflowEngineType.AIRFLOW: FakeWorkflowEngineClient()},
+    )
     app.state.container = SimpleNamespace(
         workflow_service=WorkflowService(workflows),
         run_service=WorkflowRunService(runs, workflows),
+        retry_service=RunRetryService(runs, handlers, tickets),
         callback_service=RunCallbackService(runs),
         health_check=FakeHealthCheck(healthy=True),
     )
@@ -268,3 +289,57 @@ async def test_list_by_resource_and_ticket(client: httpx.AsyncClient) -> None:
 
     unfiltered = await client.get("/api/v1/workflow-runs")
     assert unfiltered.status_code == 200 and len(unfiltered.json()) == 1
+
+
+# --- Retry: resume a failed run from the step it stopped at -------------------
+
+
+async def _make_failed_run(runs: FakeWorkflowRunRepository) -> uuid.UUID:
+    """A run that exhausted its retries at RUN_ENGINE — the state the console offers Retry on."""
+    from orchestrator.domain import RunStatus, RunType, StepName
+    from tests.factories import make_run
+
+    run = make_run(run_type=RunType.RESOURCE)
+    run.status, run.current_step, run.scheduled_at = RunStatus.FAILED, StepName.RUN_ENGINE, None
+    run.run_state.engine_run_id = "dagrun-1"
+    run.run_state.errors[StepName.RUN_ENGINE] = "Engine run dagrun-1 failed."
+    await runs.create(run)
+    return run.run_id
+
+
+async def test_retry_reschedules_a_failed_run(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    from orchestrator.domain import utcnow
+
+    run_id = await _make_failed_run(runs)
+
+    resp = await client.post(f"/api/v1/workflow-runs/{run_id}/retry")
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "running"  # scheduled for a re-drive, not re-created
+    assert body["current_step"] == "running_engine"  # it resumes at the step that failed
+    assert body["run_state"]["manual_retries"] == 1
+    assert body["run_state"]["engine_run_id"] is None  # the failed engine run is not re-attached
+    stored = await runs.get(run_id)
+    assert stored is not None and stored.scheduled_at is not None
+    assert stored.scheduled_at <= utcnow()  # due now → a worker picks it up
+
+
+async def test_retry_of_a_run_that_is_not_failed_is_409(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    from tests.factories import make_run
+
+    run = make_run()  # PENDING — still on its way
+    await runs.create(run)
+
+    resp = await client.post(f"/api/v1/workflow-runs/{run.run_id}/retry")
+
+    assert resp.status_code == 409 and "not failed" in resp.json()["detail"]
+
+
+async def test_retry_of_an_unknown_run_is_404(client: httpx.AsyncClient) -> None:
+    resp = await client.post(f"/api/v1/workflow-runs/{uuid.uuid4()}/retry")
+    assert resp.status_code == 404

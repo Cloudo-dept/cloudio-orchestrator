@@ -220,6 +220,21 @@ class CloseTicketStep(StepHandler):
 
 ## `orchestration/escalator.py` — the failure model
 
+The incident is a record **per problem**, not per failure, which is what makes it survive a retry
+sensibly. `escalate()` looks at the incident already on the run (`state.incident` +
+`state.incident_step`) and picks one of three paths:
+
+| Situation | What happens |
+| --- | --- |
+| No incident yet | Open one, routed to the responsible group; note it on the RITM; record it together with the step it covers. |
+| The same step failed again (after a retry) | **Comment on that incident**, and refresh the failure detail it carries (`flow_type` / `failed_task` → ServiceNow's `u_cloudio_*`) to this failure. No duplicate INC for a problem that is still the same problem. |
+| A *different* step fails now | The retry got the run past what the old incident was about → **close it** ("Resolved by retrying…"), then open a new one for the new problem. |
+
+Each path is individually guarded: a ticket system that refuses the comment or the close never
+crashes the worker, and a failed close still lets the new incident open. The failure detail itself
+is derived once (`_failure_fields`) and used by both the open and the comment path, so an incident
+cannot be opened describing one thing and updated describing another.
+
 ```python
 import logging
 
@@ -257,6 +272,23 @@ class FailureEscalator:
         except Exception as e:      # never let escalation crash the worker
             logger.error("Failed to escalate run %s failure: %s", run.run_id, e)
 ```
+
+### Resuming a failed run
+
+`FAILED` is terminal for the *executor* — it never re-drives a failed run by itself — but it is
+not the end of the road for the run. Because the failure leaves `current_step` on the step that
+gave up and leaves every earlier step's idempotency marker in `RunState`, an operator can resume
+it: `RunRetryService.retry(run_id)` (behind `POST /api/v1/workflow-runs/{run_id}/retry`, surfaced
+as **Retry** in the dev console) clears the failed step's bookkeeping — attempts, wall-clock
+deadline, recorded error, plus the same `reset_for_retry` hook an automatic retry uses — bumps
+`manual_retries`, and sets the run back to `RUNNING` with `scheduled_at = now`. A worker then
+claims it and drives it from `current_step`; the completed steps short-circuit, so nothing is
+re-created. Still no rollback and no compensation: nothing already built is undone, and the
+resumed run simply carries on from where it stopped.
+
+The retry also puts the run's RITM back to an in-progress state with a work note (best-effort —
+a ticket system that is down does not block the resume), and leaves the incident open for the
+escalator to deal with on the next failure, per the table above.
 
 ## `orchestration/executor.py` — the run driver
 

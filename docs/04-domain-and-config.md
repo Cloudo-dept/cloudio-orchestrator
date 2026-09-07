@@ -191,9 +191,14 @@ class RunState(BaseModel):
     step_started_at: dict[StepName, datetime] = PyField(default_factory=dict)
     errors: dict[StepName, str] = PyField(default_factory=dict)
 
+    # operator-initiated retries of this run after it FAILED (RunRetryService). Also keeps the
+    # engine's idempotency key unique across retries — each retry clears step_attempts.
+    manual_retries: int = 0
+
     # failure escalation
     engine_failure: EngineFailure | None = None
-    incident_id: str | None = None
+    incident: TicketRef | None = None      # the incident open for the current failure
+    incident_step: StepName | None = None  # ...and the step it was raised for
 
 
 # --- Persistence helpers ---

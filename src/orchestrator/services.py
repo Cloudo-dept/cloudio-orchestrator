@@ -1,6 +1,7 @@
 """Use-cases the API delegates to."""
 
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from loguru import logger
@@ -9,16 +10,21 @@ from orchestrator.domain import (
     ResolvedWorkflow,
     ResourceParamsRequired,
     ResourceSpec,
+    RunNotFound,
+    RunNotRetryable,
     RunState,
     RunStatus,
     RunType,
+    StepName,
     TicketRef,
     TicketRefRequired,
     UnknownWorkflowError,
     Workflow,
     WorkflowRun,
+    utcnow,
 )
-from orchestrator.ports import WorkflowRepository, WorkflowRunRepository
+from orchestrator.orchestration.steps import StepHandler
+from orchestrator.ports import TicketSystemClient, WorkflowRepository, WorkflowRunRepository
 
 
 class WorkflowService:
@@ -114,6 +120,99 @@ class WorkflowRunService:
 
     async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]:
         return await self.runs.find_by_resource_id(vendor_id)
+
+
+class RunRetryService:
+    """Resume a FAILED run from the step it stopped at (an operator action from the console).
+
+    A failed run keeps everything it had achieved: ``current_step`` is the step that exhausted its
+    retries, and every step before it left its idempotency marker in ``RunState`` (``ticket``,
+    ``resource_configured``, ``engine_run_id``, …). So resuming is not a re-trigger — it clears
+    only the failed step's own bookkeeping (attempt count, wall-clock deadline, recorded error)
+    plus whatever that step's handler considers stale, then makes the run due now. A worker claims
+    it and drives it from ``current_step``; the completed steps ahead of it short-circuit.
+
+    The handler map is the same one the executor drives with — a retry resets step-scoped state
+    through the very hook (``reset_for_retry``) that an automatic retry uses, so the two paths
+    cannot drift.
+
+    The ticket system is told too: the run's ticket goes back to an in-progress state with a note
+    saying the run was retried, so the requester sees the request is being worked again rather
+    than a record that silently starts moving. The incident raised for the failure is deliberately
+    left open — the escalator decides what becomes of it when (and only if) the run fails again.
+    """
+
+    def __init__(
+        self,
+        runs: WorkflowRunRepository,
+        handlers: Mapping[StepName, StepHandler],
+        tickets: TicketSystemClient,
+    ) -> None:
+        self.runs = runs
+        self.handlers = handlers
+        self.tickets = tickets
+
+    async def retry(self, run_id: uuid.UUID) -> WorkflowRun:
+        run = await self.runs.get(run_id)
+        if run is None:
+            logger.warning("Retry requested for unknown run {}.", run_id)
+            raise RunNotFound(str(run_id))
+        if run.status is not RunStatus.FAILED:
+            logger.warning("Retry refused for run {}: status is {}.", run_id, run.status)
+            raise RunNotRetryable(f"Run {run_id} is {run.status.value}, not failed.")
+
+        st = run.run_state
+        step = StepName(run.current_step) if run.current_step else None
+        if step is not None:  # give the failed step a clean slate: attempts, deadline, error
+            st.step_attempts.pop(step, None)
+            st.step_started_at.pop(step, None)
+            st.errors.pop(step, None)
+            self.handlers[step].reset_for_retry(st)
+        st.manual_retries += 1
+        await self._reopen_ticket(run, step)
+
+        # RUNNING + due now: a worker claims it on its next scan and drives it from current_step.
+        run.status, run.scheduled_at = RunStatus.RUNNING, utcnow()
+        await self.runs.save(run)
+        logger.info(
+            "Run {} retried (manual retry #{}); resuming at step {}.",
+            run.run_id,
+            st.manual_retries,
+            step or "the start of the plan",
+        )
+        return run
+
+    async def _reopen_ticket(self, run: WorkflowRun, step: StepName | None) -> None:
+        """Put the retry on the run's ticket and return it to an in-progress state.
+
+        Best-effort: a ticket system that is down must not stop an operator from resuming a run,
+        so a failure here is logged and the retry carries on. Applies to both run types — an
+        automation run's RITM belongs to the caller, but it is still the record tracking this
+        work, so it is told the work resumed.
+        """
+        st = run.run_state
+        if st.ticket is None:  # a resource run that failed before it ever opened its RITM
+            return
+        at = f"step '{step.value}'" if step else "the first step of the plan"
+        note = f"Run {run.run_id} was retried (retry #{st.manual_retries}); resuming at {at}."
+        try:
+            await self.tickets.reopen_ticket(st.ticket, note=note)
+        except Exception as error:
+            logger.warning(
+                "Run {}: could not re-open ticket {} for the retry ({}); resuming anyway.",
+                run.run_id,
+                st.ticket.ticket_id,
+                error,
+            )
+            return
+        # Re-opened, so the run owes it a close again — CLOSE_TICKET re-runs at the end.
+        st.ticket_closed = False
+        logger.info(
+            "Run {}: ticket {} re-opened and noted for retry #{}.",
+            run.run_id,
+            st.ticket.ticket_id,
+            st.manual_retries,
+        )
 
 
 class RunCallbackService:

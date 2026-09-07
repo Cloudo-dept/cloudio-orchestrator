@@ -93,6 +93,16 @@ class RunRejected(Exception):
     without retry or escalation."""
 
 
+class RunNotFound(Exception):
+    """An operation named a run id that does not exist."""
+
+
+class RunNotRetryable(Exception):
+    """A retry was requested for a run that is not FAILED. Only a failed run can be resumed:
+    a completed one has nothing left to do, a rejected one was denied (not a failure), and a
+    pending/running one is already being driven."""
+
+
 class UnknownWorkflowError(Exception):
     """Trigger named a workflow identifier that is not registered."""
 
@@ -184,12 +194,21 @@ class RunState(BaseModel):
     step_started_at: dict[StepName, datetime] = PyField(default_factory=dict)
     errors: dict[StepName, str] = PyField(default_factory=dict)
 
+    # Operator-initiated retries of this run after it FAILED (see RunRetryService). Each retry
+    # clears the failed step's attempt counter, so this generation counter is also what keeps the
+    # engine's idempotency key unique across retries (see steps.engine_run_key).
+    manual_retries: int = 0
+
     # per-step outputs handed off to later steps (keyed by StepName)
     step_results: dict[StepName, StepResult] = PyField(default_factory=dict)
 
-    # failure escalation
+    # failure escalation. The incident stays on the run across a retry: a repeat of the SAME
+    # step's failure is commented onto it rather than raising a duplicate, and a failure at a
+    # DIFFERENT step closes it (the retry got the run past what it was raised for) before a new
+    # one is opened. incident_step is the step it was raised for.
     engine_failure: EngineFailure | None = None
-    incident_id: str | None = None
+    incident: TicketRef | None = None
+    incident_step: StepName | None = None
 
 
 # --- Persistence helpers ---

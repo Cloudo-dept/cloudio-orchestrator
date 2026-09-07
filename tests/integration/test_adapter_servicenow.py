@@ -131,3 +131,72 @@ async def test_incident_open_5xx_is_surfaced(
         await servicenow_client.open_incident(
             summary="x", requested_by="jdoe", responsible_group="netops"
         )
+
+
+async def test_reopen_ticket_puts_the_ritm_back_to_work_with_a_note(
+    servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
+) -> None:
+    ref = await servicenow_client.open_ticket(
+        template_id="cat-1", fields={}, requested_by="jdoe", idempotency_key="k"
+    )
+    await servicenow_client.close_ticket(ref, note="done")
+    ritm = next(r for r in servicenow.ritms if r.sys_id == ref.native_id)
+    assert ritm.state == 3  # closed complete
+
+    await servicenow_client.reopen_ticket(ref, note="retried; resuming at 'running_engine'")
+
+    assert ritm.state == 2  # work in progress — the run is working it again
+    assert ritm.work_notes[-1] == "retried; resuming at 'running_engine'"
+
+
+async def test_annotate_incident_adds_a_work_note_without_closing_it(
+    servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
+) -> None:
+    ref = await servicenow_client.open_incident(
+        summary="boom", requested_by="jdoe", responsible_group="netops"
+    )
+
+    await servicenow_client.annotate_incident(ref, "failed again after retry #1")
+
+    inc = next(i for i in servicenow.incidents if i.sys_id == ref.native_id)
+    assert inc.work_notes == ["failed again after retry #1"]
+    assert inc.state is None  # still open
+    assert "u_cloudio_failed_task" not in inc.body  # nothing to refresh → nothing written
+
+
+async def test_annotate_incident_refreshes_the_cloudio_fields(
+    servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
+) -> None:
+    ref = await servicenow_client.open_incident(
+        summary="boom",
+        requested_by="jdoe",
+        responsible_group="netops",
+        flow_type="dag-x",
+        failed_task="provision_vm",
+    )
+    inc = next(i for i in servicenow.incidents if i.sys_id == ref.native_id)
+    assert inc.body["u_cloudio_failed_task"] == "provision_vm"
+
+    await servicenow_client.annotate_incident(
+        ref, "failed again after retry #1", flow_type="dag-x", failed_task="attach_disk"
+    )
+
+    # One PATCH: the note appended, and the u_cloudio_* columns moved to the new failure.
+    assert inc.work_notes[-1] == "failed again after retry #1"
+    assert inc.body["u_cloudio_failed_task"] == "attach_disk"
+    assert inc.body["u_cloudio_flow_type"] == "dag-x"
+    assert inc.state is None  # a comment never resolves it
+
+
+async def test_close_incident_resolves_it_with_the_closing_note(
+    servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
+) -> None:
+    ref = await servicenow_client.open_incident(
+        summary="boom", requested_by="jdoe", responsible_group="netops"
+    )
+
+    await servicenow_client.close_incident(ref, "Resolved by retrying: run got past the step.")
+
+    inc = next(i for i in servicenow.incidents if i.sys_id == ref.native_id)
+    assert inc.state == 6  # resolved
+    assert inc.close_notes == "Resolved by retrying: run got past the step."

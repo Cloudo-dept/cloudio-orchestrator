@@ -26,6 +26,9 @@ class Incident:
     number: str
     sys_id: str
     body: dict[str, Any]
+    state: int | None = None
+    close_notes: str | None = None
+    work_notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -122,5 +125,19 @@ def _build(mock: ServiceNowMock) -> FastAPI:
         number, sys_id = mock._mint("INC")
         mock.incidents.append(Incident(number=number, sys_id=sys_id, body=body))
         return {"result": {"number": number, "sys_id": sys_id}}
+
+    @app.patch("/api/now/table/incident/{sys_id}")
+    async def patch_incident(sys_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        inc = next(i for i in mock.incidents if i.sys_id == sys_id)
+        if "state" in body:
+            inc.state = body["state"]
+        if "close_notes" in body:
+            inc.close_notes = body["close_notes"]
+        if "work_notes" in body:
+            inc.work_notes.append(body["work_notes"])  # a journal field: appends, never replaces
+        # everything else is a plain column write (u_cloudio_*, …) onto the record
+        journal_or_handled = {"state", "close_notes", "work_notes"}
+        inc.body.update({k: v for k, v in body.items() if k not in journal_or_handled})
+        return {"result": {"number": inc.number, "sys_id": inc.sys_id}}
 
     return app

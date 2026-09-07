@@ -162,8 +162,11 @@ class FakeTicketSystemClient(TicketSystemClient):
         self.tickets_by_key: dict[str, TicketRef] = {}
         self.open_ticket_calls: list[str] = []  # idempotency keys, in order
         self.closed: list[tuple[str, str | None]] = []  # (ticket_id, note)
+        self.reopened: list[tuple[str, str | None]] = []  # (ticket_id, note)
         self.notes: list[tuple[str, str]] = []  # (ticket_id, note)
         self.incidents: list[dict[str, Any]] = []
+        self.incident_notes: list[dict[str, Any]] = []  # note + any refreshed failure fields
+        self.closed_incidents: list[tuple[str, str]] = []  # (incident_id, close note)
         # default APPROVED so a resource run drives straight through AWAIT_APPROVAL; flip to
         # PENDING/REJECTED to exercise the wait/rejection paths.
         self.approval_status = ApprovalStatus.APPROVED
@@ -188,6 +191,9 @@ class FakeTicketSystemClient(TicketSystemClient):
 
     async def close_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
         self.closed.append((ticket.ticket_id, note))
+
+    async def reopen_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
+        self.reopened.append((ticket.ticket_id, note))
 
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
         self.notes.append((ticket.ticket_id, note))
@@ -214,6 +220,25 @@ class FakeTicketSystemClient(TicketSystemClient):
             }
         )
         return ref
+
+    async def annotate_incident(
+        self,
+        incident: TicketRef,
+        note: str,
+        flow_type: str | None = None,
+        failed_task: str | None = None,
+    ) -> None:
+        self.incident_notes.append(
+            {
+                "ticket_id": incident.ticket_id,
+                "note": note,
+                "flow_type": flow_type,
+                "failed_task": failed_task,
+            }
+        )
+
+    async def close_incident(self, incident: TicketRef, note: str) -> None:
+        self.closed_incidents.append((incident.ticket_id, note))
 
 
 class FakeResourceManagerClient(ResourceManagerClient):

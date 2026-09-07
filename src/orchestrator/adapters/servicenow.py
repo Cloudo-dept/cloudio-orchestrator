@@ -4,10 +4,10 @@ Templates are catalog items, tickets are RITMs (sc_req_item), incidents are INCs
 vocabulary is confined to this class. Create idempotency is orchestrator-added: the RITM is tagged
 with correlation_id and looked up before re-ordering.
 """
-from loguru import logger
-from typing 
+from typing import Any
 
 import httpx
+from loguru import logger
 
 from orchestrator.domain import ApprovalStatus, TicketRef
 from orchestrator.ports import TicketSystemClient
@@ -17,6 +17,10 @@ class ServiceNowTicketClient(TicketSystemClient):
     _BUSINESS_SERVICE = "רשת יחידה"
     _SERVICE_OFFERING = "שירותי פיתוח"
     _RITM_CLOSED = 3
+    _RITM_IN_PROGRESS = 2  # what a re-opened RITM goes back to (a retried run is working it again)
+    # Incident state 6 = Resolved. close_code is left to the instance default: UI policies that
+    # make it mandatory do not apply to REST writes (see docs/01-external-contracts).
+    _INCIDENT_RESOLVED = 6
     # RITM `approval` field values that are terminal; anything else means still pending.
     _APPROVAL_MAP = {"approved": ApprovalStatus.APPROVED, "rejected": ApprovalStatus.REJECTED}
 
@@ -142,6 +146,11 @@ class ServiceNowTicketClient(TicketSystemClient):
         body = {"work_notes": note} if note else {}
         await self._patch("sc_req_item", ticket.native_id, state=self._RITM_CLOSED, **body)
 
+    async def reopen_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
+        # The inverse of close_ticket: state back to Work in Progress, note optional.
+        body = {"work_notes": note} if note else {}
+        await self._patch("sc_req_item", ticket.native_id, state=self._RITM_IN_PROGRESS, **body)
+
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
         await self._patch("sc_req_item", ticket.native_id, work_notes=note)
 
@@ -152,6 +161,7 @@ class ServiceNowTicketClient(TicketSystemClient):
         responsible_group: str,
         flow_type: str | None = None,
         failed_task: str | None = None,
+        comment: str | None = None,
     ) -> TicketRef:
         body: dict[str, Any] = {
             "u_noc": True,
@@ -165,6 +175,8 @@ class ServiceNowTicketClient(TicketSystemClient):
             "u_new_subcategory": "CloudIO",
             "assignment_group": self._group(responsible_group),
         }
+        if comment:  # the failure detail, as the incident's opening work note
+            body["work_notes"] = comment
         if flow_type and failed_task:  # DAG-run failures only
             body["u_cloudio_flow_type"] = flow_type
             body["u_cloudio_failed_task"] = failed_task
@@ -173,3 +185,25 @@ class ServiceNowTicketClient(TicketSystemClient):
             resp.raise_for_status()
             r = resp.json()["result"]
             return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
+
+    async def annotate_incident(
+        self,
+        incident: TicketRef,
+        note: str,
+        flow_type: str | None = None,
+        failed_task: str | None = None,
+    ) -> None:
+        # One PATCH: the note plus, when this repeat failure carries DAG detail, the u_cloudio_*
+        # fields brought up to it — the same pair open_incident set, so the incident describes the
+        # latest failure rather than the first one it was raised for.
+        body: dict[str, Any] = {"work_notes": note}
+        if flow_type and failed_task:
+            body["u_cloudio_flow_type"] = flow_type
+            body["u_cloudio_failed_task"] = failed_task
+        await self._patch("incident", incident.native_id, **body)
+
+    async def close_incident(self, incident: TicketRef, note: str) -> None:
+        # Resolved + the closing comment; the run got past whatever this incident was raised for.
+        await self._patch(
+            "incident", incident.native_id, state=self._INCIDENT_RESOLVED, close_notes=note
+        )

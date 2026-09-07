@@ -11,6 +11,7 @@ from orchestrator.domain import (
     EngineFailure,
     EngineRunStatus,
     ResourceOperation,
+    RunNotRetryable,
     RunRejected,
     RunStatus,
     RunType,
@@ -31,6 +32,7 @@ from orchestrator.orchestration.steps import (
     engine_run_key,
     idem_key,
 )
+from orchestrator.services import RunRetryService
 from tests.factories import make_resource_spec, make_run
 from tests.fakes import (
     FakeResourceManagerClient,
@@ -65,6 +67,21 @@ async def drive(
             return run
         await executor.handle(run_id)
     return await runs.get(run_id)
+
+
+class BrokenTicketClient(FakeTicketSystemClient):
+    """open_ticket fails while `broken` is set — an outage a retry can outlive once cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.broken = True
+
+    async def open_ticket(
+        self, template_id: str, fields: dict[str, Any], requested_by: str, idempotency_key: str
+    ) -> TicketRef:
+        if self.broken:
+            raise RuntimeError("ServiceNow unavailable")
+        return await super().open_ticket(template_id, fields, requested_by, idempotency_key)
 
 
 class FlakyTicketClient(FakeTicketSystemClient):
@@ -182,7 +199,7 @@ async def test_permanent_failure_marks_failed_and_escalates(
     assert tickets.incidents[0]["summary"] == "Run execution failure"  # non-engine title
     # description = exception type + message
     assert tickets.incidents[0]["comment"] == "RuntimeError: ServiceNow unavailable"
-    assert final.run_state.incident_id is not None
+    assert final.run_state.incident is not None
 
 
 async def test_engine_failure_escalates_to_responsible_group(
@@ -208,6 +225,159 @@ async def test_engine_failure_escalates_to_responsible_group(
     assert inc["flow_type"] == "dag-x"  # automation_id, since a task failed
     # The caller's attached RITM gets a work note about the incident.
     assert tickets.notes and "Incident" in tickets.notes[-1][1]
+
+
+async def test_retry_resumes_a_failed_run_without_rerunning_completed_steps(
+    runs, tickets, resources, settings
+) -> None:
+    engine = FakeWorkflowEngineClient(status=EngineRunStatus.FAILED)
+    executor, handlers = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+
+    failed = await drive(runs, executor, run.run_id, iters=20)
+    assert failed.status is RunStatus.FAILED
+    assert failed.current_step == StepName.RUN_ENGINE  # ticket + resource were already done
+    dead_engine_run = failed.run_state.engine_run_id
+
+    engine.status = EngineRunStatus.SUCCESS  # whatever broke the engine run was fixed
+    await RunRetryService(runs, handlers, tickets).retry(run.run_id)
+    resumed = await drive(runs, executor, run.run_id, iters=20)
+
+    assert resumed.status is RunStatus.COMPLETED
+    # It picked up at RUN_ENGINE: no second RITM, no second resource record.
+    assert len(tickets.open_ticket_calls) == 1
+    assert len(resources.create_calls) == 1
+    # ...and it launched a FRESH engine run instead of re-reading the failed one.
+    assert len(engine.trigger_calls) == 2
+    assert resumed.run_state.engine_run_id != dead_engine_run
+    # The steps after the engine ran normally: the resource was finalized and the RITM closed.
+    assert resumed.run_state.resource_finalized and resumed.run_state.ticket_closed
+
+
+async def test_retry_reopens_the_ticket_with_a_note(runs, tickets, resources, settings) -> None:
+    engine = FakeWorkflowEngineClient(status=EngineRunStatus.FAILED)
+    executor, handlers = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+    failed = await drive(runs, executor, run.run_id, iters=20)
+    assert failed.status is RunStatus.FAILED and failed.run_state.ticket is not None
+    ritm = failed.run_state.ticket.ticket_id
+
+    retried = await RunRetryService(runs, handlers, tickets).retry(run.run_id)
+
+    # The requester's RITM is put back to work with a note saying why it is moving again.
+    assert [t for t, _ in tickets.reopened] == [ritm]
+    note = tickets.reopened[-1][1]
+    assert "retried" in note and StepName.RUN_ENGINE.value in note  # names the resuming step
+    assert retried.run_state.ticket_closed is False  # re-opened → CLOSE_TICKET owes it a close
+
+
+async def test_failing_again_at_the_same_step_comments_on_the_open_incident(
+    runs, resources, engine, settings
+) -> None:
+    tickets = BrokenTicketClient()  # stays broken across the retry
+    executor, handlers = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+
+    first = await drive(runs, executor, run.run_id, iters=20)
+    assert first.current_step == StepName.CREATE_TICKET
+    incident = first.run_state.incident
+    assert incident is not None and len(tickets.incidents) == 1
+
+    await RunRetryService(runs, handlers, tickets).retry(run.run_id)
+    second = await drive(runs, executor, run.run_id, iters=20)
+
+    assert second.status is RunStatus.FAILED and second.current_step == StepName.CREATE_TICKET
+    # Same problem, same incident: a comment, not a duplicate.
+    assert len(tickets.incidents) == 1
+    assert [n["ticket_id"] for n in tickets.incident_notes] == [incident.ticket_id]
+    assert "failed again" in tickets.incident_notes[-1]["note"]
+    assert not tickets.closed_incidents  # nothing was resolved — it is still stuck
+    assert second.run_state.incident == incident
+
+
+async def test_repeat_failure_refreshes_the_incidents_failure_fields(
+    runs, tickets, resources, settings
+) -> None:
+    # The incident's u_cloudio_* fields (flow_type/failed_task at the port) describe the failure
+    # it was raised for. A retry that dies on a *different* task must not leave them describing
+    # the first one — the comment carries the new state.
+    engine = FakeWorkflowEngineClient(status=EngineRunStatus.FAILED)
+    engine.failure = EngineFailure(failed_task="provision_vm", responsible_group="netops")
+    executor, handlers = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=0))
+
+    first = await drive(runs, executor, run.run_id, iters=20)
+    assert tickets.incidents[-1]["failed_task"] == "provision_vm"
+    incident = first.run_state.incident
+    assert incident is not None
+
+    engine.failure = EngineFailure(failed_task="attach_disk", responsible_group="netops")
+    await RunRetryService(runs, handlers, tickets).retry(run.run_id)
+    second = await drive(runs, executor, run.run_id, iters=20)
+
+    assert second.status is RunStatus.FAILED
+    assert len(tickets.incidents) == 1  # still the same incident, commented on
+    note = tickets.incident_notes[-1]
+    assert note["ticket_id"] == incident.ticket_id
+    assert note["failed_task"] == "attach_disk"  # the new state
+    assert note["flow_type"] == "dag-x"
+
+
+async def test_non_engine_repeat_failure_carries_no_failure_fields(
+    runs, resources, engine, settings
+) -> None:
+    # Nothing outside the engine names a flow or a task, so the comment is just the note — the
+    # incident keeps whatever it was opened with rather than being blanked.
+    tickets = BrokenTicketClient()
+    executor, handlers = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+    await drive(runs, executor, run.run_id, iters=20)
+
+    await RunRetryService(runs, handlers, tickets).retry(run.run_id)
+    await drive(runs, executor, run.run_id, iters=20)
+
+    note = tickets.incident_notes[-1]
+    assert note["flow_type"] is None and note["failed_task"] is None
+
+
+async def test_failing_at_a_later_step_closes_the_old_incident_and_opens_a_new_one(
+    runs, resources, settings
+) -> None:
+    tickets = BrokenTicketClient()
+    engine = FakeWorkflowEngineClient(status=EngineRunStatus.FAILED)  # the next thing to break
+    executor, handlers = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+
+    first = await drive(runs, executor, run.run_id, iters=20)
+    assert first.current_step == StepName.CREATE_TICKET
+    stale_incident = first.run_state.incident
+    assert stale_incident is not None
+
+    tickets.broken = False  # the ticket system recovered; the engine has not
+    await RunRetryService(runs, handlers, tickets).retry(run.run_id)
+    second = await drive(runs, executor, run.run_id, iters=20)
+
+    assert second.status is RunStatus.FAILED and second.current_step == StepName.RUN_ENGINE
+    # The retry got the run past what the first incident was raised for → close it as resolved.
+    assert [i for i, _ in tickets.closed_incidents] == [stale_incident.ticket_id]
+    closing_note = tickets.closed_incidents[-1][1]
+    assert "Resolved by retrying" in closing_note and "creating_ticket" in closing_note
+    # ...and the new problem gets its own incident, recorded against the step it belongs to.
+    assert len(tickets.incidents) == 2
+    assert second.run_state.incident is not None
+    assert second.run_state.incident.ticket_id == tickets.incidents[-1]["ticket_id"]
+    assert second.run_state.incident_step == StepName.RUN_ENGINE
+    assert not tickets.incident_notes  # a different step → no comment on the old incident
+
+
+async def test_retry_of_a_completed_run_is_refused(runs, tickets, resources, engine, settings):
+    executor, handlers = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION))
+    completed = await drive(runs, executor, run.run_id)
+    assert completed.status is RunStatus.COMPLETED
+
+    with pytest.raises(RunNotRetryable):
+        await RunRetryService(runs, handlers, tickets).retry(run.run_id)
 
 
 async def test_deadline_exceeded_fails_the_step(runs, tickets, resources, engine, settings) -> None:
@@ -344,6 +514,20 @@ def test_engine_run_key_is_fresh_per_attempt() -> None:
     before = engine_run_key(run)
     run.run_state.step_attempts[StepName.RUN_ENGINE] = 1
     assert engine_run_key(run) != before
+
+
+def test_engine_run_key_is_fresh_after_a_manual_retry() -> None:
+    # An operator retry clears the attempt counter, so the attempt number alone would hand the
+    # engine a key it already used (re-attaching to the first failed run). The retry generation
+    # keeps it unique.
+    run = make_run(run_type=RunType.AUTOMATION)
+    burned = set()
+    for attempt in range(4):  # the keys the automatic retries used up before the run failed
+        run.run_state.step_attempts[StepName.RUN_ENGINE] = attempt
+        burned.add(engine_run_key(run))
+    run.run_state.step_attempts.pop(StepName.RUN_ENGINE)
+    run.run_state.manual_retries += 1
+    assert engine_run_key(run) not in burned
 
 
 async def test_configure_resource_is_idempotent_across_attempts(resources) -> None:

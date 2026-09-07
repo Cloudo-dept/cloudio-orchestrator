@@ -106,6 +106,11 @@ class TicketSystemClient(abc.ABC):
         """Mark the ticket complete, optionally attaching a note."""
 
     @abc.abstractmethod
+    async def reopen_ticket(self, ticket: TicketRef, note: str | None = None) -> None:
+        """Return the ticket to an in-progress state (the inverse of ``close_ticket``), optionally
+        attaching a note. Used when a failed run is retried: the request is being worked again."""
+
+    @abc.abstractmethod
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
         """Attach a note to the ticket without changing its state."""
 
@@ -121,6 +126,24 @@ class TicketSystemClient(abc.ABC):
     ) -> TicketRef:
         """Raise an incident for a failure, routed to the responsible group. ``comment``, when
         given, is attached to the incident as a note (e.g. the failure's exception message)."""
+
+    @abc.abstractmethod
+    async def annotate_incident(
+        self,
+        incident: TicketRef,
+        note: str,
+        flow_type: str | None = None,
+        failed_task: str | None = None,
+    ) -> None:
+        """Attach a note to an open incident without changing its state — how a repeat of the
+        failure it was raised for is recorded, instead of raising a duplicate incident. When the
+        repeat carries fresh failure detail, pass it: the incident's failure fields are brought up
+        to the new state in the same write, so it does not keep describing only the first failure.
+        """
+
+    @abc.abstractmethod
+    async def close_incident(self, incident: TicketRef, note: str) -> None:
+        """Resolve/close an incident, attaching ``note`` as the closing comment."""
 
 
 class ResourceManagerClient(abc.ABC):

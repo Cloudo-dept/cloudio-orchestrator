@@ -18,7 +18,12 @@ from orchestrator.orchestration.escalator import FailureEscalator
 from orchestrator.orchestration.executor import RunExecutor
 from orchestrator.orchestration.plans import build_handlers
 from orchestrator.ports import HealthCheck, WorkflowEngineClient
-from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
+from orchestrator.services import (
+    RunCallbackService,
+    RunRetryService,
+    WorkflowRunService,
+    WorkflowService,
+)
 from orchestrator.worker import OrchestratorWorker
 
 
@@ -29,6 +34,7 @@ class Container(BaseModel):
 
     workflow_service: WorkflowService
     run_service: WorkflowRunService
+    retry_service: RunRetryService
     callback_service: RunCallbackService
     worker: OrchestratorWorker
     health_check: HealthCheck
@@ -87,6 +93,9 @@ async def build(settings: Settings) -> Container:
     return Container(
         workflow_service=WorkflowService(workflows),
         run_service=WorkflowRunService(runs, workflows),
+        # The retry service resets a failed step through the same handlers the executor drives,
+        # and tells the ticket system the request is being worked again.
+        retry_service=RunRetryService(runs, handlers, ticket_client),
         callback_service=RunCallbackService(runs),
         worker=worker,
         health_check=PostgresHealthCheck(session_factory),

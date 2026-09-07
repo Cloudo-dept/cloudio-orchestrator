@@ -16,9 +16,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from orchestrator.domain import (
     ResourceParamsRequired,
     ResourceSpec,
+    RunNotFound,
+    RunNotRetryable,
     RunState,
     RunStatus,
     RunType,
+    StaleRunError,
     TicketRef,
     TicketRefRequired,
     UnknownWorkflowError,
@@ -27,7 +30,12 @@ from orchestrator.domain import (
     WorkflowEngineType,
 )
 from orchestrator.ports import HealthCheck
-from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
+from orchestrator.services import (
+    RunCallbackService,
+    RunRetryService,
+    WorkflowRunService,
+    WorkflowService,
+)
 
 # --- HTTP schemas ---
 
@@ -141,6 +149,11 @@ def get_workflow_service(request: Request) -> WorkflowService:
 
 def get_run_service(request: Request) -> WorkflowRunService:
     service: WorkflowRunService = request.app.state.container.run_service
+    return service
+
+
+def get_retry_service(request: Request) -> RunRetryService:
+    service: RunRetryService = request.app.state.container.retry_service
     return service
 
 
@@ -290,6 +303,31 @@ async def list_workflow_runs(
     if resource_id:
         return await svc.find_by_resource_id(resource_id)
     return await svc.list_recent()  # unfiltered: the most recent runs, newest first
+
+
+@app.post(
+    "/api/v1/workflow-runs/{run_id}/retry",
+    response_model=WorkflowRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_workflow_run(
+    run_id: uuid.UUID,
+    svc: RunRetryService = Depends(get_retry_service),
+) -> Any:
+    """Resume a FAILED run from the step it stopped at: the failed step's bookkeeping is cleared
+    and the run is made due now, so a worker re-drives it from ``current_step``. Steps that already
+    completed are not re-run (their idempotency markers short-circuit them). 202 because the
+    re-drive is asynchronous — the body is the run as it was just re-scheduled, not its outcome."""
+    try:
+        return await svc.retry(run_id)
+    except RunNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Run {run_id} not found.") from None
+    except RunNotRetryable as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(error)) from None
+    except StaleRunError:  # someone else moved the run between our read and our write
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail=f"Run {run_id} changed concurrently; re-read it."
+        ) from None
 
 
 # --- Callbacks: external systems wake a waiting run early (co-exists with polling) ---

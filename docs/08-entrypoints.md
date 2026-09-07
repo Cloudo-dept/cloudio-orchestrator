@@ -71,6 +71,13 @@ class WorkflowRunService:
         return await self.runs.find_by_resource_id(vendor_id)
 ```
 
+Alongside these, **`RunCallbackService`** (wake-early on an external notification) and
+**`RunRetryService`** (resume a `FAILED` run at the step it stopped at) are the other two
+use-cases the API delegates to. `RunRetryService` is constructed with the run repository *and*
+the executor's own `handlers` map, so an operator retry resets step-scoped state through exactly
+the hook (`reset_for_retry`) an automatic retry uses — the two paths cannot drift. See
+[07-orchestration](07-orchestration.md#resuming-a-failed-run).
+
 ## `api.py` — FastAPI app + HTTP schemas
 
 Explicit request/response DTOs keep the HTTP contract decoupled from the persistence shape.

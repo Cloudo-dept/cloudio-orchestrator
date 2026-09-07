@@ -160,8 +160,9 @@
       Tables load the full server-side lists automatically every 5s. Param editors send their
       contents as JSON exactly as written — nested objects and arrays reach the engine untouched.
       Each must be a JSON object (<code>{…}</code>); errors are flagged inline and the trigger is
-      refused. <code>Shift+Alt+F</code> formats. The API exposes no delete, so rows have no
-      remove action.
+      refused. <code>Shift+Alt+F</code> formats. A failed run gets a <strong>Retry</strong>
+      action: it resumes at the step it stopped at — the steps it already completed are not
+      re-run. The API exposes no delete, so rows have no remove action.
     </p>
   </main>
 
