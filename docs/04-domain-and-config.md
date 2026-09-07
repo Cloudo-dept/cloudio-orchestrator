@@ -163,6 +163,8 @@ class TicketRef(BaseModel):
 
 
 class ResourceOperation(str, Enum):
+    """Carried on the run (RunState.operation), NOT on the ResourceSpec: the spec describes the
+    resource, this says what is being done to it."""
     CREATE = "create"         # provision a new record (the run id becomes its vendor id)
     UPDATE = "update"         # act on an existing record
     DELETE = "delete"         # act on an existing record
@@ -172,9 +174,9 @@ class ResourceSpec(BaseModel):
     """The resource a resource run acts on (Project Manager fields)."""
     project_id: str
     resource_type: str
-    operation: ResourceOperation = ResourceOperation.CREATE
     vendor_id: str = ""       # resource identity; a CREATE is assigned the run id when configured,
-                              # an UPDATE/DELETE REQUIRES the caller's (validator below)
+                              # an UPDATE/DELETE REQUIRES the caller's (checked at trigger time,
+                              # where the operation is known)
     name: str
     region: str
     environment: str
@@ -182,15 +184,6 @@ class ResourceSpec(BaseModel):
     tags: list[str] = PyField(default_factory=list)
     data: dict[str, Any] = PyField(default_factory=dict)
     alert_groups: list[str] = PyField(default_factory=list)
-
-    @model_validator(mode="after")
-    def _existing_record_needs_an_identity(self) -> Self:
-        """An UPDATE/DELETE acts on a record that already exists, so nothing can assign its
-        identity for it. Rejected here, so the caller is told at trigger time (422) instead of
-        the run failing halfway through, after it has already opened a ticket."""
-        if self.operation is not ResourceOperation.CREATE and not self.vendor_id:
-            raise ValueError(f"vendor_id is required for a {self.operation.value} operation.")
-        return self
 
 
 class ResolvedWorkflow(BaseModel):
@@ -225,6 +218,7 @@ class RunState(BaseModel):
     ticket_params: dict[str, Any] = PyField(default_factory=dict)    # provider template variables (pass-through)
     workflow_params: dict[str, Any] = PyField(default_factory=dict)  # engine conf (pass-through)
     resource: ResourceSpec | None = None                             # resource runs only
+    operation: ResourceOperation = ResourceOperation.CREATE          # what this run does to it
 
     # step progress / idempotency markers
     ticket: TicketRef | None = None

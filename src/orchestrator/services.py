@@ -6,8 +6,10 @@ from typing import Any
 
 from orchestrator.domain import (
     ResolvedWorkflow,
+    ResourceOperation,
     ResourceParamsRequired,
     ResourceSpec,
+    ResourceVendorIdRequired,
     RunState,
     RunStatus,
     RunType,
@@ -53,6 +55,7 @@ class WorkflowRunService:
         ticket_params: dict[str, Any],
         workflow_params: dict[str, Any],
         resource: ResourceSpec | None,
+        operation: ResourceOperation,
         ticket: TicketRef | None,
     ) -> WorkflowRun:
         logger.info("Trigger requested for workflow '%s' by %s.", workflow_identifier, created_by)
@@ -60,12 +63,25 @@ class WorkflowRunService:
         if wf is None:
             logger.warning("Trigger rejected: unknown workflow '%s'.", workflow_identifier)
             raise UnknownWorkflowError(workflow_identifier)
-        if wf.run_type is RunType.RESOURCE and resource is None:
-            logger.warning(
-                "Trigger rejected: workflow '%s' is a resource run but no resource was supplied.",
-                workflow_identifier,
-            )
-            raise ResourceParamsRequired(workflow_identifier)
+        if wf.run_type is RunType.RESOURCE:
+            if resource is None:
+                logger.warning(
+                    "Trigger rejected: workflow '%s' is a resource run but no resource "
+                    "was supplied.",
+                    workflow_identifier,
+                )
+                raise ResourceParamsRequired(workflow_identifier)
+            # An UPDATE/DELETE acts on a record that already exists, so nothing can assign its
+            # identity for it. Caught here so the caller is told at trigger time, rather than the
+            # run failing at CONFIGURE_RESOURCE after it has already opened a ticket.
+            if operation is not ResourceOperation.CREATE and not resource.vendor_id:
+                logger.warning(
+                    "Trigger rejected: a %s operation on workflow '%s' needs the vendor_id of "
+                    "the record it acts on.",
+                    operation.value,
+                    workflow_identifier,
+                )
+                raise ResourceVendorIdRequired(workflow_identifier)
         if wf.run_type is RunType.AUTOMATION and ticket is None:
             logger.warning(
                 "Trigger rejected: workflow '%s' is an automation run but no ticket was supplied.",
@@ -84,6 +100,7 @@ class WorkflowRunService:
             ticket_params=ticket_params,
             workflow_params=workflow_params,
             resource=resource if wf.run_type is RunType.RESOURCE else None,
+            operation=operation,
             # Automation runs attach to the caller's existing RITM; resource runs create their own.
             ticket=ticket if wf.run_type is RunType.AUTOMATION else None,
         )

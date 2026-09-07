@@ -147,13 +147,13 @@ class ConfigureResourceStep(StepHandler):
         logger.info(
             "Run %s: configuring resource (operation=%s, type=%s, project=%s).",
             run.run_id,
-            resource.operation,
+            st.operation.value,
             resource.resource_type,
             resource.project_id,
         )
-        if resource.operation is ResourceOperation.CREATE:
+        if st.operation is ResourceOperation.CREATE:
             resource.vendor_id = str(run.run_id)  # the run id is the new resource's identity
-            body = resource.model_dump(exclude={"project_id", "resource_type", "operation"}) | {
+            body = resource.model_dump(exclude={"project_id", "resource_type"}) | {
                 "in_progress": True,
                 "last_modified_by": run.created_by,
             }
@@ -286,7 +286,7 @@ class FinalizeResourceStep(StepHandler):
         resource = st.resource
         # The record lives where ConfigureResourceStep created/targeted it (resource.vendor_id —
         # the run id for a CREATE).
-        if resource.operation is ResourceOperation.DELETE:
+        if st.operation is ResourceOperation.DELETE:
             logger.info("Run %s: deleting resource %s.", run.run_id, resource.vendor_id)
             await self.resource_client.delete_resource(
                 resource.project_id, resource.resource_type, resource.vendor_id
@@ -297,7 +297,7 @@ class FinalizeResourceStep(StepHandler):
                 "Run %s: finalizing resource %s (operation=%s).",
                 run.run_id,
                 resource.vendor_id,
-                resource.operation.value,
+                st.operation.value,
             )
             await self.resource_client.update_resource(
                 resource.project_id, resource.resource_type, resource.vendor_id, fields
@@ -312,10 +312,10 @@ class FinalizeResourceStep(StepHandler):
         id it actually provisioned (the RUN_ENGINE step result's final_vendor_id), re-key to it —
         for a CREATE that replaces the run-id placeholder with the real vendor id."""
         fields: dict[str, Any] = {"in_progress": False}  # done provisioning
-        if resource.operation is ResourceOperation.UPDATE:
-            fields |= resource.model_dump(
-                exclude={"project_id", "resource_type", "operation", "vendor_id"}
-            ) | {"last_modified_by": run.created_by}
+        if run.run_state.operation is ResourceOperation.UPDATE:
+            fields |= resource.model_dump(exclude={"project_id", "resource_type", "vendor_id"}) | {
+                "last_modified_by": run.created_by
+            }
         engine_result = run.run_state.step_results.get(StepName.RUN_ENGINE)
         engine_vendor_id = engine_result.final_vendor_id if engine_result else None
         if engine_vendor_id and engine_vendor_id != resource.vendor_id:
@@ -342,7 +342,7 @@ class CloseTicketStep(StepHandler):
             return True
         assert st.ticket is not None
         note = (
-            f"Resource {st.resource.operation.value} completed; request closed."
+            f"Resource {st.operation.value} completed; request closed."
             if st.resource is not None
             else "CloudIO automation completed."
         )

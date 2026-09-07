@@ -7,9 +7,9 @@ working state via an explicit ``RunState`` model. No untyped dicts with magic ke
 import uuid
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Self
+from typing import Any
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel
 from pydantic import Field as PyField
 from sqlalchemy import Column, DateTime, Integer, String, types
 from sqlalchemy import Enum as SQLEnum
@@ -55,7 +55,10 @@ class StepName(str, Enum):
 
 class ResourceOperation(str, Enum):
     """What a resource run does to its resource. A CREATE provisions a new record; UPDATE and
-    DELETE act on a record that already exists (the engine does the real work either way)."""
+    DELETE act on a record that already exists (the engine does the real work either way).
+
+    Carried on the run (``RunState.operation``), not on the ResourceSpec: the spec describes the
+    resource, this says what is being done to it."""
 
     CREATE = "create"
     UPDATE = "update"
@@ -139,6 +142,10 @@ class ResourceParamsRequired(Exception):
     """A resource workflow was triggered without a resource spec."""
 
 
+class ResourceVendorIdRequired(Exception):
+    """An UPDATE/DELETE was triggered without the vendor_id of the record it acts on."""
+
+
 class TicketRefRequired(Exception):
     """An automation workflow was triggered without a reference to its pre-existing ticket."""
 
@@ -159,10 +166,9 @@ class ResourceSpec(BaseModel):
 
     project_id: str
     resource_type: str
-    operation: ResourceOperation = ResourceOperation.CREATE  # create / update / delete
     # Resource identity. Callers do NOT set this for a CREATE — ConfigureResourceStep assigns the
     # run id as the new record's identity. REQUIRED from the caller on an UPDATE/DELETE, which
-    # target a record that already exists (see the validator below).
+    # target a record that already exists (enforced at trigger time, where the operation is known).
     vendor_id: str = ""
     name: str
     region: str | None = None
@@ -171,16 +177,6 @@ class ResourceSpec(BaseModel):
     tags: list[str] = PyField(default_factory=list)
     data: dict[str, Any] = PyField(default_factory=dict)
     alert_groups: list[str] = PyField(default_factory=list)
-
-    @model_validator(mode="after")
-    def _existing_record_needs_an_identity(self) -> Self:
-        """An UPDATE/DELETE acts on a record that already exists, so nothing can assign its
-        identity for it — without a vendor_id there is no record to target. Rejected here rather
-        than at the step, so the caller is told at trigger time (422) instead of the run failing
-        halfway through, after it has already opened a ticket."""
-        if self.operation is not ResourceOperation.CREATE and not self.vendor_id:
-            raise ValueError(f"vendor_id is required for a {self.operation.value} operation.")
-        return self
 
 
 class ResolvedWorkflow(BaseModel):
@@ -225,6 +221,9 @@ class RunState(BaseModel):
     ticket_params: dict[str, Any] = PyField(default_factory=dict)  # provider template variables
     workflow_params: dict[str, Any] = PyField(default_factory=dict)  # engine conf (pass-through)
     resource: ResourceSpec | None = None  # resource runs only
+    # What this run does to that resource. Independent of the spec (which only describes the
+    # resource) and meaningless for an automation run, which touches no resource at all.
+    operation: ResourceOperation = ResourceOperation.CREATE
 
     # step progress / idempotency markers
     ticket: TicketRef | None = None

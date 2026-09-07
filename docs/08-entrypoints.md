@@ -40,12 +40,18 @@ class WorkflowRunService:
 
     async def trigger(self, *, workflow_identifier: str, created_by: str, max_retries: int,
                       ticket_params: dict[str, Any], workflow_params: dict[str, Any],
-                      resource: ResourceSpec | None) -> WorkflowRun:
+                      resource: ResourceSpec | None,
+                      operation: ResourceOperation) -> WorkflowRun:
         wf = await self.workflows.get_by_identifier(workflow_identifier)
         if wf is None:
             raise UnknownWorkflowError(workflow_identifier)
-        if wf.run_type is RunType.RESOURCE and resource is None:
-            raise ResourceParamsRequired(workflow_identifier)
+        if wf.run_type is RunType.RESOURCE:
+            if resource is None:
+                raise ResourceParamsRequired(workflow_identifier)
+            # An UPDATE/DELETE acts on a record that already exists — nothing can assign its
+            # identity. Caught here, where both the operation and the spec are in hand.
+            if operation is not ResourceOperation.CREATE and not resource.vendor_id:
+                raise ResourceVendorIdRequired(workflow_identifier)
 
         state = RunState(
             workflow=ResolvedWorkflow(
@@ -54,6 +60,7 @@ class WorkflowRunService:
             ticket_params=ticket_params,
             workflow_params=workflow_params,
             resource=resource if wf.run_type is RunType.RESOURCE else None,
+            operation=operation,
         )
         # scheduled_at defaults to now → a RunWorker claims it on its next scan.
         run = WorkflowRun(run_type=wf.run_type, status=RunStatus.PENDING,
@@ -123,6 +130,7 @@ class WorkflowRunTriggerRequest(BaseModel):
     ticket_params: dict[str, Any] = Field(default_factory=dict)     # provider template variables
     workflow_params: dict[str, Any] = Field(default_factory=dict)   # engine conf
     resource: ResourceSpec | None = None                            # resource workflows only
+    operation: ResourceOperation = ResourceOperation.CREATE         # what to do to that resource
     ticket: TicketRef | None = None                                 # existing RITM (automation only)
 
 
@@ -178,13 +186,19 @@ async def trigger_workflow_run(request: WorkflowRunTriggerRequest,
         return await svc.trigger(
             workflow_identifier=request.workflow_identifier, created_by=request.created_by,
             max_retries=request.max_retries, ticket_params=request.ticket_params,
-            workflow_params=request.workflow_params, resource=request.resource)
+            workflow_params=request.workflow_params, resource=request.resource,
+            operation=request.operation)
     except UnknownWorkflowError:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             detail=f"Unknown workflow '{request.workflow_identifier}'.")
     except ResourceParamsRequired:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail="resource is required for a resource workflow.")
+    except ResourceVendorIdRequired:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"resource.vendor_id is required for a {request.operation.value} operation "
+                   "— it names the record to act on.")
 
 
 @app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)

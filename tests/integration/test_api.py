@@ -197,11 +197,38 @@ async def test_trigger_without_vendor_id_for_an_existing_record_is_422(
         json={
             "workflow_identifier": "provision-vm",
             "created_by": "jdoe",
-            "resource": {**RESOURCE, "operation": operation},  # no vendor_id
+            "operation": operation,  # top-level, beside `resource` — not inside the spec
+            "resource": RESOURCE,  # no vendor_id
         },
     )
     assert resp.status_code == 422
-    assert "vendor_id is required" in str(resp.json()["detail"])
+    assert "vendor_id is required" in resp.json()["detail"]
+
+
+async def test_trigger_carries_the_operation_beside_the_spec(client: httpx.AsyncClient) -> None:
+    await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={
+            "workflow_identifier": "provision-vm",
+            "created_by": "jdoe",
+            "operation": "delete",
+            "resource": {**RESOURCE, "vendor_id": "vm-1"},
+        },
+    )
+    assert resp.status_code == 201
+    state = resp.json()["run_state"]
+    assert state["operation"] == "delete"
+    assert "operation" not in state["resource"]  # the spec only describes the resource
+
+
+async def test_trigger_defaults_to_a_create_operation(client: httpx.AsyncClient) -> None:
+    await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={"workflow_identifier": "provision-vm", "created_by": "jdoe", "resource": RESOURCE},
+    )
+    assert resp.status_code == 201 and resp.json()["run_state"]["operation"] == "create"
 
 
 async def test_get_unknown_run_is_404(client: httpx.AsyncClient) -> None:
@@ -269,10 +296,14 @@ async def test_callback_for_unknown_reference_is_a_noop(client: httpx.AsyncClien
 async def test_list_by_resource_and_ticket(client: httpx.AsyncClient) -> None:
     await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
     # An UPDATE targets an existing record, so the caller supplies vendor_id (a CREATE would not).
-    resource = {**RESOURCE, "operation": "update", "vendor_id": "vm-1"}
     await client.post(
         "/api/v1/workflow-runs",
-        json={"workflow_identifier": "provision-vm", "created_by": "jdoe", "resource": resource},
+        json={
+            "workflow_identifier": "provision-vm",
+            "created_by": "jdoe",
+            "operation": "update",
+            "resource": {**RESOURCE, "vendor_id": "vm-1"},
+        },
     )
 
     by_resource = await client.get("/api/v1/workflow-runs", params={"resource_id": "vm-1"})

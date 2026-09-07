@@ -33,15 +33,10 @@ def make_workflow(
     )
 
 
-def make_resource_spec(
-    *,
-    vendor_id: str = "vm-1",
-    operation: ResourceOperation = ResourceOperation.CREATE,
-) -> ResourceSpec:
+def make_resource_spec(*, vendor_id: str = "vm-1") -> ResourceSpec:
     return ResourceSpec(
         project_id="proj-1",
         resource_type="vm",
-        operation=operation,
         vendor_id=vendor_id,
         name="app-01",
         region="gvt",
@@ -57,6 +52,7 @@ def make_run(
     automation_id: str = "dag-x",
     ticket_template_id: str = "cat-1",
     workflow_name: str | None = None,  # None → a shown label falls back to the identifier
+    operation: ResourceOperation = ResourceOperation.CREATE,  # resource runs only
 ) -> WorkflowRun:
     with_resource = run_type is RunType.RESOURCE
     state = RunState(
@@ -70,6 +66,7 @@ def make_run(
         ticket_params={"catalog_variable_1": "value"},
         workflow_params={"size": "large"},
         resource=make_resource_spec() if with_resource else None,
+        operation=operation,
         # Automation runs attach to the caller's pre-existing RITM; resource runs open their own.
         ticket=None if with_resource else TicketRef(ticket_id="RITM0000001", native_id="sys1"),
     )

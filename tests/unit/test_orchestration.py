@@ -34,7 +34,7 @@ from orchestrator.orchestration.steps import (
     engine_run_key,
     idem_key,
 )
-from tests.factories import make_resource_spec, make_run
+from tests.factories import make_run
 from tests.fakes import (
     FakeResourceManagerClient,
     FakeTicketSystemClient,
@@ -133,7 +133,7 @@ async def test_delete_resource_run_removes_the_record_end_to_end(
 ) -> None:
     executor, _ = build_executor(runs, tickets, resources, engine, settings)
     run = make_run(run_type=RunType.RESOURCE)
-    run.run_state.resource = make_resource_spec(operation=ResourceOperation.DELETE)
+    run.run_state.operation = ResourceOperation.DELETE
     created = await runs.create(run)
 
     final = await drive(runs, executor, created.run_id)
@@ -596,7 +596,7 @@ async def test_configure_resource_is_idempotent_across_attempts(resources) -> No
 async def test_begin_resource_step_update_only_marks_in_progress(resources) -> None:
     step = ConfigureResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE)
-    run.run_state.resource = make_resource_spec(operation=ResourceOperation.UPDATE)
+    run.run_state.operation = ResourceOperation.UPDATE
 
     assert await step.execute(run) is True
     assert run.run_state.resource_configured is True
@@ -610,7 +610,7 @@ async def test_begin_resource_step_update_only_marks_in_progress(resources) -> N
 async def test_begin_resource_step_delete_only_marks_in_progress(resources) -> None:
     step = ConfigureResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE)
-    run.run_state.resource = make_resource_spec(operation=ResourceOperation.DELETE)
+    run.run_state.operation = ResourceOperation.DELETE
 
     assert await step.execute(run) is True
     assert resources.create_calls == []
@@ -636,7 +636,7 @@ async def test_finalize_resource_step(resources) -> None:
 async def test_finalize_resource_step_update_writes_the_spec_as_desired_state(resources) -> None:
     step = FinalizeResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE)
-    run.run_state.resource = make_resource_spec(operation=ResourceOperation.UPDATE)
+    run.run_state.operation = ResourceOperation.UPDATE
 
     assert await step.execute(run) is True
     assert run.run_state.resource_finalized is True
@@ -666,7 +666,7 @@ async def test_finalize_resource_step_update_writes_the_spec_as_desired_state(re
 async def test_finalize_resource_step_delete_removes_the_record(resources) -> None:
     step = FinalizeResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE)
-    run.run_state.resource = make_resource_spec(operation=ResourceOperation.DELETE)
+    run.run_state.operation = ResourceOperation.DELETE
 
     assert await step.execute(run) is True
     assert run.run_state.resource_finalized is True

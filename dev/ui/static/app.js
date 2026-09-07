@@ -183,6 +183,7 @@ function toggleResourceFields() {
   const opt = $("#trigger-workflow").selectedOptions[0];
   const isResource = opt && opt.dataset.runType === "resource";
   $("#resource-fields").hidden = !isResource;
+  $("#operation-field").hidden = !isResource;  // the operation only means anything for a resource
 }
 
 // =============================================================================
@@ -303,6 +304,8 @@ $("#trigger-form").addEventListener("submit", async (e) => {
       workflow_params: readJSON("workflow_params"),
     };
     if (opt.dataset.runType === "resource") {
+      // Independent of the spec: the spec describes the resource, this says what to do to it.
+      body.operation = f.get("operation");
       body.resource = {
         project_id: f.get("res_project_id"),
         resource_type: f.get("res_resource_type"),
