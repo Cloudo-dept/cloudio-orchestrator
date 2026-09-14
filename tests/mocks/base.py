@@ -35,3 +35,14 @@ Middleware = Callable[[Request, Callable[[Request], Awaitable[Response]]], Await
 def asgi(app: Any) -> httpx.ASGITransport:
     """Route a real adapter's httpx client straight into a mock app — no socket."""
     return httpx.ASGITransport(app=app)
+
+
+def mock_client(app: Any, base_url: str = "http://mock.local", **kwargs: Any) -> httpx.AsyncClient:
+    """The pooled client an adapter is injected with, pointed at a mock app.
+
+    The test-side twin of bootstrap's ``_provider_client``: adapters no longer build their own
+    client, so a test has to supply one. Connection limits are omitted deliberately — an ASGI
+    transport opens no connections to bound.
+    """
+    headers = {"Accept": "application/json", **kwargs.pop("headers", {})}
+    return httpx.AsyncClient(base_url=base_url, transport=asgi(app), headers=headers, **kwargs)

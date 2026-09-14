@@ -132,10 +132,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # the last dictConfig to run, so it wins over uvicorn's own default configuration.
     configure_logging(settings.log_level)
     logger.info("API lifespan startup: building container.")
-    app.state.container = await build(settings)
+    container = await build(settings)
+    app.state.container = container
     logger.info("API ready to serve requests.")
     yield
-    logger.info("API lifespan shutdown.")
+    logger.info("API lifespan shutdown: draining provider connection pools.")
+    await container.aclose()
 
 
 app = FastAPI(title="Orchestrator Core API", lifespan=lifespan)

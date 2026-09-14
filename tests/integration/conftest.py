@@ -15,7 +15,7 @@ from orchestrator.adapters.airflow import AirflowWorkflowEngineClient
 from orchestrator.adapters.project_manager import ProjectManagerResourceClient
 from orchestrator.adapters.servicenow import ServiceNowTicketClient
 from tests.mocks.airflow import AirflowMock
-from tests.mocks.base import asgi
+from tests.mocks.base import mock_client
 from tests.mocks.project_manager import ProjectManagerMock
 from tests.mocks.servicenow import ServiceNowMock
 
@@ -26,10 +26,9 @@ def airflow() -> AirflowMock:
 
 
 @pytest.fixture
-def airflow_client(airflow: AirflowMock) -> AirflowWorkflowEngineClient:
-    return AirflowWorkflowEngineClient(
-        base_url="http://airflow.local", username="u", password="p", transport=asgi(airflow.app)
-    )
+async def airflow_client(airflow: AirflowMock) -> AsyncIterator[AirflowWorkflowEngineClient]:
+    async with mock_client(airflow.app, "http://airflow.local") as http:
+        yield AirflowWorkflowEngineClient(http, username="u", password="p")
 
 
 @pytest.fixture
@@ -38,17 +37,15 @@ def servicenow() -> ServiceNowMock:
 
 
 @pytest.fixture
-def servicenow_client(servicenow: ServiceNowMock) -> ServiceNowTicketClient:
-    return ServiceNowTicketClient(
-        base_url="http://servicenow.local",
-        username="u",
-        password="p",
-        # "netops" is pre-seeded (no lookup); every other name resolves against the mock's
-        # sys_user_group table, and "cloudio" is the default incident team.
-        responsible_groups={"netops": "grpsys-netops"},
-        default_group="cloudio",
-        transport=asgi(servicenow.app),
-    )
+async def servicenow_client(servicenow: ServiceNowMock) -> AsyncIterator[ServiceNowTicketClient]:
+    async with mock_client(servicenow.app, "http://servicenow.local", auth=("u", "p")) as http:
+        yield ServiceNowTicketClient(
+            http,
+            # "netops" is pre-seeded (no lookup); every other name resolves against the mock's
+            # sys_user_group table, and "cloudio" is the default incident team.
+            responsible_groups={"netops": "grpsys-netops"},
+            default_group="cloudio",
+        )
 
 
 @pytest.fixture
@@ -57,10 +54,13 @@ def project_manager() -> ProjectManagerMock:
 
 
 @pytest.fixture
-def pm_client(project_manager: ProjectManagerMock) -> ProjectManagerResourceClient:
-    return ProjectManagerResourceClient(
-        base_url="http://pm.local", token="t", transport=asgi(project_manager.app)
-    )
+async def pm_client(
+    project_manager: ProjectManagerMock,
+) -> AsyncIterator[ProjectManagerResourceClient]:
+    async with mock_client(
+        project_manager.app, "http://pm.local", headers={"Authorization": "Bearer t"}
+    ) as http:
+        yield ProjectManagerResourceClient(http)
 
 
 # --- Postgres (testcontainers) — skipped when Docker is unavailable ---

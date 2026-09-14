@@ -64,52 +64,37 @@ class AirflowWorkflowEngineClient(WorkflowEngineClient):
     automation_id == DAG id; the engine run id == dag_run_id.
     """
 
-    def __init__(
-        self,
-        base_url: str,
-        username: str,
-        password: str,
-        timeout: float = 10.0,
-        transport: httpx.AsyncBaseTransport | None = None,
-    ) -> None:
-        self._base = base_url.rstrip("/")
+    def __init__(self, client: httpx.AsyncClient, username: str, password: str) -> None:
+        # One pooled client for the process, built and closed by the composition root. It matters
+        # most here: get_output probes every task instance of a run on every poll, so a client per
+        # call meant a TCP+TLS handshake per probe. TLS verification is disabled on the injected
+        # transport, not here — see the note in bootstrap.
+        self._http = client
         self._username = username
         self._password = password
-        self._timeout = timeout
         self._token: str | None = None
-        self._transport = transport  # test seam (11-testing); None in prod
 
-    def _client(self, token: str | None) -> httpx.AsyncClient:
-        headers = {"Accept": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        return httpx.AsyncClient(
-            base_url=self._base,
-            timeout=self._timeout,
-            verify=False,
-            headers=headers,
-            transport=self._transport,
-        )
+    @staticmethod
+    def _bearer(token: str) -> dict[str, str]:
+        # Per-request, not a client default: the token is refreshed on 401 and the client is shared.
+        return {"Authorization": f"Bearer {token}"}
 
     async def _authenticate(self) -> str:
-        async with self._client(None) as client:
-            resp = await client.post(
-                "/auth/token", json={"username": self._username, "password": self._password}
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            token: str = data.get("access_token") or data["token"]
-            self._token = token
-            return token
+        resp = await self._http.post(
+            "/auth/token", json={"username": self._username, "password": self._password}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token: str = data.get("access_token") or data["token"]
+        self._token = token
+        return token
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         token = self._token or await self._authenticate()
-        async with self._client(token) as client:
-            resp = await client.request(method, path, **kwargs)
+        resp = await self._http.request(method, path, headers=self._bearer(token), **kwargs)
         if resp.status_code == 401:  # token expired -> re-auth once
             token = await self._authenticate()
-            async with self._client(token) as client:
-                resp = await client.request(method, path, **kwargs)
+            resp = await self._http.request(method, path, headers=self._bearer(token), **kwargs)
         return resp
 
     async def trigger_workflow(

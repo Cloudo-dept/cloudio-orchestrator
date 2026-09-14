@@ -37,6 +37,42 @@ class Container(BaseModel):
     callback_service: RunCallbackService
     worker: OrchestratorWorker
     health_check: HealthCheck
+    # The pooled provider clients. Held only so an entrypoint can release their connections on
+    # shutdown; nothing reads them. Adapters own the calls, the container owns the sockets.
+    http_clients: list[httpx.AsyncClient]
+
+    async def aclose(self) -> None:
+        """Drain every provider connection pool. Safe to call twice."""
+        for client in self.http_clients:
+            await client.aclose()
+
+
+def _provider_client(
+    base_url: str,
+    settings: Settings,
+    transport: httpx.AsyncBaseTransport,
+    *,
+    headers: dict[str, str] | None = None,
+    auth: tuple[str, str] | None = None,
+) -> httpx.AsyncClient:
+    """One long-lived, pooled client for a provider.
+
+    The connection limits go on the *transport*, not the client: an explicit ``transport=`` makes
+    the client's own ``limits`` (like its ``verify``) inert, so setting them there would look right
+    and bound nothing.
+    """
+    return httpx.AsyncClient(
+        base_url=base_url.rstrip("/"),
+        # connect/read/write get the provider budget; waiting for a pooled connection gets its own
+        # (see http_pool_acquire_timeout_seconds). Timeouts, unlike limits, do apply client-side.
+        timeout=httpx.Timeout(
+            settings.external_call_timeout_seconds,
+            pool=settings.http_pool_acquire_timeout_seconds,
+        ),
+        transport=transport,
+        headers={"Accept": "application/json", **(headers or {})},
+        auth=auth,
+    )
 
 
 async def build(settings: Settings) -> Container:
@@ -46,35 +82,53 @@ async def build(settings: Settings) -> Container:
     workflows = PostgresWorkflowRepository(session_factory)
     logger.debug("Postgres run store + workflow registry bound.")
 
-    # One transport per provider, so a failed outbound call names the provider it was made to.
-    # Airflow needs its own verifying-disabled transport: the adapter sets verify=False on the
-    # *client*, and client-level TLS arguments are inert once an explicit transport is supplied —
-    # so sharing one transport would silently re-enable verification against Airflow.
-    ticket_client = ServiceNowTicketClient(
+    # One transport per provider, so a failed outbound call names the provider it was made to, and
+    # so each provider gets its own connection pool — the limits live on the transport, and a
+    # shared one would let a burst against Airflow starve ServiceNow of connections.
+    # TLS verification is disabled on every provider transport: client-level TLS arguments are inert
+    # once an explicit transport is supplied, so ``verify=False`` must go on the transport itself.
+    limits = httpx.Limits(
+        max_connections=settings.http_max_connections,
+        max_keepalive_connections=settings.http_max_keepalive_connections,
+    )
+    servicenow_http = _provider_client(
         settings.servicenow_base_url,
-        settings.servicenow_username,
-        settings.servicenow_password.get_secret_value(),
+        settings,
+        FailureLoggingTransport(
+            "ServiceNow",
+            httpx.AsyncHTTPTransport(verify=False, limits=limits),  # noqa: S501 — private cloud
+        ),
+        auth=(settings.servicenow_username, settings.servicenow_password.get_secret_value()),
+    )
+    pm_http = _provider_client(
+        settings.pm_base_url,
+        settings,
+        FailureLoggingTransport(
+            "Project Manager",
+            httpx.AsyncHTTPTransport(verify=False, limits=limits),  # noqa: S501 — private cloud
+        ),
+        headers={"Authorization": f"Bearer {settings.pm_token.get_secret_value()}"},
+    )
+    airflow_http = _provider_client(
+        settings.airflow_base_url,
+        settings,
+        FailureLoggingTransport(
+            "Airflow",
+            httpx.AsyncHTTPTransport(verify=False, limits=limits),  # noqa: S501 — per spec
+        ),
+    )
+
+    ticket_client = ServiceNowTicketClient(
+        servicenow_http,
         settings.servicenow_responsible_groups,
         settings.servicenow_incident_team,
-        settings.external_call_timeout_seconds,
-        transport=FailureLoggingTransport("ServiceNow", httpx.AsyncHTTPTransport()),
     )
-    resource_client = ProjectManagerResourceClient(
-        settings.pm_base_url,
-        settings.pm_token.get_secret_value(),
-        settings.external_call_timeout_seconds,
-        transport=FailureLoggingTransport("Project Manager", httpx.AsyncHTTPTransport()),
-    )
+    resource_client = ProjectManagerResourceClient(pm_http)
     engines: dict[WorkflowEngineType, WorkflowEngineClient] = {
         WorkflowEngineType.AIRFLOW: AirflowWorkflowEngineClient(
-            settings.airflow_base_url,
+            airflow_http,
             settings.airflow_username,
             settings.airflow_password.get_secret_value(),
-            settings.external_call_timeout_seconds,
-            transport=FailureLoggingTransport(
-                "Airflow",
-                httpx.AsyncHTTPTransport(verify=False),  # noqa: S501 — per spec
-            ),
         ),
     }
 
@@ -94,10 +148,13 @@ async def build(settings: Settings) -> Container:
         lease_seconds=settings.redrive_lease_seconds,
     )
     logger.info(
-        "Container built: %s step handlers, worker concurrency=%s, re-drive lease=%ss.",
+        "Container built: %s step handlers, worker concurrency=%s, re-drive lease=%ss, "
+        "HTTP pool per provider=%s (keepalive %s).",
         len(handlers),
         settings.worker_concurrency_limit,
         settings.redrive_lease_seconds,
+        settings.http_max_connections,
+        settings.http_max_keepalive_connections,
     )
 
     return Container(
@@ -106,4 +163,5 @@ async def build(settings: Settings) -> Container:
         callback_service=RunCallbackService(runs),
         worker=worker,
         health_check=PostgresHealthCheck(session_factory),
+        http_clients=[servicenow_http, pm_http, airflow_http],
     )
