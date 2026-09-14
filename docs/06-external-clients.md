@@ -318,11 +318,9 @@ from orchestrator.ports import TicketSystemClient
 
 
 # The catalog variable naming the group whose approval the request needs — must match the catalog
-# item's own variable. And the columns a name is looked up by: instance-specific, changed here in
-# one place if your ServiceNow identifies groups or users by something else.
+# item's own variable. The columns a name is looked up by are instance-specific, so they are not
+# constants here: they come from config (servicenow_group_lookup_field / servicenow_user_lookup_field).
 APPROVAL_GROUP_VARIABLE = "approval_group"
-GROUP_LOOKUP_FIELD = "name"         # sys_user_group column matched against a group name
-USER_LOOKUP_FIELD = "user_param"    # sys_user column matched against a login
 
 
 class ServiceNowTicketClient(TicketSystemClient):
@@ -334,12 +332,15 @@ class ServiceNowTicketClient(TicketSystemClient):
                      TicketOutcome.UNSUCCESSFUL: _RITM_CLOSED_INCOMPLETE}
 
     def __init__(self, base_url: str, username: str, password: str,
-                 responsible_groups: dict[str, str], default_group: str, timeout: float = 10.0,
+                 responsible_groups: dict[str, str], default_group: str, *,
+                 group_lookup_field: str, user_lookup_field: str, timeout: float = 10.0,
                  transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._base = base_url.rstrip("/")
         self._auth = (username, password)
         self._groups = dict(responsible_groups)   # group name -> sys_id; also the memo cache
         self._default_group = default_group       # incident fallback when a name resolves nowhere
+        self._group_lookup_field = group_lookup_field  # sys_user_group column matched against a name
+        self._user_lookup_field = user_lookup_field    # sys_user column matched against a login
         self._timeout = timeout
         self._transport = transport     # test seam: inject an ASGITransport (11-testing); None in prod
 
@@ -353,7 +354,7 @@ class ServiceNowTicketClient(TicketSystemClient):
         known = self._groups.get(name)
         if known:
             return known
-        sys_id = await self._lookup_sys_id("sys_user_group", GROUP_LOOKUP_FIELD, name)
+        sys_id = await self._lookup_sys_id("sys_user_group", self._group_lookup_field, name)
         if sys_id is None:
             logger.warning("No ServiceNow group named '%s'.", name)
             return None
@@ -373,7 +374,7 @@ class ServiceNowTicketClient(TicketSystemClient):
 
     async def _user_sys_id(self, login: str) -> str:
         """The sys_user sys_id for a login, falling back to the login itself when unknown."""
-        sys_id = await self._lookup_sys_id("sys_user", USER_LOOKUP_FIELD, login)
+        sys_id = await self._lookup_sys_id("sys_user", self._user_lookup_field, login)
         return sys_id if sys_id is not None else login
 
     async def _patch(self, table: str, sys_id: str, **body: Any) -> None:

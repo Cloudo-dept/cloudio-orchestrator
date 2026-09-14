@@ -21,12 +21,6 @@ logger = logging.getLogger(__name__)
 # ServiceNow drops it without complaint.
 APPROVAL_GROUP_VARIABLE = "approval_group"
 
-# The columns a name is looked up by. Instance-specific: change them here, in one place, if your
-# ServiceNow identifies groups or users by something other than these (u_group_name, user_name, an
-# email). Everything a group or user name is resolved through goes via these two.
-GROUP_LOOKUP_FIELD = "name"  # sys_user_group column matched against a group name
-USER_LOOKUP_FIELD = "user_param"  # sys_user column matched against a login
-
 
 class ServiceNowTicketClient(TicketSystemClient):
     _BUSINESS_SERVICE = "רשת יחידה"
@@ -46,6 +40,9 @@ class ServiceNowTicketClient(TicketSystemClient):
         client: httpx.AsyncClient,
         responsible_groups: dict[str, str],
         default_group: str,
+        *,
+        group_lookup_field: str,
+        user_lookup_field: str,
     ) -> None:
         # One pooled client for the process, built and closed by the composition root. Never a
         # client per call: each one costs a fresh TCP+TLS handshake and re-auth, and nothing then
@@ -56,6 +53,10 @@ class ServiceNowTicketClient(TicketSystemClient):
         # _group_sys_id, so each name costs at most one lookup per process.
         self._groups = dict(responsible_groups)
         self._default_group = default_group  # incident fallback when a name resolves nowhere
+        # The columns a name is looked up by — instance-specific, so they come from config.
+        # Everything a group or user name is resolved through goes via these two.
+        self._group_lookup_field = group_lookup_field  # sys_user_group column matched to a name
+        self._user_lookup_field = user_lookup_field  # sys_user column matched to a login
 
     async def _group_sys_id(self, name: str) -> str | None:
         """The sys_user_group sys_id for a team name: the configured map first, then ServiceNow.
@@ -68,7 +69,7 @@ class ServiceNowTicketClient(TicketSystemClient):
         known = self._groups.get(name)
         if known:
             return known
-        sys_id = await self._lookup_sys_id("sys_user_group", GROUP_LOOKUP_FIELD, name)
+        sys_id = await self._lookup_sys_id("sys_user_group", self._group_lookup_field, name)
         if sys_id is None:
             logger.warning("No ServiceNow group named '%s'.", name)
             return None
@@ -112,7 +113,7 @@ class ServiceNowTicketClient(TicketSystemClient):
         """The sys_user sys_id for a login, falling back to the login itself when there is no such
         user — ServiceNow resolves some references by login, and a ticket opened against a slightly
         wrong caller beats no ticket at all."""
-        sys_id = await self._lookup_sys_id("sys_user", USER_LOOKUP_FIELD, login)
+        sys_id = await self._lookup_sys_id("sys_user", self._user_lookup_field, login)
         if sys_id is None:
             logger.warning("No ServiceNow user '%s'; using the login as-is.", login)
             return login

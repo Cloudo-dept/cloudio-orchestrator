@@ -35,6 +35,16 @@ def test_settings_load_from_env_with_defaults(env: None) -> None:
     assert settings.retry_base_seconds == 10.0
     assert settings.servicenow_incident_team == "cloudio"
     assert settings.servicenow_responsible_groups == {}
+    assert settings.servicenow_group_lookup_field == "name"
+    assert settings.servicenow_user_lookup_field == "user_param"
+
+
+def test_lookup_fields_read_from_env(env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ORCH_SERVICENOW_GROUP_LOOKUP_FIELD", "u_group_name")
+    monkeypatch.setenv("ORCH_SERVICENOW_USER_LOOKUP_FIELD", "user_name")
+    settings = Settings()
+    assert settings.servicenow_group_lookup_field == "u_group_name"
+    assert settings.servicenow_user_lookup_field == "user_name"
 
 
 def test_secrets_are_wrapped(env: None) -> None:

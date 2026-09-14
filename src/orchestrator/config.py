@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     # what a DAG raises (DAG says "netops", the group is "CloudIO NetOps") and to skip the lookup.
     servicenow_responsible_groups: dict[str, str] = Field(default_factory=dict)
     servicenow_incident_team: str = "cloudio"  # default team for failure incidents
+    # The columns a name is looked up by. Instance-specific: set them if your ServiceNow identifies
+    # groups or users by something other than these (u_group_name, user_name, an email).
+    servicenow_group_lookup_field: str = "name"  # sys_user_group column matched against a name
+    servicenow_user_lookup_field: str = "user_param"  # sys_user column matched against a login
 
     # Project Manager (first resource manager)
     pm_base_url: str

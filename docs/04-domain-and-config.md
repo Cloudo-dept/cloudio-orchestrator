@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     # is not here is looked up in ServiceNow by name and remembered.
     servicenow_responsible_groups: dict[str, str] = Field(default_factory=dict)
     servicenow_incident_team: str = "cloudio"    # default team for failure incidents
+    # The columns a name is looked up by — instance-specific.
+    servicenow_group_lookup_field: str = "name"         # sys_user_group column matched against a name
+    servicenow_user_lookup_field: str = "user_param"    # sys_user column matched against a login
 
     # Project Manager (first resource manager)
     pm_base_url: str
