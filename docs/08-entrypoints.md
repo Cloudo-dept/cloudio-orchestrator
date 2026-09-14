@@ -334,7 +334,9 @@ async def build(settings: Settings) -> Container:
         settings.servicenow_base_url, settings.servicenow_username,
         settings.servicenow_password.get_secret_value(),
         settings.servicenow_responsible_groups, settings.servicenow_incident_team,
-        settings.external_call_timeout_seconds)
+        group_lookup_field=settings.servicenow_group_lookup_field,
+        user_lookup_field=settings.servicenow_user_lookup_field,
+        timeout=settings.external_call_timeout_seconds)
     resource_client = ProjectManagerResourceClient(
         settings.pm_base_url, settings.pm_token.get_secret_value(),
         settings.external_call_timeout_seconds)

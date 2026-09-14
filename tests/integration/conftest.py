@@ -45,6 +45,8 @@ async def servicenow_client(servicenow: ServiceNowMock) -> AsyncIterator[Service
             # sys_user_group table, and "cloudio" is the default incident team.
             responsible_groups={"netops": "grpsys-netops"},
             default_group="cloudio",
+            group_lookup_field=servicenow.group_lookup_field,
+            user_lookup_field=servicenow.user_lookup_field,
         )
 
 

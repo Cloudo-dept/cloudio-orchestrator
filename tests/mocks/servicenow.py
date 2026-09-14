@@ -6,7 +6,6 @@ from typing import Any
 
 from fastapi import FastAPI, Request, Response
 
-from orchestrator.adapters.servicenow import GROUP_LOOKUP_FIELD, USER_LOOKUP_FIELD
 from tests.mocks.base import Override, apply_overrides
 
 
@@ -43,6 +42,10 @@ class ServiceNowMock:
     groups: dict[str, str] = field(
         default_factory=lambda: {"CloudIO NetOps": "grpsys0000002", "cloudio": "grpsys0000003"}
     )
+    # The columns the instance identifies groups and users by. Hand the same values to the adapter
+    # under test; a query on any other column finds nothing, like a misconfigured instance.
+    group_lookup_field: str = "name"
+    user_lookup_field: str = "user_param"
     _seq: int = 0
 
     def _mint(self, prefix: str) -> tuple[str, str]:
@@ -86,20 +89,20 @@ def _build(mock: ServiceNowMock) -> FastAPI:
             hits = []
         return {"result": [{"number": r.number, "sys_id": r.sys_id} for r in hits[:1]]}
 
-    # Both tables answer only on the column the adapter is configured to query — the instance this
-    # doubles for is the one those constants describe, so a query on anything else finds nothing.
+    # Both tables answer only on the mock's own lookup columns — a query on anything else finds
+    # nothing, so an adapter configured with the wrong column fails here as it would for real.
     @app.get("/api/now/table/sys_user")
     async def query_user(sysparm_query: str = "") -> dict[str, Any]:
-        # <USER_LOOKUP_FIELD>=<login>; unknown logins return no rows, like the real table
+        # <user_lookup_field>=<login>; unknown logins return no rows, like the real table
         field_name, _, value = sysparm_query.partition("=")
-        sys_id = mock.users.get(value) if field_name == USER_LOOKUP_FIELD else None
+        sys_id = mock.users.get(value) if field_name == mock.user_lookup_field else None
         return {"result": [{"sys_id": sys_id}] if sys_id else []}
 
     @app.get("/api/now/table/sys_user_group")
     async def query_group(sysparm_query: str = "") -> dict[str, Any]:
-        # <GROUP_LOOKUP_FIELD>=<group name>; a group nobody created returns no rows
+        # <group_lookup_field>=<group name>; a group nobody created returns no rows
         field_name, _, value = sysparm_query.partition("=")
-        sys_id = mock.groups.get(value) if field_name == GROUP_LOOKUP_FIELD else None
+        sys_id = mock.groups.get(value) if field_name == mock.group_lookup_field else None
         return {"result": [{"sys_id": sys_id}] if sys_id else []}
 
     @app.get("/api/now/table/sc_req_item/{sys_id}")

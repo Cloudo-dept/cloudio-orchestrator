@@ -122,6 +122,8 @@ async def build(settings: Settings) -> Container:
         servicenow_http,
         settings.servicenow_responsible_groups,
         settings.servicenow_incident_team,
+        group_lookup_field=settings.servicenow_group_lookup_field,
+        user_lookup_field=settings.servicenow_user_lookup_field,
     )
     resource_client = ProjectManagerResourceClient(pm_http)
     engines: dict[WorkflowEngineType, WorkflowEngineClient] = {

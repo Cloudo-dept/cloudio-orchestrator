@@ -5,7 +5,7 @@ import pytest
 
 from orchestrator.adapters.servicenow import ServiceNowTicketClient
 from orchestrator.domain import ApprovalStatus, TicketOutcome
-from tests.mocks.base import Override
+from tests.mocks.base import Override, mock_client
 from tests.mocks.servicenow import ServiceNowMock
 
 
@@ -170,6 +170,25 @@ async def test_open_incident_omits_the_group_when_nothing_resolves(
     )
     # ServiceNow's own triage beats a reference field holding a name that is not a sys_id.
     assert "assignment_group" not in servicenow.incidents[-1].body
+
+
+async def test_lookups_match_on_the_configured_columns() -> None:
+    # An instance that identifies groups and users by other columns than the defaults.
+    servicenow = ServiceNowMock(group_lookup_field="u_group_name", user_lookup_field="user_name")
+    async with mock_client(servicenow.app, "http://servicenow.local", auth=("u", "p")) as http:
+        client = ServiceNowTicketClient(
+            http,
+            responsible_groups={},
+            default_group="cloudio",
+            group_lookup_field="u_group_name",
+            user_lookup_field="user_name",
+        )
+        await client.open_incident(
+            summary="boom", requested_by="jdoe", responsible_group="CloudIO NetOps"
+        )
+    body = servicenow.incidents[-1].body
+    assert body["assignment_group"] == servicenow.groups["CloudIO NetOps"]
+    assert body["caller_id"] == servicenow.users["jdoe"]
 
 
 async def test_open_incident_falls_back_to_the_login_for_an_unknown_caller(

@@ -35,6 +35,8 @@ async def _assemble(pg_session_factory, servicenow, airflow, project_manager):
         mock_client(servicenow.app, "http://sn.local", auth=("u", "p")),
         responsible_groups={"netops": "grpsys-netops"},
         default_group="cloudio",
+        group_lookup_field=servicenow.group_lookup_field,
+        user_lookup_field=servicenow.user_lookup_field,
     )
     engine = AirflowWorkflowEngineClient(
         mock_client(airflow.app, "http://af.local"), username="u", password="p"
