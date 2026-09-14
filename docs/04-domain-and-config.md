@@ -163,6 +163,8 @@ class TicketRef(BaseModel):
 
 
 class ResourceOperation(str, Enum):
+    """Carried on the run (RunState.operation), NOT on the ResourceSpec: the spec describes the
+    resource, this says what is being done to it."""
     CREATE = "create"         # provision a new record (the run id becomes its vendor id)
     UPDATE = "update"         # act on an existing record
     DELETE = "delete"         # act on an existing record
@@ -172,8 +174,9 @@ class ResourceSpec(BaseModel):
     """The resource a resource run acts on (Project Manager fields)."""
     project_id: str
     resource_type: str
-    operation: ResourceOperation = ResourceOperation.CREATE
-    vendor_id: str            # resource identity; a CREATE is assigned the run id when configured
+    vendor_id: str = ""       # resource identity; a CREATE is assigned the run id when configured,
+                              # an UPDATE/DELETE REQUIRES the caller's (checked at trigger time,
+                              # where the operation is known)
     name: str
     region: str
     environment: str
@@ -215,6 +218,7 @@ class RunState(BaseModel):
     ticket_params: dict[str, Any] = PyField(default_factory=dict)    # provider template variables (pass-through)
     workflow_params: dict[str, Any] = PyField(default_factory=dict)  # engine conf (pass-through)
     resource: ResourceSpec | None = None                             # resource runs only
+    operation: ResourceOperation = ResourceOperation.CREATE          # what this run does to it
 
     # step progress / idempotency markers
     ticket: TicketRef | None = None

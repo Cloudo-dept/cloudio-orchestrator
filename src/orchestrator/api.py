@@ -15,8 +15,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.domain import (
+    ResourceOperation,
     ResourceParamsRequired,
     ResourceSpec,
+    ResourceVendorIdRequired,
     RunState,
     RunStatus,
     RunType,
@@ -77,6 +79,8 @@ class WorkflowRunTriggerRequest(BaseModel):
     ticket_params: dict[str, Any] = Field(default_factory=dict)  # provider template variables
     workflow_params: dict[str, Any] = Field(default_factory=dict)  # engine conf
     resource: ResourceSpec | None = None  # resource workflows only
+    # What to do to that resource. Independent of the spec, which only describes the resource.
+    operation: ResourceOperation = ResourceOperation.CREATE
     ticket: TicketRef | None = None  # the pre-existing ticket to attach to (automation only)
 
 
@@ -128,10 +132,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # the last dictConfig to run, so it wins over uvicorn's own default configuration.
     configure_logging(settings.log_level)
     logger.info("API lifespan startup: building container.")
-    app.state.container = await build(settings)
+    container = await build(settings)
+    app.state.container = container
     logger.info("API ready to serve requests.")
     yield
-    logger.info("API lifespan shutdown.")
+    logger.info("API lifespan shutdown: draining provider connection pools.")
+    await container.aclose()
 
 
 app = FastAPI(title="Orchestrator Core API", lifespan=lifespan)
@@ -261,6 +267,7 @@ async def trigger_workflow_run(
             ticket_params=request.ticket_params,
             workflow_params=request.workflow_params,
             resource=request.resource,
+            operation=request.operation,
             ticket=request.ticket,
         )
     except UnknownWorkflowError:
@@ -271,6 +278,14 @@ async def trigger_workflow_run(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="resource is required for a resource workflow.",
+        ) from None
+    except ResourceVendorIdRequired:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"resource.vendor_id is required for a {request.operation.value} operation "
+                "— it names the record to act on."
+            ),
         ) from None
     except TicketRefRequired:
         raise HTTPException(

@@ -59,7 +59,12 @@ def worker() -> None:
             except NotImplementedError:  # e.g. Windows — fall back to default handling
                 logger.warning("Signal handler for %s not supported on this platform.", sig.name)
 
-        await container.worker.start()
+        try:
+            await container.worker.start()
+        finally:
+            # The loops have drained; release the provider connection pools before the process
+            # exits, so a graceful stop does not leave sockets open on the way out.
+            await container.aclose()
         logger.info("Worker process exiting.")
 
     asyncio.run(_main())

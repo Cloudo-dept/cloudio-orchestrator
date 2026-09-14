@@ -55,7 +55,10 @@ class StepName(str, Enum):
 
 class ResourceOperation(str, Enum):
     """What a resource run does to its resource. A CREATE provisions a new record; UPDATE and
-    DELETE act on a record that already exists (the engine does the real work either way)."""
+    DELETE act on a record that already exists (the engine does the real work either way).
+
+    Carried on the run (``RunState.operation``), not on the ResourceSpec: the spec describes the
+    resource, this says what is being done to it."""
 
     CREATE = "create"
     UPDATE = "update"
@@ -139,6 +142,10 @@ class ResourceParamsRequired(Exception):
     """A resource workflow was triggered without a resource spec."""
 
 
+class ResourceVendorIdRequired(Exception):
+    """An UPDATE/DELETE was triggered without the vendor_id of the record it acts on."""
+
+
 class TicketRefRequired(Exception):
     """An automation workflow was triggered without a reference to its pre-existing ticket."""
 
@@ -159,10 +166,9 @@ class ResourceSpec(BaseModel):
 
     project_id: str
     resource_type: str
-    operation: ResourceOperation = ResourceOperation.CREATE  # create / update / delete
     # Resource identity. Callers do NOT set this for a CREATE — ConfigureResourceStep assigns the
-    # run id as the new record's identity. Supplied by the caller only to target an existing
-    # record for an UPDATE/DELETE.
+    # run id as the new record's identity. REQUIRED from the caller on an UPDATE/DELETE, which
+    # target a record that already exists (enforced at trigger time, where the operation is known).
     vendor_id: str = ""
     name: str
     region: str | None = None
@@ -215,6 +221,9 @@ class RunState(BaseModel):
     ticket_params: dict[str, Any] = PyField(default_factory=dict)  # provider template variables
     workflow_params: dict[str, Any] = PyField(default_factory=dict)  # engine conf (pass-through)
     resource: ResourceSpec | None = None  # resource runs only
+    # What this run does to that resource. Independent of the spec (which only describes the
+    # resource) and meaningless for an automation run, which touches no resource at all.
+    operation: ResourceOperation = ResourceOperation.CREATE
 
     # step progress / idempotency markers
     ticket: TicketRef | None = None

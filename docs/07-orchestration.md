@@ -7,11 +7,18 @@ data too (`FAILURE_POLICIES`), handlers are small classes behind one ABC, the ex
 worker invokes per run, and the escalator applies the failure model.
 There is **no compensation** — permanent failure ends the run at `FAILED` and escalates.
 
-Both flows start by creating the ticket. `ConfigureResourceStep` configures the resource for its operation — a
-`create` provisions a new record (assigning the run id as its vendor id); an `update`/`delete`
-just marks the existing record in-progress. Finalization is two independent steps:
-`FinalizeResourceStep` clears in-progress once the engine is done (resource runs only), and the
-shared `CloseTicketStep` closes the RITM:
+Both flows start by creating the ticket. `ConfigureResourceStep` configures the resource for the
+run's operation (`RunState.operation` — carried on the run, *not* on the `ResourceSpec`, which only
+describes the resource) — a `create` provisions a new record (assigning the run id as its vendor
+id); an `update`/`delete` just marks the existing record in-progress (`resource.vendor_id` is
+required from the caller for those two, enforced in `WorkflowRunService.trigger`, where both the
+operation and the spec are in hand). Finalization is two independent steps:
+`FinalizeResourceStep` applies the outcome to the record once the engine is done (resource runs
+only) — a `create`/`update` clears in-progress, and an `update` also writes the spec as the
+record's new state, while a `delete` removes the record — and the shared `CloseTicketStep` closes
+the RITM. The record changes at *finalize*, not at configure, so a failed run never leaves Project
+Manager advertising a change (or a deletion) the engine did not make — there is no compensation to
+undo one:
 
 - **automation**: `running_engine → closing_ticket` — attaches to the caller's pre-existing RITM
   (supplied at trigger time), so there is no `creating_ticket` step
@@ -126,15 +133,15 @@ class ConfigureResourceStep(StepHandler):
             return True
         resource = st.resource
         assert resource is not None             # guaranteed by the trigger validation
-        if resource.operation is ResourceOperation.CREATE:
+        if st.operation is ResourceOperation.CREATE:      # the operation lives on the run
             resource.vendor_id = str(run.run_id)  # the run id is the new resource's identity
-            body = resource.model_dump(exclude={"project_id", "resource_type", "operation"}) | {
+            body = resource.model_dump(exclude={"project_id", "resource_type"}) | {
                 "in_progress": True, "last_modified_by": run.created_by}
             await self.resource_client.create_resource(
                 project_id=resource.project_id, resource_type=resource.resource_type,
                 body=body, idempotency_key=idem_key(run, StepName.CONFIGURE_RESOURCE))
         else:                                   # update / delete — record exists; mark in-progress
-            await self.resource_client.update_resource(
+            await self.resource_client.update_resource(   # the change itself lands at finalize
                 resource.project_id, resource.resource_type, resource.vendor_id,
                 {"in_progress": True})
         st.resource_configured = True
@@ -197,7 +204,9 @@ class RunEngineStep(StepHandler):
 
 
 class FinalizeResourceStep(StepHandler):
-    """Mark the created resource provisioned (resource runs only). Idempotent on
+    """Apply the run's outcome to the resource record (resource runs only), now that the engine
+    has done the real work: a CREATE/UPDATE clears in-progress — and an UPDATE also writes the
+    spec as the record's new state — while a DELETE removes the record. Idempotent on
     resource_finalized; a no-op if the run has no resource."""
 
     def __init__(self, resource_client: ResourceManagerClient) -> None:
@@ -207,14 +216,34 @@ class FinalizeResourceStep(StepHandler):
         st = run.run_state
         if st.resource is None or st.resource_finalized:
             return True
-        # Prefer the vendor id the engine reported (data.vendor_id, from the final_vendor_id
-        # output); fall back to the caller-supplied vendor_id when the run produced none.
-        vendor_id = st.resource.data.get("vendor_id") or st.resource.vendor_id
-        await self.resource_client.update_resource(
-            st.resource.project_id, st.resource.resource_type, vendor_id,
-            {"in_progress": False})              # done provisioning
+        resource = st.resource
+        # The record lives where ConfigureResourceStep created/targeted it (resource.vendor_id —
+        # the run id for a CREATE).
+        if st.operation is ResourceOperation.DELETE:
+            await self.resource_client.delete_resource(
+                resource.project_id, resource.resource_type, resource.vendor_id)
+        else:
+            await self.resource_client.update_resource(
+                resource.project_id, resource.resource_type, resource.vendor_id,
+                self._finalize_fields(run, resource))
         st.resource_finalized = True
         return True
+
+    def _finalize_fields(self, run: WorkflowRun, resource: ResourceSpec) -> dict[str, Any]:
+        """Always in_progress=False; for an UPDATE also the spec's own fields — the spec is the
+        record's *desired state*, as on a CREATE, so a caller sends the whole thing, not a delta.
+        If the engine reported the id it provisioned (final_vendor_id), re-key to it — for a
+        CREATE that replaces the run-id placeholder with the real vendor id."""
+        fields: dict[str, Any] = {"in_progress": False}
+        if run.run_state.operation is ResourceOperation.UPDATE:
+            fields |= resource.model_dump(
+                exclude={"project_id", "resource_type", "vendor_id"}) | {
+                    "last_modified_by": run.created_by}
+        engine_result = run.run_state.step_results.get(StepName.RUN_ENGINE)
+        engine_vendor_id = engine_result.final_vendor_id if engine_result else None
+        if engine_vendor_id and engine_vendor_id != resource.vendor_id:
+            fields["vendor_id"] = engine_vendor_id
+        return fields
 
 
 class CloseTicketStep(StepHandler):

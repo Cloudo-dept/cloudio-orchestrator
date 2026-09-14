@@ -58,8 +58,13 @@ class ResourceManagerClient(abc.ABC):
     @abc.abstractmethod
     async def update_resource(self, project_id: str, resource_type: str, vendor_id: str,
                               fields: dict[str, Any]) -> None:
-        """Partial update (only changed fields) — e.g. in_progress=False on finalize.
-        (There is no delete endpoint in the provider; nothing is ever removed.)"""
+        """Partial update (only changed fields) — e.g. in_progress=False on finalize."""
+
+    @abc.abstractmethod
+    async def delete_resource(self, project_id: str, resource_type: str,
+                              vendor_id: str) -> None:
+        """Remove a project resource. Idempotent: a record that is already gone is not an error,
+        so a re-driven finalize cannot fail on the strength of its own earlier success."""
 
 
 class WorkflowEngineClient(abc.ABC):
@@ -507,6 +512,17 @@ class ProjectManagerResourceClient(ResourceManagerClient):
             resp = await client.patch(
                 f"/projects/{project_id}/project_resources/{resource_type}/{vendor_id}",
                 json=fields)
+            resp.raise_for_status()
+
+    async def delete_resource(self, project_id: str, resource_type: str,
+                              vendor_id: str) -> None:
+        async with self._client() as client:
+            resp = await client.delete(
+                f"/projects/{project_id}/project_resources/{resource_type}/{vendor_id}")
+            # Already gone → the delete has happened; a re-driven finalize (delivery is
+            # at-least-once) must not fail on the strength of its own earlier success.
+            if resp.status_code == httpx.codes.NOT_FOUND:
+                return
             resp.raise_for_status()
 ```
 

@@ -49,3 +49,18 @@ class Settings(BaseSettings):
     pm_token: SecretStr
 
     external_call_timeout_seconds: float = 10.0
+
+    # Outbound HTTP connection pool, applied per provider. A pooled client reuses connections
+    # instead of paying a TCP+TLS handshake per call (open_ticket alone makes five), and the pool
+    # doubles as the real concurrency cap on a provider: worker_concurrency_limit bounds how many
+    # runs are in flight, but only this bounds how many sockets they open at once. An unbounded
+    # pool lets 16 workers stampede a rate-limited instance, which answers by dropping connections
+    # mid-response (httpx.ReadError). Keep max_connections at or below what the slowest provider
+    # tolerates concurrently.
+    http_max_connections: int = 10
+    http_max_keepalive_connections: int = 5
+    # How long a call may wait for a free connection from that pool. Deliberately far longer than
+    # external_call_timeout_seconds: queueing behind other runs is not the same failure as a
+    # provider that stopped answering, and charging both to one budget turns healthy backpressure
+    # (more workers than connections, which is the point of the cap) into spurious step retries.
+    http_pool_acquire_timeout_seconds: float = 60.0

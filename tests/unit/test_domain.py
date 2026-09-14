@@ -10,6 +10,7 @@ from orchestrator.domain import (
     EngineRunStatus,
     PydanticJSONB,
     ResolvedWorkflow,
+    ResourceOperation,
     ResourceSpec,
     RunState,
     RunStatus,
@@ -46,6 +47,21 @@ def make_run_state(*, with_resource: bool = False) -> RunState:
             else None
         ),
     )
+
+
+def test_resource_spec_describes_the_resource_not_the_operation() -> None:
+    # The operation is carried on the run (RunState.operation), never on the spec.
+    spec = ResourceSpec(project_id="proj-1", resource_type="vm", name="app-01")
+    assert "operation" not in ResourceSpec.model_fields
+    assert spec.vendor_id == ""  # a CREATE is assigned the run id by ConfigureResourceStep
+
+
+def test_run_state_operation_defaults_to_create() -> None:
+    # Runs persisted before the field existed load as CREATE, which is what they were.
+    state = RunState.model_validate(
+        make_run_state(with_resource=True).model_dump(mode="json", exclude={"operation"})
+    )
+    assert state.operation is ResourceOperation.CREATE
 
 
 def test_enum_values_are_lowercase_strings() -> None:

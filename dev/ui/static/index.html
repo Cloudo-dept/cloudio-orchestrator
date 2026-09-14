@@ -111,12 +111,25 @@
           </div>
         </fieldset>
 
+        <fieldset class="params" id="operation-field" hidden>
+          <legend>operation <span class="muted small">— what the run does to the resource; sent beside the spec, not inside it</span></legend>
+          <div class="grid">
+            <label>operation
+              <select name="operation">
+                <option value="create" selected>create — provision a new record</option>
+                <option value="update">update — write the spec to an existing record</option>
+                <option value="delete">delete — remove an existing record</option>
+              </select>
+            </label>
+          </div>
+        </fieldset>
+
         <fieldset class="params" id="resource-fields" hidden>
           <legend>resource <span class="muted small">— sent to the resource manager (required for resource workflows)</span></legend>
           <div class="grid">
             <label>project_id <input name="res_project_id" placeholder="proj-1" /></label>
             <label>resource_type <input name="res_resource_type" placeholder="vm" /></label>
-            <label>vendor_id <span class="muted small">— update/delete only; a create is assigned the run id</span>
+            <label>vendor_id <span class="muted small">— required for update/delete; a create is assigned the run id</span>
               <input name="res_vendor_id" placeholder="(leave blank for create)" /></label>
             <label>name <input name="res_name" placeholder="app-01" /></label>
             <label>region <input name="res_region" placeholder="(optional)" /></label>

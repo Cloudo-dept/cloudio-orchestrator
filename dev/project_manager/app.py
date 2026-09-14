@@ -130,6 +130,19 @@ async def update_resource(
     return updated_body
 
 
+@app.delete("/projects/{project_id}/project_resources/{resource_type}/{vendor_id}", status_code=204)
+async def delete_resource(project_id: str, resource_type: str, vendor_id: str) -> None:
+    result = await db["resources"].delete_one(
+        {
+            "project_id": project_id,
+            "resource_type": resource_type,
+            "vendor_id": vendor_id,
+        }
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(404, detail=f"resource '{vendor_id}' not found")
+
+
 @app.get("/projects/{project_id}/project_resources/{resource_type}")
 async def list_resources(project_id: str, resource_type: str) -> list[dict[str, Any]]:
     """Convenience for eyeballing state during development."""

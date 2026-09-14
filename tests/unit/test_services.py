@@ -3,7 +3,9 @@
 import pytest
 
 from orchestrator.domain import (
+    ResourceOperation,
     ResourceParamsRequired,
+    ResourceVendorIdRequired,
     RunStatus,
     RunType,
     TicketRef,
@@ -39,6 +41,7 @@ async def test_trigger_builds_run_from_snapshot(runs, workflows) -> None:
         ticket_params={"v": 1},
         workflow_params={"size": "L"},
         resource=None,
+        operation=ResourceOperation.CREATE,
         ticket=RITM,
     )
 
@@ -74,6 +77,7 @@ async def test_trigger_snapshots_the_workflow_name(runs, workflows) -> None:
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(),
+        operation=ResourceOperation.CREATE,
         ticket=None,
     )
 
@@ -94,6 +98,7 @@ async def test_trigger_carries_ticket_params_verbatim(runs, workflows) -> None:
         ticket_params={"size": "L", "approval_group": "CloudIO NetOps"},
         workflow_params={},
         resource=make_resource_spec(),
+        operation=ResourceOperation.CREATE,
         ticket=None,
     )
 
@@ -114,6 +119,7 @@ async def test_trigger_resource_workflow_carries_spec(runs, workflows) -> None:
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-9"),
+        operation=ResourceOperation.CREATE,
         ticket=None,
     )
 
@@ -135,6 +141,7 @@ async def test_trigger_resource_ignores_supplied_ticket(runs, workflows) -> None
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-9"),
+        operation=ResourceOperation.CREATE,
         ticket=RITM,
     )
 
@@ -151,6 +158,7 @@ async def test_trigger_unknown_workflow_raises(runs, workflows) -> None:
             ticket_params={},
             workflow_params={},
             resource=None,
+            operation=ResourceOperation.CREATE,
             ticket=None,
         )
 
@@ -166,8 +174,51 @@ async def test_trigger_resource_without_spec_raises(runs, workflows) -> None:
             ticket_params={},
             workflow_params={},
             resource=None,
+            operation=ResourceOperation.CREATE,
             ticket=None,
         )
+
+
+@pytest.mark.parametrize(
+    "operation", [ResourceOperation.UPDATE, ResourceOperation.DELETE], ids=lambda op: op.value
+)
+async def test_trigger_without_vendor_id_for_an_existing_record_raises(
+    runs, workflows, operation
+) -> None:
+    # An UPDATE/DELETE acts on a record that already exists — nothing can assign its identity.
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    svc = WorkflowRunService(runs, workflows)
+    with pytest.raises(ResourceVendorIdRequired):
+        await svc.trigger(
+            workflow_identifier="provision-vm",
+            created_by="jdoe",
+            max_retries=3,
+            ticket_params={},
+            workflow_params={},
+            resource=make_resource_spec(vendor_id=""),
+            operation=operation,
+            ticket=None,
+        )
+
+
+async def test_trigger_carries_the_operation_independently_of_the_spec(runs, workflows) -> None:
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    svc = WorkflowRunService(runs, workflows)
+
+    run = await svc.trigger(
+        workflow_identifier="provision-vm",
+        created_by="jdoe",
+        max_retries=3,
+        ticket_params={},
+        workflow_params={},
+        resource=make_resource_spec(vendor_id="vm-9"),
+        operation=ResourceOperation.DELETE,
+        ticket=None,
+    )
+
+    # The operation lives on the run, not on the spec — the spec only describes the resource.
+    assert run.run_state.operation is ResourceOperation.DELETE
+    assert not hasattr(run.run_state.resource, "operation")
 
 
 async def test_trigger_automation_without_ticket_raises(runs, workflows) -> None:
@@ -183,6 +234,7 @@ async def test_trigger_automation_without_ticket_raises(runs, workflows) -> None
             ticket_params={},
             workflow_params={},
             resource=None,
+            operation=ResourceOperation.CREATE,
             ticket=None,
         )
 
@@ -197,6 +249,7 @@ async def test_find_by_ticket_and_resource(runs, workflows) -> None:
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-7"),
+        operation=ResourceOperation.CREATE,
         ticket=None,
     )
 

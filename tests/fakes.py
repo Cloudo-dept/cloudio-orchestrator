@@ -113,11 +113,7 @@ class FakeWorkflowRunRepository(WorkflowRunRepository):
         ]
 
     async def find_by_engine_run_id(self, engine_run_id: str) -> list[WorkflowRun]:
-        return [
-            _copy(r)
-            for r in self._runs.values()
-            if r.run_state.engine_run_id == engine_run_id
-        ]
+        return [_copy(r) for r in self._runs.values() if r.run_state.engine_run_id == engine_run_id]
 
     async def wake(self, run_id: uuid.UUID) -> bool:
         # A nudge outside the version scheme: make a non-terminal run due now, no version bump.
@@ -235,6 +231,7 @@ class FakeResourceManagerClient(ResourceManagerClient):
         self.created_by_key: dict[str, dict[str, Any]] = {}
         self.create_calls: list[str] = []  # idempotency keys, in order
         self.updated: list[tuple[str, str, str, dict[str, Any]]] = []
+        self.deleted: list[tuple[str, str, str]] = []
 
     async def create_resource(
         self, project_id: str, resource_type: str, body: dict[str, Any], idempotency_key: str
@@ -250,6 +247,9 @@ class FakeResourceManagerClient(ResourceManagerClient):
         self, project_id: str, resource_type: str, vendor_id: str, fields: dict[str, Any]
     ) -> None:
         self.updated.append((project_id, resource_type, vendor_id, fields))
+
+    async def delete_resource(self, project_id: str, resource_type: str, vendor_id: str) -> None:
+        self.deleted.append((project_id, resource_type, vendor_id))
 
 
 class FakeWorkflowEngineClient(WorkflowEngineClient):

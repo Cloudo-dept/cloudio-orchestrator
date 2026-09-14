@@ -43,32 +43,19 @@ class ServiceNowTicketClient(TicketSystemClient):
 
     def __init__(
         self,
-        base_url: str,
-        username: str,
-        password: str,
+        client: httpx.AsyncClient,
         responsible_groups: dict[str, str],
         default_group: str,
-        timeout: float = 10.0,
-        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self._base = base_url.rstrip("/")
-        self._auth = (username, password)
+        # One pooled client for the process, built and closed by the composition root. Never a
+        # client per call: each one costs a fresh TCP+TLS handshake and re-auth, and nothing then
+        # bounds how many sockets the worker pool opens against ServiceNow at once.
+        self._http = client
         # group name -> sys_user_group sys_id. Seeded from config (an override for names that differ
         # from what a DAG raises, and a way to skip the lookup for hot names) and filled in by
         # _group_sys_id, so each name costs at most one lookup per process.
         self._groups = dict(responsible_groups)
         self._default_group = default_group  # incident fallback when a name resolves nowhere
-        self._timeout = timeout
-        self._transport = transport  # test seam (11-testing); None in prod
-
-    def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            base_url=self._base,
-            timeout=self._timeout,
-            auth=self._auth,
-            headers={"Accept": "application/json"},
-            transport=self._transport,
-        )
 
     async def _group_sys_id(self, name: str) -> str | None:
         """The sys_user_group sys_id for a team name: the configured map first, then ServiceNow.
@@ -90,12 +77,11 @@ class ServiceNowTicketClient(TicketSystemClient):
         return sys_id
 
     async def _patch(self, table: str, sys_id: str, **body: Any) -> None:
-        async with self._client() as client:
-            resp = await client.patch(f"/api/now/table/{table}/{sys_id}", json=body)
-            resp.raise_for_status()
+        resp = await self._http.patch(f"/api/now/table/{table}/{sys_id}", json=body)
+        resp.raise_for_status()
 
-    async def _find_ritm(self, client: httpx.AsyncClient, key: str) -> TicketRef | None:
-        resp = await client.get(
+    async def _find_ritm(self, key: str) -> TicketRef | None:
+        resp = await self._http.get(
             "/api/now/table/sc_req_item",
             params={
                 "sysparm_query": f"correlation_id={key}",
@@ -110,17 +96,16 @@ class ServiceNowTicketClient(TicketSystemClient):
     async def _lookup_sys_id(self, table: str, field: str, value: str) -> str | None:
         """The sys_id of the first row where `field` == `value`, or None when there is no such row.
         Every reference field (assignment_group, caller_id, ...) is filled from this."""
-        async with self._client() as client:
-            resp = await client.get(
-                f"/api/now/table/{table}",
-                params={
-                    "sysparm_query": f"{field}={value}",
-                    "sysparm_fields": "sys_id",
-                    "sysparm_limit": 1,
-                },
-            )
-            resp.raise_for_status()
-            rows = resp.json().get("result", [])
+        resp = await self._http.get(
+            f"/api/now/table/{table}",
+            params={
+                "sysparm_query": f"{field}={value}",
+                "sysparm_fields": "sys_id",
+                "sysparm_limit": 1,
+            },
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("result", [])
         return str(rows[0]["sys_id"]) if rows else None
 
     async def _user_sys_id(self, login: str) -> str:
@@ -159,54 +144,52 @@ class ServiceNowTicketClient(TicketSystemClient):
         idempotency_key: str,
     ) -> TicketRef:
         # template_id == catalog item sys_id; ticket == RITM.
-        async with self._client() as client:
-            found = await self._find_ritm(client, idempotency_key)
-            if found:  # already ordered -> idempotent
-                return found
-            # Both lookups happen BEFORE ordering: every call between the order and the
-            # correlation_id tag widens the window where a crash leaves an untagged RITM that the
-            # next attempt cannot find and therefore double-orders (01-external-contracts).
-            requested_by_sys_id = await self._user_sys_id(requested_by)
-            variables = await self._resolved_variables(fields)
-            order = await client.post(
-                f"/api/sn_sc/servicecatalog/items/{template_id}/order_now",
-                json={
-                    "variables": variables,
-                    "sysparm_quantity": 1,
-                    "sysparm_requested_for": requested_by_sys_id,
-                },
-                timeout=120.0,
-            )
-            logger.info("Created a new request: %s", order.json())
-            order.raise_for_status()
-            request_sys_id = order.json()["result"]["sys_id"]
-            ritm = await client.get(
-                "/api/now/table/sc_req_item",
-                params={
-                    "sysparm_query": f"request={request_sys_id}",
-                    "sysparm_fields": "number,sys_id",
-                    "sysparm_limit": 1,
-                },
-            )
-            ritm.raise_for_status()
-            r = ritm.json()["result"][0]
-            logger.info("Created RITM: %s", r["number"])
+        found = await self._find_ritm(idempotency_key)
+        if found:  # already ordered -> idempotent
+            return found
+        # Both lookups happen BEFORE ordering: every call between the order and the
+        # correlation_id tag widens the window where a crash leaves an untagged RITM that the
+        # next attempt cannot find and therefore double-orders (01-external-contracts).
+        requested_by_sys_id = await self._user_sys_id(requested_by)
+        variables = await self._resolved_variables(fields)
+        order = await self._http.post(
+            f"/api/sn_sc/servicecatalog/items/{template_id}/order_now",
+            json={
+                "variables": variables,
+                "sysparm_quantity": 1,
+                "sysparm_requested_for": requested_by_sys_id,
+            },
+            timeout=120.0,
+        )
+        logger.info("Created a new request: %s", order.json())
+        order.raise_for_status()
+        request_sys_id = order.json()["result"]["sys_id"]
+        ritm = await self._http.get(
+            "/api/now/table/sc_req_item",
+            params={
+                "sysparm_query": f"request={request_sys_id}",
+                "sysparm_fields": "number,sys_id",
+                "sysparm_limit": 1,
+            },
+        )
+        ritm.raise_for_status()
+        r = ritm.json()["result"][0]
+        logger.info("Created RITM: %s", r["number"])
 
-            await client.patch(
-                f"/api/now/table/sc_req_item/{r['sys_id']}",
-                json={"correlation_id": idempotency_key},
-            )
-            return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
+        await self._http.patch(
+            f"/api/now/table/sc_req_item/{r['sys_id']}",
+            json={"correlation_id": idempotency_key},
+        )
+        return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
 
     async def get_approval_status(self, ticket: TicketRef) -> ApprovalStatus:
-        async with self._client() as client:
-            resp = await client.get(
-                f"/api/now/table/sc_req_item/{ticket.native_id}",
-                params={"sysparm_fields": "approval"},
-            )
-            resp.raise_for_status()
-            logger.info("RITM Status: %s", resp.json())
-            approval = resp.json()["result"].get("approval", "")
+        resp = await self._http.get(
+            f"/api/now/table/sc_req_item/{ticket.native_id}",
+            params={"sysparm_fields": "approval"},
+        )
+        resp.raise_for_status()
+        logger.info("RITM Status: %s", resp.json())
+        approval = resp.json()["result"].get("approval", "")
         return self._APPROVAL_MAP.get(approval, ApprovalStatus.PENDING)
 
     async def close_ticket(
@@ -280,8 +263,7 @@ class ServiceNowTicketClient(TicketSystemClient):
             body["u_cloudio_failed_task"] = failed_task
         if comment:  # the same failure detail again, as a work note
             body["work_notes"] = comment
-        async with self._client() as client:
-            resp = await client.post("/api/now/table/incident", json=body)
-            resp.raise_for_status()
-            r = resp.json()["result"]
-            return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
+        resp = await self._http.post("/api/now/table/incident", json=body)
+        resp.raise_for_status()
+        r = resp.json()["result"]
+        return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])

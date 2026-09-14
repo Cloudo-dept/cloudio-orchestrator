@@ -187,6 +187,50 @@ async def test_malformed_resource_spec_is_422_at_boundary(client: httpx.AsyncCli
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("operation", ["update", "delete"])
+async def test_trigger_without_vendor_id_for_an_existing_record_is_422(
+    client: httpx.AsyncClient, operation: str
+) -> None:
+    await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={
+            "workflow_identifier": "provision-vm",
+            "created_by": "jdoe",
+            "operation": operation,  # top-level, beside `resource` — not inside the spec
+            "resource": RESOURCE,  # no vendor_id
+        },
+    )
+    assert resp.status_code == 422
+    assert "vendor_id is required" in resp.json()["detail"]
+
+
+async def test_trigger_carries_the_operation_beside_the_spec(client: httpx.AsyncClient) -> None:
+    await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={
+            "workflow_identifier": "provision-vm",
+            "created_by": "jdoe",
+            "operation": "delete",
+            "resource": {**RESOURCE, "vendor_id": "vm-1"},
+        },
+    )
+    assert resp.status_code == 201
+    state = resp.json()["run_state"]
+    assert state["operation"] == "delete"
+    assert "operation" not in state["resource"]  # the spec only describes the resource
+
+
+async def test_trigger_defaults_to_a_create_operation(client: httpx.AsyncClient) -> None:
+    await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={"workflow_identifier": "provision-vm", "created_by": "jdoe", "resource": RESOURCE},
+    )
+    assert resp.status_code == 201 and resp.json()["run_state"]["operation"] == "create"
+
+
 async def test_get_unknown_run_is_404(client: httpx.AsyncClient) -> None:
     resp = await client.get(f"/api/v1/workflow-runs/{'0' * 8}-0000-0000-0000-000000000000")
     assert resp.status_code == 404
@@ -220,9 +264,7 @@ async def test_ticket_approval_callback_wakes_the_run(
     from orchestrator.domain import utcnow
 
     run_id = await _make_waiting_run(runs, ticket_id="RITM0001234")
-    resp = await client.post(
-        "/api/v1/callbacks/ticket-approval", json={"ticket_id": "RITM0001234"}
-    )
+    resp = await client.post("/api/v1/callbacks/ticket-approval", json={"ticket_id": "RITM0001234"})
     assert resp.status_code == 202 and resp.json() == {"woken": 1}
     woken = await runs.get(run_id)
     assert woken is not None and woken.scheduled_at is not None
@@ -254,10 +296,14 @@ async def test_callback_for_unknown_reference_is_a_noop(client: httpx.AsyncClien
 async def test_list_by_resource_and_ticket(client: httpx.AsyncClient) -> None:
     await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
     # An UPDATE targets an existing record, so the caller supplies vendor_id (a CREATE would not).
-    resource = {**RESOURCE, "operation": "update", "vendor_id": "vm-1"}
     await client.post(
         "/api/v1/workflow-runs",
-        json={"workflow_identifier": "provision-vm", "created_by": "jdoe", "resource": resource},
+        json={
+            "workflow_identifier": "provision-vm",
+            "created_by": "jdoe",
+            "operation": "update",
+            "resource": {**RESOURCE, "vendor_id": "vm-1"},
+        },
     )
 
     by_resource = await client.get("/api/v1/workflow-runs", params={"resource_id": "vm-1"})

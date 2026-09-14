@@ -12,7 +12,7 @@ Architecture, persistence, run scheduling, step state machine, and Python interf
 >
 > **Two structural decisions:**
 > 1. **One durable store, no separate queue.** The durable business object is a **`WorkflowRun`** row; all scheduling (poll interval, retry backoff) is application state (`WorkflowRun.scheduled_at`). A pool of identical `RunWorker` loops each claim one due row (`FOR UPDATE SKIP LOCKED`) and drive it through the executor. `claim_due` + a re-drive lease + optimistic `version` + idempotency keys already give at-least-once and crash recovery, so a dedicated queue (pgqueuer, RabbitMQ) — or even a separate scheduler feeding the workers — would only restate the workers' own claim over the same database. Cut as duplication.
-> 2. **No rollback/compensation.** On a step's permanent failure the run terminates as `FAILED` and the failure is escalated (ServiceNow Incident + RITM work note). Partially-created resources are left in place with `in_progress=False` for operator follow-up (there is no delete endpoint anyway).
+> 2. **No rollback/compensation.** On a step's permanent failure the run terminates as `FAILED` and the failure is escalated (ServiceNow Incident + RITM work note). Partially-created resources are left in place, still `in_progress=True`, for operator follow-up — only `FinalizeResourceStep` clears that, and a failed run never reaches it.
 >
 > See [Design safeguards](09-design-safeguards.md) for the retained correctness properties. Project engineering rules live in [CLAUDE.md](../CLAUDE.md).
 

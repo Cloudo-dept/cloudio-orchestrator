@@ -364,6 +364,7 @@ class ProjectManagerMock:
     resources: dict[str, dict[str, Any]] = field(default_factory=dict)   # key: project/type/vendor
     _by_key: dict[str, str] = field(default_factory=dict)                # Idempotency-Key → resource key
     patches: list[dict[str, Any]] = field(default_factory=list)
+    deletes: list[str] = field(default_factory=list)                     # resource keys, in order
     overrides: list[Override] = field(default_factory=list)
     requests: list[tuple[str, str]] = field(default_factory=list)
 
@@ -398,6 +399,14 @@ def _build_pm(mock: ProjectManagerMock) -> FastAPI:
         mock.resources[key].update(body)
         mock.patches.append({"vendor_id": vendor_id, **body})
         return mock.resources[key]
+
+    @app.delete("/projects/{project_id}/project_resources/{resource_type}/{vendor_id}",
+                status_code=204)
+    async def delete(project_id: str, resource_type: str, vendor_id: str) -> None:
+        key = f"{project_id}/{resource_type}/{vendor_id}"
+        if mock.resources.pop(key, None) is None:      # already gone → 404, as the provider does
+            raise HTTPException(404, detail=f"resource '{vendor_id}' not found")
+        mock.deletes.append(key)
 
     return app
 ```

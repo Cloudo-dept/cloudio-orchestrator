@@ -21,7 +21,7 @@ from orchestrator.orchestration.plans import build_handlers
 from orchestrator.services import WorkflowRunService
 from tests.factories import make_resource_spec, make_workflow
 from tests.mocks.airflow import AirflowMock
-from tests.mocks.base import asgi
+from tests.mocks.base import mock_client
 from tests.mocks.project_manager import ProjectManagerMock
 from tests.mocks.servicenow import ServiceNowMock
 
@@ -29,19 +29,18 @@ pytestmark = pytest.mark.integration
 
 
 async def _assemble(pg_session_factory, servicenow, airflow, project_manager):
+    # The clients are not closed: an ASGI transport holds no sockets, and these live for the
+    # duration of one test. Production lifecycle is the container's job (bootstrap.Container).
     tickets = ServiceNowTicketClient(
-        base_url="http://sn.local",
-        username="u",
-        password="p",
+        mock_client(servicenow.app, "http://sn.local", auth=("u", "p")),
         responsible_groups={"netops": "grpsys-netops"},
         default_group="cloudio",
-        transport=asgi(servicenow.app),
     )
     engine = AirflowWorkflowEngineClient(
-        base_url="http://af.local", username="u", password="p", transport=asgi(airflow.app)
+        mock_client(airflow.app, "http://af.local"), username="u", password="p"
     )
     resources = ProjectManagerResourceClient(
-        base_url="http://pm.local", token="t", transport=asgi(project_manager.app)
+        mock_client(project_manager.app, "http://pm.local", headers={"Authorization": "Bearer t"})
     )
     runs = PostgresWorkflowRunRepository(pg_session_factory)
     workflows = PostgresWorkflowRepository(pg_session_factory)
