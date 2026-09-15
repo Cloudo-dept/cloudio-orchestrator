@@ -57,7 +57,7 @@ AUTOMATION_WORKFLOW_BODY = {
     "automation_id": "dag-x",
     "ticket_template_id": "cat-1",
 }
-RESOURCE = {  # a CREATE — the caller does not supply vendor_id (assigned at RegisterResourceStep)
+RESOURCE = {  # a CREATE — the caller does not supply vendor_id (assigned at ConfigureResourceStep)
     "project_id": "proj-1",
     "resource_type": "vm",
     "name": "app-01",
@@ -130,7 +130,7 @@ async def test_trigger_resource_run(client: httpx.AsyncClient) -> None:
     body = resp.json()
     assert body["run_id"] and body["run_type"] == "resource" and body["status"] == "pending"
     # The typed run_state is exposed with a real schema. vendor_id is still empty at trigger time —
-    # RegisterResourceStep assigns the run id when the run is driven.
+    # ConfigureResourceStep assigns the run id when the run is driven.
     assert body["run_state"]["resource"]["vendor_id"] == ""
 
     run_id = body["run_id"]

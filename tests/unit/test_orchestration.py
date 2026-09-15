@@ -30,7 +30,6 @@ from orchestrator.orchestration.steps import (
     ConfigureResourceStep,
     CreateTicketStep,
     FinalizeResourceStep,
-    RegisterResourceStep,
     StepHandler,
     engine_run_key,
     idem_key,
@@ -124,20 +123,14 @@ async def test_resource_run_completes_and_finalizes(
 
     assert final.status is RunStatus.COMPLETED
     assert len(resources.create_calls) == 1
-    assert final.run_state.resource_registered is True
     assert final.run_state.resource_configured is True
     assert final.run_state.resource_finalized is True
-    # A CREATE assigns the run id as the resource's vendor id when registered...
+    # A CREATE assigns the run id as the resource's vendor id and creates it PROVISIONING...
     assert final.run_state.resource is not None
     assert final.run_state.resource.vendor_id == str(run.run_id)
-    # ...marks it PROVISIONING once approved and READY at finalize, then closes the RITM.
+    assert resources.created_by_key[resources.create_calls[0]]["state"] == "PROVISIONING"
+    # ...then finalize marks it READY, and the RITM is closed.
     assert resources.updated == [
-        (
-            "proj-1",
-            "vm",
-            str(run.run_id),
-            state_fields(run.run_id, "PROVISIONING", in_progress=True),
-        ),
         ("proj-1", "vm", str(run.run_id), state_fields(run.run_id, "READY", in_progress=False)),
     ]
     assert tickets.closed and tickets.closed[0][1] == "Resource create completed; request closed."
@@ -155,14 +148,8 @@ async def test_delete_resource_run_removes_the_record_end_to_end(
 
     assert final.status is RunStatus.COMPLETED
     assert resources.create_calls == []  # a delete provisions nothing
-    # The caller's record goes PENDING_APPROVAL → DELETING → DELETED, and is then removed.
+    # The caller's record goes DELETING → DELETED, and is then removed.
     assert resources.updated == [
-        (
-            "proj-1",
-            "vm",
-            "vm-1",
-            state_fields(created.run_id, "PENDING_APPROVAL", in_progress=True),
-        ),
         ("proj-1", "vm", "vm-1", state_fields(created.run_id, "DELETING", in_progress=True)),
         ("proj-1", "vm", "vm-1", state_fields(created.run_id, "DELETED", in_progress=False)),
     ]
@@ -266,7 +253,7 @@ async def test_permanent_failure_marks_failed_and_escalates(
 
     assert final.status is RunStatus.FAILED
     assert StepName.CREATE_TICKET in final.run_state.errors
-    # Failed before the resource was registered, so there is no resource to mark.
+    # Failed before the resource was configured, so there is no resource to mark.
     assert resources.create_calls == [] and resources.updated == []
     # Escalation opened an Incident routed to the default team (no engine failure detail).
     assert len(tickets.incidents) == 1
@@ -527,11 +514,11 @@ async def test_resource_run_waits_while_approval_pending(
     assert mid.status is RunStatus.RUNNING
     assert mid.current_step == StepName.AWAIT_APPROVAL
     assert mid.scheduled_at is not None  # rescheduled for a later poll, worker released
-    # The request is already visible on its resource, but provisioning never started.
+    # The request already shows on its resource as under way, before anyone approved it...
     assert len(resources.create_calls) == 1
     created = resources.created_by_key[resources.create_calls[0]]
-    assert created["state"] == "PENDING_APPROVAL" and created["in_progress"] is True
-    assert resources.updated == []  # never configured
+    assert created["state"] == "PROVISIONING" and created["in_progress"] is True
+    assert engine.trigger_calls == []  # ...but provisioning never started
 
 
 async def test_resource_run_rejection_terminates_without_incident(
@@ -547,7 +534,7 @@ async def test_resource_run_rejection_terminates_without_incident(
     assert final.scheduled_at is None
     assert StepName.AWAIT_APPROVAL in final.run_state.errors
     assert tickets.incidents == []  # a rejection is not a failure — no escalation
-    # The placeholder record registered for the request is removed: nothing was provisioned.
+    # The record created for the request is removed: nothing was provisioned.
     assert len(resources.create_calls) == 1
     assert resources.deleted == [("proj-1", "vm", str(run.run_id))]
     assert resources.updated == []
@@ -565,21 +552,21 @@ async def test_rejected_update_leaves_the_resource_ready(
     assert final.status is RunStatus.REJECTED
     assert resources.deleted == []  # an existing resource is never deleted over a rejected change
     assert resources.updated == [
-        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "PENDING_APPROVAL", in_progress=True)),
+        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "UPDATING", in_progress=True)),
         ("proj-1", "vm", "vm-1", state_fields(run.run_id, "READY", in_progress=False)),
     ]
 
 
-def test_resource_is_registered_before_the_approval_gate() -> None:
-    # Resource runs record the request against the resource right after the ticket, then wait for
-    # approval — so the request is visible while it waits. Automation runs do neither.
+def test_resource_is_configured_before_the_approval_gate() -> None:
+    # Resource runs put the request on the resource right after the ticket, then wait for
+    # approval — so the request shows while it waits. Automation runs do neither.
     assert RUN_PLANS[RunType.RESOURCE][:3] == (
         StepName.CREATE_TICKET,
-        StepName.REGISTER_RESOURCE,
+        StepName.CONFIGURE_RESOURCE,
         StepName.AWAIT_APPROVAL,
     )
     assert StepName.AWAIT_APPROVAL not in RUN_PLANS[RunType.AUTOMATION]
-    assert StepName.REGISTER_RESOURCE not in RUN_PLANS[RunType.AUTOMATION]
+    assert StepName.CONFIGURE_RESOURCE not in RUN_PLANS[RunType.AUTOMATION]
 
 
 def test_automation_plan_has_no_create_ticket_step() -> None:
@@ -597,19 +584,19 @@ def test_finalize_is_two_ordered_steps() -> None:
     assert StepName.FINALIZE_RESOURCE not in RUN_PLANS[RunType.AUTOMATION]
 
 
-async def test_register_resource_step_create_assigns_run_id_as_vendor_id(resources) -> None:
-    step = RegisterResourceStep(resources)
+async def test_configure_resource_step_create_assigns_run_id_as_vendor_id(resources) -> None:
+    step = ConfigureResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE)  # resource op defaults to CREATE
 
     assert await step.execute(run) is True
-    assert run.run_state.resource_registered is True
-    # A CREATE creates a new record whose vendor id is the run id, pending approval.
+    assert run.run_state.resource_configured is True
+    # A CREATE creates a new record whose vendor id is the run id, PROVISIONING.
     assert run.run_state.resource is not None
     assert run.run_state.resource.vendor_id == str(run.run_id)
     assert len(resources.create_calls) == 1
     created = resources.created_by_key[resources.create_calls[0]]
     assert created["vendor_id"] == str(run.run_id)
-    assert created["state"] == "PENDING_APPROVAL"
+    assert created["state"] == "PROVISIONING"
     assert created["in_progress"] is True
     assert created["last_run_id"] == str(run.run_id)
     assert created["last_modified_by"] == "jdoe"
@@ -635,83 +622,44 @@ def test_engine_run_key_is_fresh_per_attempt() -> None:
     assert engine_run_key(run) != before
 
 
-async def test_register_resource_is_idempotent_across_attempts(resources) -> None:
+async def test_configure_resource_is_idempotent_across_attempts(resources) -> None:
     # The user's example: if the resource already exists in the manager, re-running does NOT
     # create a duplicate — the stable key dedups even when the marker was lost and the attempt
     # advanced (a crash mid-step, then a retry).
-    step = RegisterResourceStep(resources)
+    step = ConfigureResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE)  # CREATE
 
     assert await step.execute(run) is True
     assert len(resources.created_by_key) == 1
 
-    run.run_state.resource_registered = False  # marker lost before it was persisted
-    run.run_state.step_attempts[StepName.REGISTER_RESOURCE] = 1  # ...and the step retried
+    run.run_state.resource_configured = False  # marker lost before it was persisted
+    run.run_state.step_attempts[StepName.CONFIGURE_RESOURCE] = 1  # ...and the step retried
     assert await step.execute(run) is True
     assert len(resources.create_calls) == 2  # the provider was called again...
     assert len(resources.created_by_key) == 1  # ...but deduped to a SINGLE resource
 
 
-@pytest.mark.parametrize("operation", [ResourceOperation.UPDATE, ResourceOperation.DELETE])
-async def test_register_resource_step_marks_an_existing_record_pending(
-    operation, resources
-) -> None:
-    step = RegisterResourceStep(resources)
-    run = make_run(run_type=RunType.RESOURCE, operation=operation)
-
-    assert await step.execute(run) is True
-    assert run.run_state.resource_registered is True
-    # An UPDATE/DELETE acts on an existing record — no create, only its state on the caller's id.
-    assert resources.create_calls == []
-    assert resources.updated == [
-        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "PENDING_APPROVAL", in_progress=True))
-    ]
-    assert run.run_state.resource is not None
-    assert run.run_state.resource.vendor_id == "vm-1"  # left untouched
-
-
 @pytest.mark.parametrize(
     ("operation", "state"),
-    [
-        (ResourceOperation.CREATE, "PROVISIONING"),
-        (ResourceOperation.UPDATE, "UPDATING"),
-        (ResourceOperation.DELETE, "DELETING"),
-    ],
+    [(ResourceOperation.UPDATE, "UPDATING"), (ResourceOperation.DELETE, "DELETING")],
 )
-async def test_configure_resource_step_marks_the_operation_in_flight(
+async def test_configure_resource_step_marks_an_existing_record_in_flight(
     operation, state, resources
 ) -> None:
     step = ConfigureResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE, operation=operation)
-    run.run_state.resource_registered = True  # REGISTER_RESOURCE already ran
 
     assert await step.execute(run) is True
     assert run.run_state.resource_configured is True
+    # An UPDATE/DELETE acts on an existing record — no create, only its state on the caller's id.
     assert resources.create_calls == []
     assert resources.updated == [
         ("proj-1", "vm", "vm-1", state_fields(run.run_id, state, in_progress=True))
     ]
+    assert run.run_state.resource is not None
+    assert run.run_state.resource.vendor_id == "vm-1"  # left untouched
     assert await step.execute(run) is True  # re-drive: marker short-circuits
     assert len(resources.updated) == 1
-
-
-async def test_configure_resource_registers_a_run_from_before_the_register_step(resources) -> None:
-    # A CREATE that was waiting for approval when REGISTER_RESOURCE joined the plan has no record
-    # yet: configure creates it first — under the key the create always used — then marks it.
-    step = ConfigureResourceStep(resources)
-    run = make_run(run_type=RunType.RESOURCE)
-
-    assert await step.execute(run) is True
-    assert resources.create_calls == [idem_key(run, StepName.CONFIGURE_RESOURCE)]
-    assert run.run_state.resource_registered is True
-    assert resources.updated == [
-        (
-            "proj-1",
-            "vm",
-            str(run.run_id),
-            state_fields(run.run_id, "PROVISIONING", in_progress=True),
-        )
-    ]
 
 
 async def test_finalize_resource_step(resources) -> None:

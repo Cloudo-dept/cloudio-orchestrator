@@ -53,7 +53,7 @@ def test_resource_spec_describes_the_resource_not_the_operation() -> None:
     # The operation is carried on the run (RunState.operation), never on the spec.
     spec = ResourceSpec(project_id="proj-1", resource_type="vm", name="app-01")
     assert "operation" not in ResourceSpec.model_fields
-    assert spec.vendor_id == ""  # a CREATE is assigned the run id by RegisterResourceStep
+    assert spec.vendor_id == ""  # a CREATE is assigned the run id by ConfigureResourceStep
 
 
 def test_run_state_operation_defaults_to_create() -> None:

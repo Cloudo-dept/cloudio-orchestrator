@@ -9,7 +9,6 @@ from orchestrator.orchestration.steps import (
     ConfigureResourceStep,
     CreateTicketStep,
     FinalizeResourceStep,
-    RegisterResourceStep,
     RunEngineStep,
     StepHandler,
 )
@@ -23,13 +22,12 @@ RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
     # Automation runs attach to the caller's pre-existing RITM (supplied at trigger time), so there
     # is no CREATE_TICKET step — the run only drives the engine and closes the ticket.
     RunType.AUTOMATION: (StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
-    # Resource runs register the request against the resource before waiting for approval, so the
-    # resource shows the request from the moment it is made.
+    # Resource runs put the request on its resource before waiting for approval, so the resource
+    # shows the request under way from the moment it is made.
     RunType.RESOURCE: (
         StepName.CREATE_TICKET,
-        StepName.REGISTER_RESOURCE,
-        StepName.AWAIT_APPROVAL,
         StepName.CONFIGURE_RESOURCE,
+        StepName.AWAIT_APPROVAL,
         StepName.RUN_ENGINE,
         StepName.FINALIZE_RESOURCE,
         StepName.CLOSE_TICKET,
@@ -44,9 +42,8 @@ def build_handlers(
 ) -> dict[StepName, StepHandler]:
     return {
         StepName.CREATE_TICKET: CreateTicketStep(ticket_client),
-        StepName.REGISTER_RESOURCE: RegisterResourceStep(resource_client),
-        StepName.AWAIT_APPROVAL: AwaitApprovalStep(ticket_client),
         StepName.CONFIGURE_RESOURCE: ConfigureResourceStep(resource_client),
+        StepName.AWAIT_APPROVAL: AwaitApprovalStep(ticket_client),
         StepName.RUN_ENGINE: RunEngineStep(engines),
         StepName.FINALIZE_RESOURCE: FinalizeResourceStep(resource_client),
         StepName.CLOSE_TICKET: CloseTicketStep(ticket_client),

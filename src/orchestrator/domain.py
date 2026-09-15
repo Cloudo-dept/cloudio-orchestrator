@@ -45,11 +45,10 @@ class WorkflowEngineType(str, Enum):
 
 class StepName(str, Enum):
     CREATE_TICKET = "creating_ticket"
-    # create the record, or mark an existing one, as pending approval — visible while it waits
-    REGISTER_RESOURCE = "registering_resource"
-    AWAIT_APPROVAL = "awaiting_approval"  # wait for the ticket to be approved before provisioning
-    # mark the resource with the approved operation's in-flight state
+    # create the record, or mark an existing one, with the operation's in-flight state — before
+    # approval, so the request shows on the resource while it waits
     CONFIGURE_RESOURCE = "configuring_resource"
+    AWAIT_APPROVAL = "awaiting_approval"  # wait for the ticket to be approved before provisioning
     RUN_ENGINE = "running_engine"
     FINALIZE_RESOURCE = "finalizing_resource"  # mark the resource operation done
     CLOSE_TICKET = "closing_ticket"  # close out the RITM
@@ -74,10 +73,11 @@ class ResourceState(str, Enum):
 
     The values are the literal strings the resource record carries."""
 
-    PENDING_APPROVAL = "PENDING_APPROVAL"  # a request against it is waiting for approval
-    PROVISIONING = "PROVISIONING"  # an approved CREATE is being carried out
-    UPDATING = "UPDATING"  # an approved UPDATE is being carried out
-    DELETING = "DELETING"  # an approved DELETE is being carried out
+    # A run is working on it, from the moment it was requested. Whether that run is still waiting
+    # for approval is the run's business (its current step), not the resource's.
+    PROVISIONING = "PROVISIONING"  # a CREATE is under way
+    UPDATING = "UPDATING"  # an UPDATE is under way
+    DELETING = "DELETING"  # a DELETE is under way
     READY = "READY"  # no run is working on it
     FAILED = "FAILED"  # the last run on it failed (nothing is rolled back)
     DELETED = "DELETED"  # a DELETE finished; the provider removes or retires the record
@@ -188,7 +188,7 @@ class ResourceSpec(BaseModel):
 
     project_id: str
     resource_type: str
-    # Resource identity. Callers do NOT set this for a CREATE — RegisterResourceStep assigns the
+    # Resource identity. Callers do NOT set this for a CREATE — ConfigureResourceStep assigns the
     # run id as the new record's identity. REQUIRED from the caller on an UPDATE/DELETE, which
     # target a record that already exists (enforced at trigger time, where the operation is known).
     vendor_id: str = ""
@@ -250,7 +250,6 @@ class RunState(BaseModel):
     # step progress / idempotency markers
     ticket: TicketRef | None = None
     engine_run_id: str | None = None
-    resource_registered: bool = False
     resource_configured: bool = False
     resource_finalized: bool = False
     ticket_closed: bool = False

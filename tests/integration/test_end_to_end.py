@@ -139,7 +139,7 @@ async def test_resource_run_rejected_stops_without_provisioning(
 
     assert final is not None and final.status is RunStatus.REJECTED
     assert final.scheduled_at is None
-    # The placeholder registered for the request is removed; nothing was provisioned.
+    # The record created for the request is removed; nothing was provisioned.
     assert project_manager.patches == []
     assert project_manager.deletes == [f"proj-1/vm/{run.run_id}"]
     assert project_manager.resources == {}
@@ -168,7 +168,7 @@ async def test_failed_resource_run_marks_the_resource_failed(
         ticket=None,
     )
 
-    for _ in range(10):  # through the ticket, registration, approval and configure to the engine
+    for _ in range(10):  # through the ticket, configure and approval to the engine
         await _drive(runs, executor, run.run_id, iters=1)
         current = await runs.get(run.run_id)
         if current is not None and current.run_state.engine_run_id is not None:
@@ -214,11 +214,7 @@ async def test_delete_resource_run_removes_the_record(
     final = await _drive(runs, executor, run.run_id)
 
     assert final is not None and final.status is RunStatus.COMPLETED
-    assert [p["state"] for p in project_manager.patches] == [
-        "PENDING_APPROVAL",
-        "DELETING",
-        "DELETED",
-    ]
+    assert [p["state"] for p in project_manager.patches] == ["DELETING", "DELETED"]
     assert project_manager.deletes == ["proj-1/vm/vm-1"]
     assert project_manager.resources == {}
 

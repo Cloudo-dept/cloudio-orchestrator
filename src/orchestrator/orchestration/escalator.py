@@ -97,7 +97,7 @@ class FailureEscalator:
         await self._mark_resource_failed(run)
 
     async def reject(self, run: WorkflowRun) -> None:
-        """Release the resource a rejected request registered. A CREATE's placeholder record is
+        """Release the resource a rejected request was put on. A CREATE's placeholder record is
         deleted — the resource was never provisioned; an UPDATE/DELETE leaves its resource READY,
         exactly as it was. Never raises."""
         resource = self._resource_in_flight(run)
@@ -143,13 +143,11 @@ class FailureEscalator:
 
     @staticmethod
     def _resource_in_flight(run: WorkflowRun) -> ResourceSpec | None:
-        """The resource this run left in flight, if any: one it registered — or, for a run from
-        before REGISTER_RESOURCE existed, configured — and did not finalize. Nothing else was
-        touched: a run that fails after finalize left its resource READY, which is the truth."""
+        """The resource this run left in flight, if any: one it configured and did not finalize.
+        Nothing else was touched — a run that ends before configure never reached the resource,
+        and one that fails after finalize left it READY, which is the truth."""
         st = run.run_state
-        if st.resource is None or st.resource_finalized:
-            return None
-        if not (st.resource_registered or st.resource_configured):
+        if st.resource is None or not st.resource_configured or st.resource_finalized:
             return None
         return st.resource
 

@@ -3,8 +3,8 @@
 Every handler is idempotent two ways:
 
 1. **Typed state markers** — a re-driven step first checks whether its work already happened
-   (``st.ticket``, ``resource_registered``, ``resource_configured``, ``engine_run_id``,
-   ``resource_finalized``, ``ticket_closed``) and short-circuits.
+   (``st.ticket``, ``resource_configured``, ``engine_run_id``, ``resource_finalized``,
+   ``ticket_closed``) and short-circuits.
 2. **Stable idempotency keys** — when the marker was not yet persisted (a crash between the side
    effect and ``save()``, or a retry), the side-effecting provider call carries a key stable per
    ``(run_id, step)``, so a provider that dedups on it returns the existing side effect instead of
@@ -64,14 +64,13 @@ def engine_run_key(run: WorkflowRun) -> str:
 # The states in which a run is still working on the resource — what the record's in_progress means.
 IN_FLIGHT_STATES = frozenset(
     {
-        ResourceState.PENDING_APPROVAL,
         ResourceState.PROVISIONING,
         ResourceState.UPDATING,
         ResourceState.DELETING,
     }
 )
 
-# The state an approved operation puts its resource in while the engine does the work.
+# The state a requested operation puts its resource in until its run is over.
 OPERATION_STATES: dict[ResourceOperation, ResourceState] = {
     ResourceOperation.CREATE: ResourceState.PROVISIONING,
     ResourceOperation.UPDATE: ResourceState.UPDATING,
@@ -127,65 +126,63 @@ class CreateTicketStep(StepHandler):
         return True
 
 
-class RegisterResourceStep(StepHandler):
-    """Record the request against its resource as soon as its ticket exists, so the request is
-    visible while it waits for approval (resource runs only).
+class ConfigureResourceStep(StepHandler):
+    """Put the request on its resource as soon as the ticket exists — before approval, so the
+    people who own the resource see it under way from the start (resource runs only). The record
+    takes the operation's in-flight state: PROVISIONING, UPDATING or DELETING.
 
     A CREATE has no vendor id yet, so the run id becomes the resource's identity and a new record
     is created. An UPDATE/DELETE acts on a record that already exists (the caller's vendor_id,
     required at trigger time), so only its state changes — the change itself lands in
-    FinalizeResourceStep, once the engine has actually made it. Idempotent on resource_registered.
+    FinalizeResourceStep, once the engine has actually made it. Idempotent on resource_configured.
     """
 
     def __init__(self, resource_client: ResourceManagerClient) -> None:
         self.resource_client = resource_client
 
     async def execute(self, run: WorkflowRun) -> bool:
-        await register_resource(self.resource_client, run)
-        return True
-
-
-async def register_resource(resource_client: ResourceManagerClient, run: WorkflowRun) -> None:
-    """REGISTER_RESOURCE's work — shared with CONFIGURE_RESOURCE, for a run that was already past
-    this step when the step joined the plan."""
-    st = run.run_state
-    if st.resource_registered:
-        logger.debug("Run %s: resource already registered; skipping.", run.run_id)
-        return
-    resource = st.resource
-    assert resource is not None  # guaranteed by the trigger validation
-    logger.info(
-        "Run %s: registering resource (operation=%s, type=%s, project=%s).",
-        run.run_id,
-        st.operation.value,
-        resource.resource_type,
-        resource.project_id,
-    )
-    fields = resource_state_fields(run, ResourceState.PENDING_APPROVAL)
-    if st.operation is ResourceOperation.CREATE:
-        resource.vendor_id = str(run.run_id)  # the run id is the new resource's identity
-        body = (
-            resource.model_dump(exclude={"project_id", "resource_type"})
-            | fields
-            | {"last_modified_by": run.created_by}
-        )
-        await resource_client.create_resource(
-            project_id=resource.project_id,
-            resource_type=resource.resource_type,
-            body=body,
-            # Keyed as CONFIGURE_RESOURCE, where this create used to happen, so a run that created
-            # the record there but crashed before saving still de-dups against it.
-            idempotency_key=idem_key(run, StepName.CONFIGURE_RESOURCE),
-        )
-        logger.info("Run %s: created resource record %s.", run.run_id, resource.vendor_id)
-    else:  # UPDATE / DELETE — the record already exists; only its state changes.
-        await resource_client.update_resource(
-            resource.project_id, resource.resource_type, resource.vendor_id, fields
-        )
+        st = run.run_state
+        if st.resource_configured:
+            logger.debug("Run %s: resource already configured; skipping.", run.run_id)
+            return True
+        resource = st.resource
+        assert resource is not None  # guaranteed by the trigger validation
+        state = OPERATION_STATES[st.operation]
         logger.info(
-            "Run %s: marked existing resource %s pending approval.", run.run_id, resource.vendor_id
+            "Run %s: configuring resource (operation=%s, type=%s, project=%s) as %s.",
+            run.run_id,
+            st.operation.value,
+            resource.resource_type,
+            resource.project_id,
+            state.value,
         )
-    st.resource_registered = True
+        fields = resource_state_fields(run, state)
+        if st.operation is ResourceOperation.CREATE:
+            resource.vendor_id = str(run.run_id)  # the run id is the new resource's identity
+            body = (
+                resource.model_dump(exclude={"project_id", "resource_type"})
+                | fields
+                | {"last_modified_by": run.created_by}
+            )
+            await self.resource_client.create_resource(
+                project_id=resource.project_id,
+                resource_type=resource.resource_type,
+                body=body,
+                idempotency_key=idem_key(run, StepName.CONFIGURE_RESOURCE),
+            )
+            logger.info("Run %s: created resource record %s.", run.run_id, resource.vendor_id)
+        else:  # UPDATE / DELETE — the record already exists; only its state changes.
+            await self.resource_client.update_resource(
+                resource.project_id, resource.resource_type, resource.vendor_id, fields
+            )
+            logger.info(
+                "Run %s: marked existing resource %s %s.",
+                run.run_id,
+                resource.vendor_id,
+                state.value,
+            )
+        st.resource_configured = True
+        return True
 
 
 class AwaitApprovalStep(StepHandler):
@@ -215,42 +212,6 @@ class AwaitApprovalStep(StepHandler):
         if status is ApprovalStatus.REJECTED:
             raise RunRejected(f"Ticket {st.ticket.ticket_id} was rejected.")
         return False  # pending → executor sets scheduled_at forward, worker re-drives
-
-
-class ConfigureResourceStep(StepHandler):
-    """Once the request is approved, mark its resource with the operation's in-flight state —
-    PROVISIONING, UPDATING or DELETING — then hand off to the engine (resource runs only).
-    Idempotent on resource_configured."""
-
-    def __init__(self, resource_client: ResourceManagerClient) -> None:
-        self.resource_client = resource_client
-
-    async def execute(self, run: WorkflowRun) -> bool:
-        st = run.run_state
-        if st.resource_configured:
-            logger.debug("Run %s: resource already configured; skipping.", run.run_id)
-            return True
-        # A no-op once REGISTER_RESOURCE has run. A run that was already past that step when it
-        # joined the plan has no record yet (a CREATE), so it registers here instead.
-        await register_resource(self.resource_client, run)
-        resource = st.resource
-        assert resource is not None  # guaranteed by the trigger validation
-        state = OPERATION_STATES[st.operation]
-        logger.info(
-            "Run %s: marking resource %s %s (operation=%s).",
-            run.run_id,
-            resource.vendor_id,
-            state.value,
-            st.operation.value,
-        )
-        await self.resource_client.update_resource(
-            resource.project_id,
-            resource.resource_type,
-            resource.vendor_id,
-            resource_state_fields(run, state),
-        )
-        st.resource_configured = True
-        return True
 
 
 class RunEngineStep(StepHandler):
@@ -359,7 +320,7 @@ class FinalizeResourceStep(StepHandler):
             logger.debug("Run %s: no resource to finalize (or already done).", run.run_id)
             return True
         resource = st.resource
-        # The record lives where RegisterResourceStep created/targeted it (resource.vendor_id —
+        # The record lives where ConfigureResourceStep created/targeted it (resource.vendor_id —
         # the run id for a CREATE).
         if st.operation is ResourceOperation.DELETE:
             await self._finalize_delete(run, resource)

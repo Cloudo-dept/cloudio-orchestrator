@@ -73,7 +73,7 @@ class WorkflowRunService:
                 raise ResourceParamsRequired(workflow_identifier)
             # An UPDATE/DELETE acts on a record that already exists, so nothing can assign its
             # identity for it. Caught here so the caller is told at trigger time, rather than the
-            # run failing at REGISTER_RESOURCE after it has already opened a ticket.
+            # run failing at CONFIGURE_RESOURCE after it has already opened a ticket.
             if operation is not ResourceOperation.CREATE and not resource.vendor_id:
                 logger.warning(
                     "Trigger rejected: a %s operation on workflow '%s' needs the vendor_id of "
