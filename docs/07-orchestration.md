@@ -7,22 +7,54 @@ data too (`FAILURE_POLICIES`), handlers are small classes behind one ABC, the ex
 worker invokes per run, and the escalator applies the failure model.
 There is **no compensation** — permanent failure ends the run at `FAILED` and escalates.
 
-Both flows start by creating the ticket. `ConfigureResourceStep` configures the resource for the
+A resource run starts by creating the ticket, then immediately registers the request against the
+resource so a portal user can see it while a human approves. `RegisterResourceStep` acts on the
 run's operation (`RunState.operation` — carried on the run, *not* on the `ResourceSpec`, which only
 describes the resource) — a `create` provisions a new record (assigning the run id as its vendor
-id); an `update`/`delete` just marks the existing record in-progress (`resource.vendor_id` is
-required from the caller for those two, enforced in `WorkflowRunService.trigger`, where both the
-operation and the spec are in hand). Finalization is two independent steps:
-`FinalizeResourceStep` applies the outcome to the record once the engine is done (resource runs
-only) — a `create`/`update` clears in-progress, and an `update` also writes the spec as the
-record's new state, while a `delete` removes the record — and the shared `CloseTicketStep` closes
-the RITM. The record changes at *finalize*, not at configure, so a failed run never leaves Project
-Manager advertising a change (or a deletion) the engine did not make — there is no compensation to
-undo one:
+id); an `update`/`delete` just marks the existing record (`resource.vendor_id` is required from the
+caller for those two, enforced in `WorkflowRunService.trigger`, where both the operation and the
+spec are in hand). Either way the record reads `PENDING_APPROVAL`. Once the RITM is approved,
+`ConfigureResourceStep` moves the record to the operation's in-flight state. Finalization is two
+independent steps: `FinalizeResourceStep` applies the outcome to the record once the engine is done
+(resource runs only) — a `create`/`update` marks it `READY`, and an `update` also writes the spec as
+the record's new state, while a `delete` marks it `DELETED` and then removes it — and the shared
+`CloseTicketStep` closes the RITM. The *requested change* lands at finalize, not at registration or
+configure, so a failed run never leaves Project Manager advertising a change (or a deletion) the
+engine did not make. A failed run's record is marked `FAILED` instead — a status, not a rollback;
+there is still no compensation:
 
 - **automation**: `running_engine → closing_ticket` — attaches to the caller's pre-existing RITM
-  (supplied at trigger time), so there is no `creating_ticket` step
-- **resource**: `creating_ticket → configuring_resource → running_engine → finalizing_resource → closing_ticket`
+  (supplied at trigger time), so there is no `creating_ticket` step; it never touches Project
+  Manager
+- **resource**: `creating_ticket → registering_resource → awaiting_approval → configuring_resource → running_engine → finalizing_resource → closing_ticket`
+
+## The resource record's lifecycle state
+
+The Project Manager record carries an explicit `state` (`ResourceState`, see
+[04-domain-and-config](04-domain-and-config.md)) so the portal (portal → gateway → Project Manager)
+can show a requester where their request is. Every state write sends the same three fields —
+`resource_state_fields(run, state)` builds them:
+
+- `state` — the `ResourceState` value (`PENDING_APPROVAL`, `PROVISIONING`, …);
+- `in_progress` — kept for existing readers, and always written *with* `state`: true exactly for
+  `PENDING_APPROVAL`, `PROVISIONING`, `UPDATING` and `DELETING`;
+- `last_run_id` — the run that set the state. The portal follows it to
+  `GET /api/v1/workflow-runs/{run_id}` for the ticket, incident and failure detail, so none of that
+  needs copying onto the record.
+
+| Transition point | CREATE | UPDATE | DELETE |
+|---|---|---|---|
+| `registering_resource` (after the ticket, before approval) | POST a new record (vendor id = run id) → `PENDING_APPROVAL` | PATCH `PENDING_APPROVAL` | PATCH `PENDING_APPROVAL` |
+| `configuring_resource` (after approval) | PATCH `PROVISIONING` | PATCH `UPDATING` | PATCH `DELETING` |
+| `finalizing_resource` | PATCH `READY` (+ re-key to the engine's `final_vendor_id`, if reported) | PATCH `READY` + the whole spec + `last_modified_by` | PATCH `DELETED`, then DELETE the record |
+| run `REJECTED` (at `awaiting_approval`) | DELETE the placeholder record | PATCH `READY` | PATCH `READY` |
+| run `FAILED` | PATCH `FAILED` | PATCH `FAILED` | PATCH `FAILED` |
+
+The last two rows are the [escalator's](#orchestrationescalatorpy--the-failure-model) job, not a
+step's. A rejection stores no "rejected" state: a rejected `create` never had a resource behind its
+placeholder, and a rejected `update`/`delete` leaves the resource exactly as it was, so `READY` is
+the truth. Neither row fires for a record that is already finalized — a run that fails in
+`closing_ticket` leaves its resource `READY`.
 
 ## `orchestration/plans.py` — run plans as data
 
@@ -30,14 +62,16 @@ undo one:
 from collections.abc import Mapping
 
 from orchestrator.domain import RunType, StepName, WorkflowEngineType
-from orchestrator.orchestration.steps import (ConfigureResourceStep, CloseTicketStep,
-                                              CreateTicketStep, FinalizeResourceStep,
+from orchestrator.orchestration.steps import (AwaitApprovalStep, ConfigureResourceStep,
+                                              CloseTicketStep, CreateTicketStep,
+                                              FinalizeResourceStep, RegisterResourceStep,
                                               RunEngineStep, StepHandler)
 from orchestrator.ports import ResourceManagerClient, TicketSystemClient, WorkflowEngineClient
 
 RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
     RunType.AUTOMATION: (StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
-    RunType.RESOURCE: (StepName.CREATE_TICKET, StepName.CONFIGURE_RESOURCE, StepName.RUN_ENGINE,
+    RunType.RESOURCE: (StepName.CREATE_TICKET, StepName.REGISTER_RESOURCE,
+                       StepName.AWAIT_APPROVAL, StepName.CONFIGURE_RESOURCE, StepName.RUN_ENGINE,
                        StepName.FINALIZE_RESOURCE, StepName.CLOSE_TICKET),
 }
 
@@ -49,6 +83,8 @@ def build_handlers(
 ) -> dict[StepName, StepHandler]:
     return {
         StepName.CREATE_TICKET: CreateTicketStep(ticket_client),
+        StepName.REGISTER_RESOURCE: RegisterResourceStep(resource_client),
+        StepName.AWAIT_APPROVAL: AwaitApprovalStep(ticket_client),
         StepName.CONFIGURE_RESOURCE: ConfigureResourceStep(resource_client),
         StepName.RUN_ENGINE: RunEngineStep(engines),
         StepName.FINALIZE_RESOURCE: FinalizeResourceStep(resource_client),
@@ -71,8 +107,9 @@ import abc
 import logging
 from collections.abc import Mapping
 
-from orchestrator.domain import (EngineRunStatus, StepName, TicketRef, WorkflowEngineType,
-                                 WorkflowRun, RunState)
+from orchestrator.domain import (ApprovalStatus, EngineRunStatus, ResourceNotFoundError,
+                                 ResourceOperation, ResourceState, RunRejected, StepName,
+                                 TicketRef, WorkflowEngineType, WorkflowRun, RunState)
 from orchestrator.ports import ResourceManagerClient, TicketSystemClient, WorkflowEngineClient
 
 logger = logging.getLogger(__name__)
@@ -92,6 +129,20 @@ def engine_run_key(run: WorkflowRun) -> str:
     fresh engine run instead of re-attaching to (and re-reading) the failed one."""
     attempt = run.run_state.step_attempts.get(StepName.RUN_ENGINE, 0)
     return f"{run.run_id}:{StepName.RUN_ENGINE.value}:{attempt}"
+
+
+# The states in which a run is still working on the resource — what the record's in_progress means.
+IN_FLIGHT_STATES = frozenset({ResourceState.PENDING_APPROVAL, ResourceState.PROVISIONING,
+                              ResourceState.UPDATING, ResourceState.DELETING})
+
+
+def resource_state_fields(run: WorkflowRun, state: ResourceState) -> dict[str, Any]:
+    """The fields every lifecycle write sends together: the state, the in_progress flag derived
+    from it (so the two can never disagree), and the run that set it — the portal follows
+    last_run_id to GET /api/v1/workflow-runs/{run_id}. Shared by the steps and the
+    FailureEscalator."""
+    return {"state": state.value, "in_progress": state in IN_FLIGHT_STATES,
+            "last_run_id": str(run.run_id)}
 
 
 class StepHandler(abc.ABC):
@@ -123,7 +174,73 @@ class CreateTicketStep(StepHandler):
         return True
 
 
+async def register_resource(resource_client: ResourceManagerClient, run: WorkflowRun) -> None:
+    """Record the request against the resource as PENDING_APPROVAL. Idempotent on
+    resource_registered. Shared by RegisterResourceStep and ConfigureResourceStep (see below)."""
+    st = run.run_state
+    if st.resource_registered:
+        return
+    resource = st.resource
+    assert resource is not None                 # guaranteed by the trigger validation
+    fields = resource_state_fields(run, ResourceState.PENDING_APPROVAL)
+    if st.operation is ResourceOperation.CREATE:          # the operation lives on the run
+        resource.vendor_id = str(run.run_id)    # the run id is the new resource's identity
+        body = resource.model_dump(exclude={"project_id", "resource_type"}) | fields | {
+            "last_modified_by": run.created_by}
+        await resource_client.create_resource(
+            project_id=resource.project_id, resource_type=resource.resource_type, body=body,
+            # Still the configuring_resource key, as before registration existed: a create that
+            # an older run already sent under it dedups instead of landing twice.
+            idempotency_key=idem_key(run, StepName.CONFIGURE_RESOURCE))
+    else:                                       # update / delete — the record exists; the
+        await resource_client.update_resource(  # change itself lands at finalize
+            resource.project_id, resource.resource_type, resource.vendor_id, fields)
+    st.resource_registered = True
+
+
+class RegisterResourceStep(StepHandler):
+    """Runs right after the ticket, before the approval gate, so the portal shows the request
+    PENDING_APPROVAL for as long as a human takes to decide."""
+
+    def __init__(self, resource_client: ResourceManagerClient) -> None:
+        self.resource_client = resource_client
+
+    async def execute(self, run: WorkflowRun) -> bool:
+        await register_resource(self.resource_client, run)
+        return True
+
+
+class AwaitApprovalStep(StepHandler):
+    """Poll the RITM's approval; never blocks a worker. Pending → False (re-driven a poll interval
+    later); rejected → RunRejected, a clean terminal stop (no retry, no incident)."""
+
+    poll_interval_seconds = 30.0
+    max_step_duration_seconds = 7 * 24 * 3600    # a human has ~7 days to approve
+
+    def __init__(self, ticket_client: TicketSystemClient) -> None:
+        self.ticket_client = ticket_client
+
+    async def execute(self, run: WorkflowRun) -> bool:
+        st = run.run_state
+        assert st.ticket is not None             # CREATE_TICKET ran first
+        status = await self.ticket_client.get_approval_status(st.ticket)
+        if status is ApprovalStatus.REJECTED:
+            raise RunRejected(f"Ticket {st.ticket.ticket_id} was rejected.")
+        return status is ApprovalStatus.APPROVED
+
+
+# The state an approved operation puts its record in while the engine does the work.
+OPERATION_STATES: dict[ResourceOperation, ResourceState] = {
+    ResourceOperation.CREATE: ResourceState.PROVISIONING,
+    ResourceOperation.UPDATE: ResourceState.UPDATING,
+    ResourceOperation.DELETE: ResourceState.DELETING,
+}
+
+
 class ConfigureResourceStep(StepHandler):
+    """The RITM is approved: mark the record PROVISIONING / UPDATING / DELETING. Idempotent on
+    resource_configured."""
+
     def __init__(self, resource_client: ResourceManagerClient) -> None:
         self.resource_client = resource_client
 
@@ -131,19 +248,15 @@ class ConfigureResourceStep(StepHandler):
         st = run.run_state
         if st.resource_configured:
             return True
+        # A no-op for every run planned with registering_resource. A run already past that point
+        # when the step was added (e.g. a CREATE awaiting approval at deploy) registers here, so
+        # its record still gets created.
+        await register_resource(self.resource_client, run)
         resource = st.resource
-        assert resource is not None             # guaranteed by the trigger validation
-        if st.operation is ResourceOperation.CREATE:      # the operation lives on the run
-            resource.vendor_id = str(run.run_id)  # the run id is the new resource's identity
-            body = resource.model_dump(exclude={"project_id", "resource_type"}) | {
-                "in_progress": True, "last_modified_by": run.created_by}
-            await self.resource_client.create_resource(
-                project_id=resource.project_id, resource_type=resource.resource_type,
-                body=body, idempotency_key=idem_key(run, StepName.CONFIGURE_RESOURCE))
-        else:                                   # update / delete — record exists; mark in-progress
-            await self.resource_client.update_resource(   # the change itself lands at finalize
-                resource.project_id, resource.resource_type, resource.vendor_id,
-                {"in_progress": True})
+        assert resource is not None
+        await self.resource_client.update_resource(
+            resource.project_id, resource.resource_type, resource.vendor_id,
+            resource_state_fields(run, OPERATION_STATES[st.operation]))
         st.resource_configured = True
         return True
 
@@ -205,8 +318,8 @@ class RunEngineStep(StepHandler):
 
 class FinalizeResourceStep(StepHandler):
     """Apply the run's outcome to the resource record (resource runs only), now that the engine
-    has done the real work: a CREATE/UPDATE clears in-progress — and an UPDATE also writes the
-    spec as the record's new state — while a DELETE removes the record. Idempotent on
+    has done the real work: a CREATE/UPDATE marks it READY — and an UPDATE also writes the spec as
+    the record's new state — while a DELETE marks it DELETED and then removes it. Idempotent on
     resource_finalized; a no-op if the run has no resource."""
 
     def __init__(self, resource_client: ResourceManagerClient) -> None:
@@ -217,24 +330,33 @@ class FinalizeResourceStep(StepHandler):
         if st.resource is None or st.resource_finalized:
             return True
         resource = st.resource
-        # The record lives where ConfigureResourceStep created/targeted it (resource.vendor_id —
-        # the run id for a CREATE).
+        # The record lives where registration created/targeted it (resource.vendor_id — the run
+        # id for a CREATE).
         if st.operation is ResourceOperation.DELETE:
-            await self.resource_client.delete_resource(
+            try:    # DELETED first: once the provider retires records instead of removing them,
+                    # the retained record already reads DELETED — no orchestrator change needed
+                await self.resource_client.update_resource(
+                    resource.project_id, resource.resource_type, resource.vendor_id,
+                    resource_state_fields(run, ResourceState.DELETED))
+            except ResourceNotFoundError:        # a re-drive after the delete already landed
+                pass
+            await self.resource_client.delete_resource(      # tolerates an already-gone record
                 resource.project_id, resource.resource_type, resource.vendor_id)
         else:
+            fields = self._finalize_fields(run, resource)
             await self.resource_client.update_resource(
-                resource.project_id, resource.resource_type, resource.vendor_id,
-                self._finalize_fields(run, resource))
+                resource.project_id, resource.resource_type, resource.vendor_id, fields)
+            if "vendor_id" in fields:            # re-keyed: follow the record, so a lookup by
+                resource.vendor_id = fields["vendor_id"]   # ?resource_id=<real id> finds the run
         st.resource_finalized = True
         return True
 
     def _finalize_fields(self, run: WorkflowRun, resource: ResourceSpec) -> dict[str, Any]:
-        """Always in_progress=False; for an UPDATE also the spec's own fields — the spec is the
-        record's *desired state*, as on a CREATE, so a caller sends the whole thing, not a delta.
-        If the engine reported the id it provisioned (final_vendor_id), re-key to it — for a
+        """Always the READY state fields; for an UPDATE also the spec's own fields — the spec is
+        the record's *desired state*, as on a CREATE, so a caller sends the whole thing, not a
+        delta. If the engine reported the id it provisioned (final_vendor_id), re-key to it — for a
         CREATE that replaces the run-id placeholder with the real vendor id."""
-        fields: dict[str, Any] = {"in_progress": False}
+        fields = resource_state_fields(run, ResourceState.READY)
         if run.run_state.operation is ResourceOperation.UPDATE:
             fields |= resource.model_dump(
                 exclude={"project_id", "resource_type", "vendor_id"}) | {
@@ -346,13 +468,25 @@ that exhausted its retries, a step that blew its deadline — keeps the older be
 the default team, work note, ticket left open). That is the only branch, and it is transitional:
 those failures move onto the policy table by raising `StepFailure` with a kind.
 
+The escalator also owns the **resource side** of a run that ends without finalizing — the last two
+rows of the [lifecycle table](#the-resource-records-lifecycle-state). `escalate` marks the record
+`FAILED` after the ticket work; `reject` (called by the executor's `_reject`) deletes a `create`'s
+placeholder record or returns an `update`/`delete`'s record to `READY`. The ticket side and the
+resource side are guarded **separately** — a Project Manager outage never blocks the Incident, and
+a ServiceNow outage never blocks the record update — and neither method raises. Both are no-ops
+for an automation run, for a run that never registered its resource (or, for a run from before
+registration existed, never configured it), and for a run whose resource was already finalized.
+Marking `FAILED` is not a rollback: whatever the engine did or half-did stays as it is.
+
 ```python
 class FailureEscalator:
-    """Runs once, when a run transitions to FAILED, and never raises — escalation must not crash
-    the worker. There is no rollback afterwards."""
+    """Runs once, when a run transitions to FAILED (escalate) or REJECTED (reject), and never
+    raises — escalation must not crash the worker. There is no rollback afterwards."""
 
-    def __init__(self, ticket_client: TicketSystemClient, default_team: str) -> None:
+    def __init__(self, ticket_client: TicketSystemClient,
+                 resource_client: ResourceManagerClient, default_team: str) -> None:
         self.ticket = ticket_client
+        self.resources = resource_client
         self.default_team = default_team
 
     async def escalate(self, run: WorkflowRun, error: Exception) -> None:
@@ -363,6 +497,48 @@ class FailureEscalator:
                 await self._escalate_unclassified(run, error)
         except Exception as e:      # never let escalation crash the worker
             logger.exception("Failed to escalate run %s failure: %s", run.run_id, e)
+        await self._mark_resource_failed(run)                   # guarded on its own
+
+    async def reject(self, run: WorkflowRun) -> None:
+        """Release the resource a rejected request registered: a CREATE's placeholder record is
+        deleted (nothing was provisioned); an UPDATE/DELETE's resource goes back to READY, exactly
+        as it was. Never raises."""
+        resource = self._resource_in_flight(run)
+        if resource is None:
+            return
+        try:
+            if run.run_state.operation is ResourceOperation.CREATE:
+                await self.resources.delete_resource(
+                    resource.project_id, resource.resource_type, resource.vendor_id)
+            else:
+                await self.resources.update_resource(
+                    resource.project_id, resource.resource_type, resource.vendor_id,
+                    resource_state_fields(run, ResourceState.READY))
+        except Exception as e:      # never let escalation crash the worker
+            logger.exception("Failed to release resource for rejected run %s: %s", run.run_id, e)
+
+    async def _mark_resource_failed(self, run: WorkflowRun) -> None:
+        resource = self._resource_in_flight(run)
+        if resource is None:
+            return
+        try:
+            await self.resources.update_resource(
+                resource.project_id, resource.resource_type, resource.vendor_id,
+                resource_state_fields(run, ResourceState.FAILED))
+        except Exception as e:      # a PM outage must not undo the ticket-side escalation
+            logger.exception("Failed to mark resource FAILED for run %s: %s", run.run_id, e)
+
+    @staticmethod
+    def _resource_in_flight(run: WorkflowRun) -> ResourceSpec | None:
+        """The resource this run registered (or, for a run from before registration existed,
+        configured) and did not finalize — else None. A run that fails after finalize left its
+        resource READY, which is the truth."""
+        st = run.run_state
+        if st.resource is None or st.resource_finalized:
+            return None
+        if not (st.resource_registered or st.resource_configured):
+            return None
+        return st.resource
 
     async def _escalate_by_policy(self, run: WorkflowRun, error: StepFailure,
                                   policy: FailurePolicy) -> None:
@@ -406,8 +582,10 @@ retrying only hides them for longer. Two details that matter:
   Incident is the part a human acts on; losing the `FAILED` write is survivable, losing the
   Incident is not.
 
-A `RunRejected` is not a failure and never reaches this path: the run ends `REJECTED`, with no
-Incident.
+A `RunRejected` is not a failure and never reaches this path: `_drive` catches it and hands the run
+to `_reject`, which ends it `REJECTED` with no retry and no Incident. Before saving, `_reject` calls
+`escalator.reject(run)` so the resource record registration wrote does not keep advertising a
+pending request (see [the escalator](#orchestrationescalatorpy--the-failure-model)).
 
 Given a `run_id`, load the run, advance it through as many synchronous steps as possible this
 wake-up, and either complete it, schedule it for a later poll/retry (by setting `scheduled_at` —
@@ -421,8 +599,8 @@ import uuid
 from datetime import timedelta
 
 from orchestrator.config import Settings
-from orchestrator.domain import (RunStatus, StaleRunError, StepDeadlineExceeded, StepName,
-                                 WorkflowRun, utcnow)
+from orchestrator.domain import (RunRejected, RunStatus, StaleRunError, StepDeadlineExceeded,
+                                 StepName, WorkflowRun, utcnow)
 from orchestrator.orchestration.escalator import FailureEscalator
 from orchestrator.orchestration.plans import RUN_PLANS
 from orchestrator.orchestration.steps import StepHandler
@@ -465,6 +643,9 @@ class RunExecutor:
                 if utcnow() - started > timedelta(seconds=handler.max_step_duration_seconds):
                     raise StepDeadlineExceeded(f"Step {step} exceeded its wall-clock budget")
                 done = await handler.execute(run)
+            except RunRejected as rejection:         # denied in the ticket system — not a failure
+                await self._reject(run, step, rejection)
+                return
             except Exception as error:
                 await self._on_step_error(run, step, handler, error)
                 return
@@ -511,6 +692,15 @@ class RunExecutor:
         logger.critical("Run %s step %s exhausted retries: %s — marked FAILED.",
                         run.run_id, step, error)
 
+    async def _reject(self, run: WorkflowRun, step: StepName, rejection: RunRejected) -> None:
+        # A clean terminal stop: no retry, no rollback, no incident (the RITM carries the
+        # rejection). The escalator releases the resource record first; it never raises.
+        run.run_state.errors[step] = str(rejection)
+        run.status, run.scheduled_at = RunStatus.REJECTED, None
+        await self.escalator.reject(run)
+        await self._save(run)
+        logger.info("Run %s REJECTED at step %s: %s", run.run_id, step, rejection)
+
     async def _schedule(self, run: WorkflowRun, delay: float) -> None:
         run.scheduled_at = utcnow() + timedelta(seconds=delay)   # a worker re-drives when due
         await self._save(run)
@@ -530,7 +720,8 @@ class RunExecutor:
   are deleted** — four classes that encoded two lists. `RUN_PLANS` is the same information as a
   dict literal, and the handler registry is one function.
 - **Finalization is two focused, single-client steps**: `FinalizeResourceStep` (resource runs
-  only — marks the resource provisioned) and `CloseTicketStep` (closes the RITM). Each guards on
+  only — marks the record `READY`, or `DELETED` and removes it) and `CloseTicketStep` (closes the
+  RITM). Each guards on
   its own idempotency marker (`resource_finalized` / `ticket_closed`), so a re-drive resumes at the
   exact step that hadn't finished.
 - **No webhook branches** in `RunEngineStep` — the `*_completed`-via-callback checks are gone;

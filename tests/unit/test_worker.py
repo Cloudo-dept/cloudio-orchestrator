@@ -108,7 +108,7 @@ async def test_worker_drives_a_real_run_to_completion(
 ) -> None:
     handlers = build_handlers(tickets, resources, {WorkflowEngineType.AIRFLOW: engine})
     handlers[StepName.RUN_ENGINE].poll_interval_seconds = 0  # re-drive immediately
-    escalator = FailureEscalator(tickets, "cloudio")
+    escalator = FailureEscalator(tickets, resources, "cloudio")
     executor = RunExecutor(handlers, runs, settings, escalator)
     run = await runs.create(make_run(run_type=RunType.AUTOMATION))
     worker = RunWorker(runs, executor, poll_interval_seconds=0.01, lease_seconds=300)

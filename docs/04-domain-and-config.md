@@ -95,6 +95,7 @@ class RunStatus(str, Enum):
     RUNNING = "running"       # being driven, or waiting on a scheduled poll/retry (scheduled_at)
     COMPLETED = "completed"   # terminal: all steps done
     FAILED = "failed"         # terminal: a step exhausted its retries (no rollback)
+    REJECTED = "rejected"     # terminal: request denied in the ticket system (no incident)
 
 
 class WorkflowEngineType(str, Enum):
@@ -103,9 +104,11 @@ class WorkflowEngineType(str, Enum):
 
 class StepName(str, Enum):
     CREATE_TICKET = "creating_ticket"
-    CONFIGURE_RESOURCE = "configuring_resource"       # create/mark-in-progress the resource
+    REGISTER_RESOURCE = "registering_resource"  # create/mark the record PENDING_APPROVAL
+    AWAIT_APPROVAL = "awaiting_approval"        # wait for the ticket to be approved
+    CONFIGURE_RESOURCE = "configuring_resource" # mark the record PROVISIONING/UPDATING/DELETING
     RUN_ENGINE = "running_engine"
-    FINALIZE_RESOURCE = "finalizing_resource"   # mark the resource operation done
+    FINALIZE_RESOURCE = "finalizing_resource"   # apply the outcome: READY, or DELETED + remove
     CLOSE_TICKET = "closing_ticket"             # close out the RITM
 
 
@@ -148,6 +151,17 @@ class StepDeadlineExceeded(Exception):
     """A step ran past its overall wall-clock budget across all polls."""
 
 
+class RunRejected(Exception):
+    """A gating step (AWAIT_APPROVAL) reported the request was denied; the run stops terminally
+    as REJECTED, without retry or incident."""
+
+
+class ResourceNotFoundError(Exception):
+    """The resource manager has no record at that identity. Raised by
+    ResourceManagerClient.update_resource (Project Manager: a PATCH answered 404), so a caller can
+    tell "already gone" from a real failure — e.g. a re-driven DELETE finalize."""
+
+
 class UnknownWorkflowError(Exception):
     """Trigger named a workflow identifier that is not registered."""
 
@@ -173,11 +187,27 @@ class ResourceOperation(str, Enum):
     DELETE = "delete"         # act on an existing record
 
 
+class ResourceState(str, Enum):
+    """The lifecycle state written to the resource record's `state` field, so a portal reading the
+    record sees where the request is (see 07-orchestration for the transitions). The values are
+    the literal strings on the record. Always written together with `in_progress` — true exactly
+    for the four in-flight states — and `last_run_id`, the run that set it."""
+    PENDING_APPROVAL = "PENDING_APPROVAL"   # registered; the ticket awaits approval
+    PROVISIONING = "PROVISIONING"           # approved CREATE, engine at work
+    UPDATING = "UPDATING"                   # approved UPDATE, engine at work
+    DELETING = "DELETING"                   # approved DELETE, engine at work
+    READY = "READY"                         # finalized — or an UPDATE/DELETE was rejected
+    FAILED = "FAILED"                       # the run failed; nothing rolled back
+    DELETED = "DELETED"                     # a DELETE finalized (the record is then removed)
+
+
 class ResourceSpec(BaseModel):
     """The resource a resource run acts on (Project Manager fields)."""
     project_id: str
     resource_type: str
-    vendor_id: str = ""       # resource identity; a CREATE is assigned the run id when configured,
+    vendor_id: str = ""       # resource identity; a CREATE is assigned the run id when registered
+                              # (RegisterResourceStep), then re-keyed at finalize if the engine
+                              # reported its own id;
                               # an UPDATE/DELETE REQUIRES the caller's (checked at trigger time,
                               # where the operation is known)
     name: str
@@ -226,7 +256,8 @@ class RunState(BaseModel):
     # step progress / idempotency markers
     ticket: TicketRef | None = None
     engine_run_id: str | None = None
-    resource_configured: bool = False
+    resource_registered: bool = False      # record created/marked PENDING_APPROVAL
+    resource_configured: bool = False      # record marked in flight (after approval)
     resource_finalized: bool = False
     ticket_closed: bool = False
 

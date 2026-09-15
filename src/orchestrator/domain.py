@@ -45,8 +45,10 @@ class WorkflowEngineType(str, Enum):
 
 class StepName(str, Enum):
     CREATE_TICKET = "creating_ticket"
+    # create the record, or mark an existing one, as pending approval — visible while it waits
+    REGISTER_RESOURCE = "registering_resource"
     AWAIT_APPROVAL = "awaiting_approval"  # wait for the ticket to be approved before provisioning
-    # create the record, or mark an existing one in-progress, for the resource operation
+    # mark the resource with the approved operation's in-flight state
     CONFIGURE_RESOURCE = "configuring_resource"
     RUN_ENGINE = "running_engine"
     FINALIZE_RESOURCE = "finalizing_resource"  # mark the resource operation done
@@ -63,6 +65,22 @@ class ResourceOperation(str, Enum):
     CREATE = "create"
     UPDATE = "update"
     DELETE = "delete"
+
+
+class ResourceState(str, Enum):
+    """Where a resource stands, as its record advertises it to the people who own it. Written by
+    the resource steps as a run moves forward, and by the escalator when a run ends badly — so a
+    record never keeps advertising a run that is over.
+
+    The values are the literal strings the resource record carries."""
+
+    PENDING_APPROVAL = "PENDING_APPROVAL"  # a request against it is waiting for approval
+    PROVISIONING = "PROVISIONING"  # an approved CREATE is being carried out
+    UPDATING = "UPDATING"  # an approved UPDATE is being carried out
+    DELETING = "DELETING"  # an approved DELETE is being carried out
+    READY = "READY"  # no run is working on it
+    FAILED = "FAILED"  # the last run on it failed (nothing is rolled back)
+    DELETED = "DELETED"  # a DELETE finished; the provider removes or retires the record
 
 
 class EngineRunStatus(str, Enum):
@@ -146,6 +164,10 @@ class ResourceVendorIdRequired(Exception):
     """An UPDATE/DELETE was triggered without the vendor_id of the record it acts on."""
 
 
+class ResourceNotFoundError(Exception):
+    """The resource manager has no record under the given identity."""
+
+
 class TicketRefRequired(Exception):
     """An automation workflow was triggered without a reference to its pre-existing ticket."""
 
@@ -166,7 +188,7 @@ class ResourceSpec(BaseModel):
 
     project_id: str
     resource_type: str
-    # Resource identity. Callers do NOT set this for a CREATE — ConfigureResourceStep assigns the
+    # Resource identity. Callers do NOT set this for a CREATE — RegisterResourceStep assigns the
     # run id as the new record's identity. REQUIRED from the caller on an UPDATE/DELETE, which
     # target a record that already exists (enforced at trigger time, where the operation is known).
     vendor_id: str = ""
@@ -228,6 +250,7 @@ class RunState(BaseModel):
     # step progress / idempotency markers
     ticket: TicketRef | None = None
     engine_run_id: str | None = None
+    resource_registered: bool = False
     resource_configured: bool = False
     resource_finalized: bool = False
     ticket_closed: bool = False

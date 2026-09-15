@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from orchestrator.adapters.project_manager import ProjectManagerResourceClient
+from orchestrator.domain import ResourceNotFoundError
 from tests.mocks.base import Override
 from tests.mocks.project_manager import ProjectManagerMock
 
@@ -33,6 +34,14 @@ async def test_finalize_patches_in_progress_false(
     await pm_client.update_resource("proj-1", "vm", "vm-1", {"in_progress": False})
     assert project_manager.patches[-1] == {"vendor_id": "vm-1", "in_progress": False}
     assert project_manager.resources["proj-1/vm/vm-1"]["in_progress"] is False
+
+
+async def test_update_resource_on_a_missing_record_raises_not_found(
+    project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    with pytest.raises(ResourceNotFoundError):
+        await pm_client.update_resource("proj-1", "vm", "vm-missing", {"state": "DELETED"})
+    assert project_manager.patches == []
 
 
 async def test_delete_resource_removes_the_record(

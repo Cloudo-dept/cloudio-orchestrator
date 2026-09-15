@@ -30,6 +30,7 @@ from orchestrator.orchestration.steps import (
     ConfigureResourceStep,
     CreateTicketStep,
     FinalizeResourceStep,
+    RegisterResourceStep,
     StepHandler,
     engine_run_key,
     idem_key,
@@ -53,7 +54,7 @@ def build_executor(
     incident_team: str = "cloudio",
 ) -> tuple[RunExecutor, dict[StepName, StepHandler]]:
     handlers = build_handlers(tickets, resources, {WorkflowEngineType.AIRFLOW: engine})
-    escalator = FailureEscalator(tickets, incident_team)
+    escalator = FailureEscalator(tickets, resources, incident_team)
     return RunExecutor(handlers, runs, settings, escalator), handlers
 
 
@@ -68,6 +69,11 @@ async def drive(
             return run
         await executor.handle(run_id)
     return await runs.get(run_id)
+
+
+def state_fields(run_id: uuid.UUID, state: str, *, in_progress: bool) -> dict[str, Any]:
+    """What every resource state change writes."""
+    return {"state": state, "in_progress": in_progress, "last_run_id": str(run_id)}
 
 
 class FlakyTicketClient(FakeTicketSystemClient):
@@ -118,13 +124,22 @@ async def test_resource_run_completes_and_finalizes(
 
     assert final.status is RunStatus.COMPLETED
     assert len(resources.create_calls) == 1
+    assert final.run_state.resource_registered is True
     assert final.run_state.resource_configured is True
     assert final.run_state.resource_finalized is True
-    # A CREATE assigns the run id as the resource's vendor id when configured...
+    # A CREATE assigns the run id as the resource's vendor id when registered...
     assert final.run_state.resource is not None
     assert final.run_state.resource.vendor_id == str(run.run_id)
-    # ...and finalize PATCHes in_progress=False on that resource, then closes the RITM.
-    assert resources.updated[-1] == ("proj-1", "vm", str(run.run_id), {"in_progress": False})
+    # ...marks it PROVISIONING once approved and READY at finalize, then closes the RITM.
+    assert resources.updated == [
+        (
+            "proj-1",
+            "vm",
+            str(run.run_id),
+            state_fields(run.run_id, "PROVISIONING", in_progress=True),
+        ),
+        ("proj-1", "vm", str(run.run_id), state_fields(run.run_id, "READY", in_progress=False)),
+    ]
     assert tickets.closed and tickets.closed[0][1] == "Resource create completed; request closed."
 
 
@@ -140,8 +155,17 @@ async def test_delete_resource_run_removes_the_record_end_to_end(
 
     assert final.status is RunStatus.COMPLETED
     assert resources.create_calls == []  # a delete provisions nothing
-    # Configure marks the caller's record in-progress; finalize removes it once the engine is done.
-    assert resources.updated == [("proj-1", "vm", "vm-1", {"in_progress": True})]
+    # The caller's record goes PENDING_APPROVAL → DELETING → DELETED, and is then removed.
+    assert resources.updated == [
+        (
+            "proj-1",
+            "vm",
+            "vm-1",
+            state_fields(created.run_id, "PENDING_APPROVAL", in_progress=True),
+        ),
+        ("proj-1", "vm", "vm-1", state_fields(created.run_id, "DELETING", in_progress=True)),
+        ("proj-1", "vm", "vm-1", state_fields(created.run_id, "DELETED", in_progress=False)),
+    ]
     assert resources.deleted == [("proj-1", "vm", "vm-1")]
     assert tickets.closed and tickets.closed[0][1] == "Resource delete completed; request closed."
 
@@ -242,6 +266,8 @@ async def test_permanent_failure_marks_failed_and_escalates(
 
     assert final.status is RunStatus.FAILED
     assert StepName.CREATE_TICKET in final.run_state.errors
+    # Failed before the resource was registered, so there is no resource to mark.
+    assert resources.create_calls == [] and resources.updated == []
     # Escalation opened an Incident routed to the default team (no engine failure detail).
     assert len(tickets.incidents) == 1
     assert tickets.incidents[0]["responsible_group"] == "cloudio"
@@ -501,7 +527,11 @@ async def test_resource_run_waits_while_approval_pending(
     assert mid.status is RunStatus.RUNNING
     assert mid.current_step == StepName.AWAIT_APPROVAL
     assert mid.scheduled_at is not None  # rescheduled for a later poll, worker released
-    assert resources.create_calls == []  # provisioning never started
+    # The request is already visible on its resource, but provisioning never started.
+    assert len(resources.create_calls) == 1
+    created = resources.created_by_key[resources.create_calls[0]]
+    assert created["state"] == "PENDING_APPROVAL" and created["in_progress"] is True
+    assert resources.updated == []  # never configured
 
 
 async def test_resource_run_rejection_terminates_without_incident(
@@ -517,13 +547,39 @@ async def test_resource_run_rejection_terminates_without_incident(
     assert final.scheduled_at is None
     assert StepName.AWAIT_APPROVAL in final.run_state.errors
     assert tickets.incidents == []  # a rejection is not a failure — no escalation
-    assert resources.create_calls == []  # nothing was provisioned
+    # The placeholder record registered for the request is removed: nothing was provisioned.
+    assert len(resources.create_calls) == 1
+    assert resources.deleted == [("proj-1", "vm", str(run.run_id))]
+    assert resources.updated == []
 
 
-def test_approval_gate_follows_ticket_for_resource_runs() -> None:
-    # Resource runs wait for approval right after the ticket; automation runs do not gate.
-    assert RUN_PLANS[RunType.RESOURCE][:2] == (StepName.CREATE_TICKET, StepName.AWAIT_APPROVAL)
+async def test_rejected_update_leaves_the_resource_ready(
+    runs, tickets, resources, engine, settings
+) -> None:
+    tickets.approval_status = ApprovalStatus.REJECTED
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, operation=ResourceOperation.UPDATE))
+
+    final = await drive(runs, executor, run.run_id)
+
+    assert final.status is RunStatus.REJECTED
+    assert resources.deleted == []  # an existing resource is never deleted over a rejected change
+    assert resources.updated == [
+        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "PENDING_APPROVAL", in_progress=True)),
+        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "READY", in_progress=False)),
+    ]
+
+
+def test_resource_is_registered_before_the_approval_gate() -> None:
+    # Resource runs record the request against the resource right after the ticket, then wait for
+    # approval — so the request is visible while it waits. Automation runs do neither.
+    assert RUN_PLANS[RunType.RESOURCE][:3] == (
+        StepName.CREATE_TICKET,
+        StepName.REGISTER_RESOURCE,
+        StepName.AWAIT_APPROVAL,
+    )
     assert StepName.AWAIT_APPROVAL not in RUN_PLANS[RunType.AUTOMATION]
+    assert StepName.REGISTER_RESOURCE not in RUN_PLANS[RunType.AUTOMATION]
 
 
 def test_automation_plan_has_no_create_ticket_step() -> None:
@@ -541,19 +597,22 @@ def test_finalize_is_two_ordered_steps() -> None:
     assert StepName.FINALIZE_RESOURCE not in RUN_PLANS[RunType.AUTOMATION]
 
 
-async def test_begin_resource_step_create_assigns_run_id_as_vendor_id(resources) -> None:
-    step = ConfigureResourceStep(resources)
+async def test_register_resource_step_create_assigns_run_id_as_vendor_id(resources) -> None:
+    step = RegisterResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE)  # resource op defaults to CREATE
 
     assert await step.execute(run) is True
-    assert run.run_state.resource_configured is True
-    # A CREATE provisions a new record whose vendor id is the run id, in_progress=True.
+    assert run.run_state.resource_registered is True
+    # A CREATE creates a new record whose vendor id is the run id, pending approval.
     assert run.run_state.resource is not None
     assert run.run_state.resource.vendor_id == str(run.run_id)
     assert len(resources.create_calls) == 1
     created = resources.created_by_key[resources.create_calls[0]]
     assert created["vendor_id"] == str(run.run_id)
+    assert created["state"] == "PENDING_APPROVAL"
     assert created["in_progress"] is True
+    assert created["last_run_id"] == str(run.run_id)
+    assert created["last_modified_by"] == "jdoe"
     assert resources.updated == []  # no PATCH — the record was created, not updated
 
     assert await step.execute(run) is True  # re-drive: marker short-circuits
@@ -576,45 +635,83 @@ def test_engine_run_key_is_fresh_per_attempt() -> None:
     assert engine_run_key(run) != before
 
 
-async def test_configure_resource_is_idempotent_across_attempts(resources) -> None:
+async def test_register_resource_is_idempotent_across_attempts(resources) -> None:
     # The user's example: if the resource already exists in the manager, re-running does NOT
     # create a duplicate — the stable key dedups even when the marker was lost and the attempt
     # advanced (a crash mid-step, then a retry).
-    step = ConfigureResourceStep(resources)
+    step = RegisterResourceStep(resources)
     run = make_run(run_type=RunType.RESOURCE)  # CREATE
 
     assert await step.execute(run) is True
     assert len(resources.created_by_key) == 1
 
-    run.run_state.resource_configured = False  # marker lost before it was persisted
-    run.run_state.step_attempts[StepName.CONFIGURE_RESOURCE] = 1  # ...and the step retried
+    run.run_state.resource_registered = False  # marker lost before it was persisted
+    run.run_state.step_attempts[StepName.REGISTER_RESOURCE] = 1  # ...and the step retried
     assert await step.execute(run) is True
     assert len(resources.create_calls) == 2  # the provider was called again...
     assert len(resources.created_by_key) == 1  # ...but deduped to a SINGLE resource
 
 
-async def test_begin_resource_step_update_only_marks_in_progress(resources) -> None:
-    step = ConfigureResourceStep(resources)
-    run = make_run(run_type=RunType.RESOURCE)
-    run.run_state.operation = ResourceOperation.UPDATE
+@pytest.mark.parametrize("operation", [ResourceOperation.UPDATE, ResourceOperation.DELETE])
+async def test_register_resource_step_marks_an_existing_record_pending(
+    operation, resources
+) -> None:
+    step = RegisterResourceStep(resources)
+    run = make_run(run_type=RunType.RESOURCE, operation=operation)
 
     assert await step.execute(run) is True
-    assert run.run_state.resource_configured is True
-    # An UPDATE acts on an existing record — no create, just in_progress=True on the caller's id.
+    assert run.run_state.resource_registered is True
+    # An UPDATE/DELETE acts on an existing record — no create, only its state on the caller's id.
     assert resources.create_calls == []
-    assert resources.updated == [("proj-1", "vm", "vm-1", {"in_progress": True})]
+    assert resources.updated == [
+        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "PENDING_APPROVAL", in_progress=True))
+    ]
     assert run.run_state.resource is not None
     assert run.run_state.resource.vendor_id == "vm-1"  # left untouched
 
 
-async def test_begin_resource_step_delete_only_marks_in_progress(resources) -> None:
+@pytest.mark.parametrize(
+    ("operation", "state"),
+    [
+        (ResourceOperation.CREATE, "PROVISIONING"),
+        (ResourceOperation.UPDATE, "UPDATING"),
+        (ResourceOperation.DELETE, "DELETING"),
+    ],
+)
+async def test_configure_resource_step_marks_the_operation_in_flight(
+    operation, state, resources
+) -> None:
     step = ConfigureResourceStep(resources)
-    run = make_run(run_type=RunType.RESOURCE)
-    run.run_state.operation = ResourceOperation.DELETE
+    run = make_run(run_type=RunType.RESOURCE, operation=operation)
+    run.run_state.resource_registered = True  # REGISTER_RESOURCE already ran
 
     assert await step.execute(run) is True
+    assert run.run_state.resource_configured is True
     assert resources.create_calls == []
-    assert resources.updated == [("proj-1", "vm", "vm-1", {"in_progress": True})]
+    assert resources.updated == [
+        ("proj-1", "vm", "vm-1", state_fields(run.run_id, state, in_progress=True))
+    ]
+    assert await step.execute(run) is True  # re-drive: marker short-circuits
+    assert len(resources.updated) == 1
+
+
+async def test_configure_resource_registers_a_run_from_before_the_register_step(resources) -> None:
+    # A CREATE that was waiting for approval when REGISTER_RESOURCE joined the plan has no record
+    # yet: configure creates it first — under the key the create always used — then marks it.
+    step = ConfigureResourceStep(resources)
+    run = make_run(run_type=RunType.RESOURCE)
+
+    assert await step.execute(run) is True
+    assert resources.create_calls == [idem_key(run, StepName.CONFIGURE_RESOURCE)]
+    assert run.run_state.resource_registered is True
+    assert resources.updated == [
+        (
+            "proj-1",
+            "vm",
+            str(run.run_id),
+            state_fields(run.run_id, "PROVISIONING", in_progress=True),
+        )
+    ]
 
 
 async def test_finalize_resource_step(resources) -> None:
@@ -624,11 +721,13 @@ async def test_finalize_resource_step(resources) -> None:
     assert await step.execute(make_run(run_type=RunType.AUTOMATION)) is True
     assert resources.updated == []
 
-    # Resource run → PATCHes in_progress=False once, idempotent on the marker.
+    # Resource run → PATCHes READY once, idempotent on the marker.
     run = make_run(run_type=RunType.RESOURCE)
     assert await step.execute(run) is True
     assert run.run_state.resource_finalized is True
-    assert resources.updated == [("proj-1", "vm", "vm-1", {"in_progress": False})]
+    assert resources.updated == [
+        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "READY", in_progress=False))
+    ]
     assert await step.execute(run) is True  # re-drive: marker short-circuits
     assert len(resources.updated) == 1
 
@@ -641,7 +740,7 @@ async def test_finalize_resource_step_update_writes_the_spec_as_desired_state(re
     assert await step.execute(run) is True
     assert run.run_state.resource_finalized is True
     # The engine has done the real work, so the record now takes the spec's own fields — not just
-    # in_progress=False. vendor_id is the target, not a field, so it is not in the body.
+    # the READY state. vendor_id is the target, not a field, so it is not in the body.
     assert resources.deleted == []
     assert resources.updated == [
         (
@@ -649,7 +748,7 @@ async def test_finalize_resource_step_update_writes_the_spec_as_desired_state(re
             "vm",
             "vm-1",
             {
-                "in_progress": False,
+                **state_fields(run.run_id, "READY", in_progress=False),
                 "name": "app-01",
                 "region": "gvt",
                 "environment": "prod",
@@ -670,10 +769,25 @@ async def test_finalize_resource_step_delete_removes_the_record(resources) -> No
 
     assert await step.execute(run) is True
     assert run.run_state.resource_finalized is True
+    # Marked DELETED first — a provider that retires records keeps one that says so — then deleted.
+    assert resources.updated == [
+        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "DELETED", in_progress=False))
+    ]
     assert resources.deleted == [("proj-1", "vm", "vm-1")]
-    assert resources.updated == []  # a delete does not clear in_progress — the record is gone
     assert await step.execute(run) is True  # re-drive: marker short-circuits
     assert len(resources.deleted) == 1
+
+
+async def test_finalize_delete_carries_on_when_the_record_is_already_gone(resources) -> None:
+    # A re-drive after the delete landed but before the marker was saved: there is no record left
+    # to mark DELETED, which is the delete having happened — not a failure.
+    step = FinalizeResourceStep(resources)
+    run = make_run(run_type=RunType.RESOURCE, operation=ResourceOperation.DELETE)
+    resources.missing.add("vm-1")
+
+    assert await step.execute(run) is True
+    assert run.run_state.resource_finalized is True
+    assert resources.deleted == [("proj-1", "vm", "vm-1")]
 
 
 async def test_close_ticket_step(tickets) -> None:
@@ -702,16 +816,18 @@ async def test_engine_final_vendor_id_overrides_finalize_target(
 
     assert final.status is RunStatus.COMPLETED
     # The engine-reported id lands in the RUN_ENGINE step result. Finalize PATCHes the record where
-    # it was created (the run id) and re-keys it to the engine-reported id as it marks it done.
-    assert final.run_state.resource is not None
-    assert final.run_state.resource.vendor_id == str(run.run_id)  # placeholder preserved
+    # it was created (the run id) and re-keys it to the engine-reported id as it marks it READY.
     assert final.run_state.step_results[StepName.RUN_ENGINE].final_vendor_id == "vm-engine-99"
     assert resources.updated[-1] == (
         "proj-1",
         "vm",
         str(run.run_id),
-        {"in_progress": False, "vendor_id": "vm-engine-99"},
+        {**state_fields(run.run_id, "READY", in_progress=False), "vendor_id": "vm-engine-99"},
     )
+    # The run follows the record to its real id, so looking runs up by that id finds this one.
+    assert final.run_state.resource is not None
+    assert final.run_state.resource.vendor_id == "vm-engine-99"
+    assert [r.run_id for r in await runs.find_by_resource_id("vm-engine-99")] == [run.run_id]
 
 
 async def test_finalize_falls_back_to_original_vendor_id(
@@ -724,6 +840,123 @@ async def test_finalize_falls_back_to_original_vendor_id(
 
     final = await drive(runs, executor, run.run_id)
 
-    assert resources.updated[-1] == ("proj-1", "vm", str(run.run_id), {"in_progress": False})
+    assert resources.updated[-1] == (
+        "proj-1",
+        "vm",
+        str(run.run_id),
+        state_fields(run.run_id, "READY", in_progress=False),
+    )
     assert final.run_state.resource is not None
     assert StepName.RUN_ENGINE not in final.run_state.step_results
+
+
+# --- A run that ends badly releases the resource it left in flight ---
+
+
+class ResourceManagerDownOnFailure(FakeResourceManagerClient):
+    """The resource manager is unreachable by the time a failed run's resource is marked."""
+
+    async def update_resource(
+        self, project_id: str, resource_type: str, vendor_id: str, fields: dict[str, Any]
+    ) -> None:
+        if fields.get("state") == "FAILED":
+            raise RuntimeError("Project Manager unavailable")
+        await super().update_resource(project_id, resource_type, vendor_id, fields)
+
+
+class IncidentsDownTicketClient(FakeTicketSystemClient):
+    """The ticket system cannot open incidents."""
+
+    async def open_incident(
+        self,
+        summary: str,
+        requested_by: str,
+        responsible_group: str,
+        flow_type: str | None = None,
+        failed_task: str | None = None,
+        comment: str | None = None,
+        description: str | None = None,
+    ) -> TicketRef:
+        raise RuntimeError("ServiceNow unavailable")
+
+
+class CloseTicketDownClient(FakeTicketSystemClient):
+    """The ticket system cannot close tickets."""
+
+    async def close_ticket(
+        self,
+        ticket: TicketRef,
+        note: str | None = None,
+        outcome: TicketOutcome = TicketOutcome.SUCCESSFUL,
+    ) -> None:
+        raise RuntimeError("ServiceNow unavailable")
+
+
+async def test_failed_resource_run_marks_the_resource_failed(
+    runs, tickets, resources, settings
+) -> None:
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert len(tickets.incidents) == 1
+    # Nothing is rolled back: the record stays, marked FAILED and no longer in progress.
+    assert resources.updated[-1] == (
+        "proj-1",
+        "vm",
+        str(run.run_id),
+        state_fields(run.run_id, "FAILED", in_progress=False),
+    )
+    assert resources.deleted == []
+
+
+async def test_a_failure_after_finalize_leaves_the_resource_ready(
+    runs, resources, engine, settings
+) -> None:
+    # The resource was finalized before CLOSE_TICKET broke, so READY is the truth about it.
+    tickets = CloseTicketDownClient()
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert StepName.CLOSE_TICKET in final.run_state.errors
+    assert resources.updated[-1] == (
+        "proj-1",
+        "vm",
+        str(run.run_id),
+        state_fields(run.run_id, "READY", in_progress=False),
+    )
+
+
+async def test_a_resource_manager_outage_does_not_cost_the_incident(
+    runs, tickets, settings
+) -> None:
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    resources = ResourceManagerDownOnFailure()
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert len(tickets.incidents) == 1
+    assert tickets.closed[-1][2] is TicketOutcome.UNSUCCESSFUL
+
+
+async def test_a_ticket_system_outage_does_not_cost_the_resource_update(
+    runs, resources, settings
+) -> None:
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    tickets = IncidentsDownTicketClient()
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=0))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert resources.updated[-1][3] == state_fields(run.run_id, "FAILED", in_progress=False)

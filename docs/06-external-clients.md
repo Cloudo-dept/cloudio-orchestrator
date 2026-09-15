@@ -53,18 +53,21 @@ class ResourceManagerClient(abc.ABC):
     @abc.abstractmethod
     async def create_resource(self, project_id: str, resource_type: str,
                               body: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
-        """Create a project resource; body carries vendor_id/name/region/etc."""
+        """Create a project resource; body carries vendor_id/name/region/etc. plus the lifecycle
+        fields (state, in_progress, last_run_id)."""
 
     @abc.abstractmethod
     async def update_resource(self, project_id: str, resource_type: str, vendor_id: str,
                               fields: dict[str, Any]) -> None:
-        """Partial update (only changed fields) — e.g. in_progress=False on finalize."""
+        """Partial update (only changed fields) — e.g. state=READY, in_progress=False on finalize.
+        Raises ResourceNotFoundError when there is no record at that identity."""
 
     @abc.abstractmethod
     async def delete_resource(self, project_id: str, resource_type: str,
                               vendor_id: str) -> None:
-        """Remove a project resource. Idempotent: a record that is already gone is not an error,
-        so a re-driven finalize cannot fail on the strength of its own earlier success."""
+        """Delete a project resource — the provider may remove the record or retire it (keep it,
+        reading DELETED). Idempotent: a record that is already gone is not an error, so a
+        re-driven finalize cannot fail on the strength of its own earlier success."""
 
 
 class WorkflowEngineClient(abc.ABC):
@@ -474,11 +477,28 @@ class ServiceNowTicketClient(TicketSystemClient):
 
 ## `adapters/project_manager.py`
 
+**The record carries the request's lifecycle.** Besides the spec, every write the orchestrator
+makes to a record sends three fields together (see
+[07-orchestration](07-orchestration.md#the-resource-records-lifecycle-state)): `state` (a
+`ResourceState` value such as `PENDING_APPROVAL` or `READY`), `in_progress` (kept for existing
+readers; true exactly while the state is `PENDING_APPROVAL`/`PROVISIONING`/`UPDATING`/`DELETING`),
+and `last_run_id` — the portal reads it off the record and calls `GET /api/v1/workflow-runs/{run_id}`
+for the ticket, incident and failure detail. The adapter passes them through like any other field;
+only the orchestration layer knows what they mean.
+
+**Not found is a domain error on PATCH.** A PATCH answered `404` raises `ResourceNotFoundError`
+rather than an `HTTPStatusError`, so a re-driven DELETE finalize (whose `DELETED` PATCH hits a
+record its earlier attempt already removed) can tell "already gone" from a failure. DELETE itself
+still treats `404` as success. Today Project Manager *removes* a deleted record; a planned change
+makes it a soft delete, and since finalize PATCHes `state=DELETED` before it DELETEs, the retained
+record will already read `DELETED` with no orchestrator change.
+
 ```python
 from typing import Any
 
 import httpx
 
+from orchestrator.domain import ResourceNotFoundError
 from orchestrator.ports import ResourceManagerClient
 
 
@@ -513,6 +533,9 @@ class ProjectManagerResourceClient(ResourceManagerClient):
             resp = await client.patch(
                 f"/projects/{project_id}/project_resources/{resource_type}/{vendor_id}",
                 json=fields)
+            if resp.status_code == httpx.codes.NOT_FOUND:     # provider vocabulary stops here
+                raise ResourceNotFoundError(
+                    f"{resource_type} '{vendor_id}' not found in project {project_id}")
             resp.raise_for_status()
 
     async def delete_resource(self, project_id: str, resource_type: str,

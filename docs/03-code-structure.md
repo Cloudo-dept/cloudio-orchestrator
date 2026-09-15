@@ -73,7 +73,7 @@ cloudio-orchestrator/
         ├── services.py                 # WorkflowService · WorkflowRunService
         ├── orchestration/
         │   ├── __init__.py
-        │   ├── steps.py                # StepHandler ABC + CreateTicketStep/ConfigureResourceStep/RunEngineStep/FinalizeResourceStep/CloseTicketStep
+        │   ├── steps.py                # StepHandler ABC + CreateTicketStep/RegisterResourceStep/AwaitApprovalStep/ConfigureResourceStep/RunEngineStep/FinalizeResourceStep/CloseTicketStep + resource_state_fields
         │   ├── plans.py                # RUN_PLANS (RunType → ordered StepNames) + build_handlers()
         │   ├── failure_policy.py       # FAILURE_POLICIES (FailureKind → retry? incident? ticket comment)
         │   ├── executor.py             # RunExecutor (drives one run per call)
@@ -104,7 +104,7 @@ package out of the repo root so tests import the *installed* copy.
 | all five port ABCs | `ports.py` |
 | session factory, `PostgresWorkflowRunRepository`, `PostgresWorkflowRepository` | `adapters/database.py` |
 | `ServiceNowTicketClient` / `AirflowWorkflowEngineClient` / `ProjectManagerResourceClient` | `adapters/servicenow.py` / `airflow.py` / `project_manager.py` |
-| `StepHandler` + the four step handlers | `orchestration/steps.py` |
+| `StepHandler` + the step handlers, `resource_state_fields` | `orchestration/steps.py` |
 | `RUN_PLANS`, `build_handlers` | `orchestration/plans.py` |
 | `RunExecutor` | `orchestration/executor.py` |
 | `FailureEscalator` | `orchestration/escalator.py` |

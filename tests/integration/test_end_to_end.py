@@ -14,7 +14,14 @@ from orchestrator.adapters.database import (
 from orchestrator.adapters.project_manager import ProjectManagerResourceClient
 from orchestrator.adapters.servicenow import ServiceNowTicketClient
 from orchestrator.config import Settings
-from orchestrator.domain import RunStatus, RunType, StepName, TicketRef, WorkflowEngineType
+from orchestrator.domain import (
+    ResourceOperation,
+    RunStatus,
+    RunType,
+    StepName,
+    TicketRef,
+    WorkflowEngineType,
+)
 from orchestrator.orchestration.escalator import FailureEscalator
 from orchestrator.orchestration.executor import RunExecutor
 from orchestrator.orchestration.plans import build_handlers
@@ -53,7 +60,7 @@ async def _assemble(pg_session_factory, servicenow, airflow, project_manager):
         handlers,
         runs,
         Settings.model_construct(retry_base_seconds=1.0),
-        FailureEscalator(tickets, "cloudio"),
+        FailureEscalator(tickets, resources, "cloudio"),
     )
     return runs, WorkflowRunService(runs, workflows), workflows, executor
 
@@ -91,6 +98,7 @@ async def test_resource_run_reaches_completed(
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-1"),
+        operation=ResourceOperation.CREATE,
         ticket=None,
     )
 
@@ -98,7 +106,9 @@ async def test_resource_run_reaches_completed(
 
     assert final is not None and final.status is RunStatus.COMPLETED
     assert any("servicecatalog" in p for _, p in servicenow.requests)  # ticket ordered
-    assert project_manager.patches[-1]["in_progress"] is False  # resource finalized
+    finalized = project_manager.patches[-1]  # resource finalized
+    assert finalized["state"] == "READY" and finalized["in_progress"] is False
+    assert finalized["last_run_id"] == str(run.run_id)
     assert servicenow.ritms[-1].state == 3  # RITM closed
     assert not servicenow.incidents  # no failure → no INC
 
@@ -121,6 +131,7 @@ async def test_resource_run_rejected_stops_without_provisioning(
         ticket_params={},
         workflow_params={},
         resource=make_resource_spec(vendor_id="vm-1"),
+        operation=ResourceOperation.CREATE,
         ticket=None,
     )
 
@@ -128,8 +139,88 @@ async def test_resource_run_rejected_stops_without_provisioning(
 
     assert final is not None and final.status is RunStatus.REJECTED
     assert final.scheduled_at is None
-    assert project_manager.patches == []  # nothing was provisioned
+    # The placeholder registered for the request is removed; nothing was provisioned.
+    assert project_manager.patches == []
+    assert project_manager.deletes == [f"proj-1/vm/{run.run_id}"]
+    assert project_manager.resources == {}
     assert not servicenow.incidents  # a rejection is not a failure → no INC
+
+
+async def test_failed_resource_run_marks_the_resource_failed(
+    pg_session_factory: async_sessionmaker,
+    servicenow: ServiceNowMock,
+    airflow: AirflowMock,
+    project_manager: ProjectManagerMock,
+) -> None:
+    airflow.default_state = "running"  # hold it until the failure is recorded below
+    runs, run_service, workflows, executor = await _assemble(
+        pg_session_factory, servicenow, airflow, project_manager
+    )
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    run = await run_service.trigger(
+        workflow_identifier="provision-vm",
+        created_by="jdoe",
+        max_retries=0,
+        ticket_params={},
+        workflow_params={},
+        resource=make_resource_spec(),
+        operation=ResourceOperation.CREATE,
+        ticket=None,
+    )
+
+    for _ in range(10):  # through the ticket, registration, approval and configure to the engine
+        await _drive(runs, executor, run.run_id, iters=1)
+        current = await runs.get(run.run_id)
+        if current is not None and current.run_state.engine_run_id is not None:
+            break
+    dag_run_id = (await runs.get(run.run_id)).run_state.engine_run_id
+    airflow.fail(dag_run_id, task="provision_vm", responsible_group="netops", message="quota")
+
+    final = await _drive(runs, executor, run.run_id)
+
+    assert final is not None and final.status is RunStatus.FAILED
+    # Nothing is rolled back: the record stays, marked FAILED and no longer in progress.
+    record = project_manager.resources[f"proj-1/vm/{run.run_id}"]
+    assert record["state"] == "FAILED" and record["in_progress"] is False
+    assert record["last_run_id"] == str(run.run_id)
+
+
+async def test_delete_resource_run_removes_the_record(
+    pg_session_factory: async_sessionmaker,
+    servicenow: ServiceNowMock,
+    airflow: AirflowMock,
+    project_manager: ProjectManagerMock,
+) -> None:
+    project_manager.resources["proj-1/vm/vm-1"] = {
+        "vendor_id": "vm-1",
+        "state": "READY",
+        "in_progress": False,
+    }
+    runs, run_service, workflows, executor = await _assemble(
+        pg_session_factory, servicenow, airflow, project_manager
+    )
+    await workflows.register(make_workflow(identifier="delete-vm", run_type=RunType.RESOURCE))
+    run = await run_service.trigger(
+        workflow_identifier="delete-vm",
+        created_by="jdoe",
+        max_retries=3,
+        ticket_params={},
+        workflow_params={},
+        resource=make_resource_spec(vendor_id="vm-1"),
+        operation=ResourceOperation.DELETE,
+        ticket=None,
+    )
+
+    final = await _drive(runs, executor, run.run_id)
+
+    assert final is not None and final.status is RunStatus.COMPLETED
+    assert [p["state"] for p in project_manager.patches] == [
+        "PENDING_APPROVAL",
+        "DELETING",
+        "DELETED",
+    ]
+    assert project_manager.deletes == ["proj-1/vm/vm-1"]
+    assert project_manager.resources == {}
 
 
 async def test_engine_failure_run_fails_and_escalates(
@@ -158,6 +249,7 @@ async def test_engine_failure_run_fails_and_escalates(
         ticket_params={},
         workflow_params={},
         resource=None,
+        operation=ResourceOperation.CREATE,
         ticket=TicketRef(ticket_id=seeded.number, native_id=seeded.sys_id),
     )
 
@@ -207,6 +299,7 @@ async def test_rolled_back_engine_run_fails_the_run_instead_of_completing_it(
         ticket_params={},
         workflow_params={},
         resource=None,
+        operation=ResourceOperation.CREATE,
         ticket=TicketRef(ticket_id=seeded.number, native_id=seeded.sys_id),
     )
 

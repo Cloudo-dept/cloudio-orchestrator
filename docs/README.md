@@ -12,7 +12,7 @@ Architecture, persistence, run scheduling, step state machine, and Python interf
 >
 > **Two structural decisions:**
 > 1. **One durable store, no separate queue.** The durable business object is a **`WorkflowRun`** row; all scheduling (poll interval, retry backoff) is application state (`WorkflowRun.scheduled_at`). A pool of identical `RunWorker` loops each claim one due row (`FOR UPDATE SKIP LOCKED`) and drive it through the executor. `claim_due` + a re-drive lease + optimistic `version` + idempotency keys already give at-least-once and crash recovery, so a dedicated queue (pgqueuer, RabbitMQ) — or even a separate scheduler feeding the workers — would only restate the workers' own claim over the same database. Cut as duplication.
-> 2. **No rollback/compensation.** On a step's permanent failure the run terminates as `FAILED` and the failure is escalated (ServiceNow Incident + RITM work note). Partially-created resources are left in place, still `in_progress=True`, for operator follow-up — only `FinalizeResourceStep` clears that, and a failed run never reaches it.
+> 2. **No rollback/compensation.** On a step's permanent failure the run terminates as `FAILED` and the failure is escalated (ServiceNow Incident + RITM work note). Partially-created resources are left in place for operator follow-up; the escalator marks the Project Manager record `state=FAILED` (`in_progress=False`) — a status, not a rollback. The record carries the request's whole lifecycle (`PENDING_APPROVAL` → `PROVISIONING`/`UPDATING`/`DELETING` → `READY`), plus `last_run_id`, which the portal uses with `GET /api/v1/workflow-runs/{run_id}` to show ticket, incident and failure detail.
 >
 > See [Design safeguards](09-design-safeguards.md) for the retained correctness properties. Project engineering rules live in [CLAUDE.md](../CLAUDE.md).
 
@@ -29,7 +29,7 @@ Read in order, or jump to what you need:
 | 04 | [Domain & config](04-domain-and-config.md) | `Settings`, enums, the typed `RunState`, the `WorkflowRun`/`Workflow` SQLModels, and the DDL. |
 | 05 | [Stores](05-stores.md) | The two Postgres repositories — the run store and the workflow registry. |
 | 06 | [External clients](06-external-clients.md) | The ticket / resource / engine ports and their ServiceNow, Airflow, and Project Manager adapters. |
-| 07 | [Orchestration](07-orchestration.md) | Run plans (data, not classes), the four step handlers, the `RunExecutor`, and the `FailureEscalator` — no compensation. |
+| 07 | [Orchestration](07-orchestration.md) | Run plans (data, not classes), the step handlers, the resource record's lifecycle state, the `RunExecutor`, and the `FailureEscalator` — no compensation. |
 | 08 | [Entrypoints](08-entrypoints.md) | Services, the FastAPI app, the worker daemon (`OrchestratorWorker` + `RunWorker`), the typer CLI, and the composition root. |
 | 09 | [Design safeguards](09-design-safeguards.md) | The correctness properties the design preserves. |
 | 10 | [Verification](10-verification.md) | The automated and integration/manual test plan — **what** must hold. |

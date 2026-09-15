@@ -354,7 +354,7 @@ def _build_servicenow(mock: ServiceNowMock) -> FastAPI:
 from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 
 from .base import Override, apply_overrides
 
@@ -388,7 +388,7 @@ def _build_pm(mock: ProjectManagerMock) -> FastAPI:
         if idempotency_key in mock._by_key:                              # replay → same resource
             return mock.resources[mock._by_key[idempotency_key]]
         key = f"{project_id}/{resource_type}/{body['vendor_id']}"
-        mock.resources[key] = {**body, "in_progress": True}
+        mock.resources[key] = dict(body)          # the orchestrator sends state/in_progress/last_run_id
         mock._by_key[idempotency_key] = key
         return mock.resources[key]
 
@@ -396,7 +396,12 @@ def _build_pm(mock: ProjectManagerMock) -> FastAPI:
     async def update(project_id: str, resource_type: str, vendor_id: str,
                      body: dict[str, Any]) -> dict[str, Any]:
         key = f"{project_id}/{resource_type}/{vendor_id}"
+        if key not in mock.resources:              # missing record → 404, as the provider does
+            raise HTTPException(404, detail=f"resource '{vendor_id}' not found")
         mock.resources[key].update(body)
+        if "vendor_id" in body and body["vendor_id"] != vendor_id:       # re-keyed at finalize
+            mock.resources[f"{project_id}/{resource_type}/{body['vendor_id']}"] = \
+                mock.resources.pop(key)
         mock.patches.append({"vendor_id": vendor_id, **body})
         return mock.resources[key]
 
@@ -517,10 +522,16 @@ async def test_token_refresh_on_401(airflow, airflow_client):
     assert airflow.requests.count(("POST", "/auth/token")) == 2
 
 
-async def test_finalize_patches_in_progress_false(project_manager, pm_client):
-    await pm_client.create_resource("proj-1", "vm", {"vendor_id": "vm-1"}, "run-1:resource:0")
-    await pm_client.update_resource("proj-1", "vm", "vm-1", {"in_progress": False})
-    assert project_manager.patches[-1] == {"vendor_id": "vm-1", "in_progress": False}
+async def test_finalize_patches_ready_state(project_manager, pm_client):
+    await pm_client.create_resource("proj-1", "vm", {"vendor_id": "vm-1"}, "run-1:configuring_resource")
+    ready = {"state": "READY", "in_progress": False, "last_run_id": "run-1"}
+    await pm_client.update_resource("proj-1", "vm", "vm-1", ready)
+    assert project_manager.patches[-1] == {"vendor_id": "vm-1", **ready}
+
+
+async def test_patch_missing_record_raises_not_found(project_manager, pm_client):
+    with pytest.raises(ResourceNotFoundError):           # domain error, not HTTPStatusError
+        await pm_client.update_resource("proj-1", "vm", "ghost", {"state": "DELETED"})
 
 
 async def test_create_resource_replay_is_idempotent(project_manager, pm_client):
@@ -576,15 +587,27 @@ async def test_resource_run_reaches_completed(pg_session_factory, servicenow, ai
     final = await runs.get(run.run_id)
     assert final.status is RunStatus.COMPLETED
     assert any("servicecatalog" in p for _, p in servicenow.requests)   # ticket opened
-    assert project_manager.patches[-1]["in_progress"] is False          # resource finalized
+    states = [p["state"] for p in project_manager.patches]
+    assert states[-2:] == ["PROVISIONING", "READY"]                      # configured, then finalized
+    assert project_manager.patches[-1]["in_progress"] is False
+    assert project_manager.patches[-1]["last_run_id"] == str(run.run_id)  # portal's link to the run
     assert servicenow.ritms[-1].state == 3                              # RITM closed
     assert not servicenow.incidents                                     # no failure → no INC
 ```
 
 Swap in `airflow.fail(...)` before the loop (and let retries exhaust) to assert the **failure**
 path: run ends `FAILED`, one `Incident` lands in `servicenow.incidents` routed to the responsible
-group, a work note is on the RITM, and the resource is left `in_progress=False` — nothing rolled
-back.
+group, a work note is on the RITM, and the last PATCH marks the resource `state="FAILED"`,
+`in_progress=False` — nothing rolled back. A rejected RITM instead ends the run `REJECTED`, with no
+Incident, and a CREATE's placeholder record gone from `project_manager.resources`.
+
+## Verifying against the real Project Manager
+
+The mock stores whatever fields it is sent, so it cannot prove the real provider does. Before
+relying on the portal's status view, check against a real Project Manager instance that it
+**accepts and returns `state` and `last_run_id`** — on the create POST and on a PATCH — rather than
+rejecting or silently dropping unknown fields, and that a **PATCH to a missing record answers
+`404`** (what `ResourceNotFoundError`, and the re-driven DELETE finalize, rely on).
 
 ## Why this shape
 

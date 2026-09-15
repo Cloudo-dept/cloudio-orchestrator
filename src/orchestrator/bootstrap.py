@@ -140,7 +140,7 @@ async def build(settings: Settings) -> Container:
     )
 
     handlers = build_handlers(ticket_client, resource_client, engines)
-    escalator = FailureEscalator(ticket_client, settings.servicenow_incident_team)
+    escalator = FailureEscalator(ticket_client, resource_client, settings.servicenow_incident_team)
     executor = RunExecutor(handlers, runs, settings, escalator)  # sets scheduled_at
     worker = OrchestratorWorker(
         runs,

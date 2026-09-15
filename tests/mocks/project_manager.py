@@ -44,7 +44,7 @@ def _build(mock: ProjectManagerMock) -> FastAPI:
         if idempotency_key in mock._by_key:  # replay → same resource
             return mock.resources[mock._by_key[idempotency_key]]
         key = f"{project_id}/{resource_type}/{body['vendor_id']}"
-        mock.resources[key] = {**body, "in_progress": True}
+        mock.resources[key] = {"in_progress": True, **body}  # the default, unless the body sets it
         mock._by_key[idempotency_key] = key
         return mock.resources[key]
 
@@ -53,6 +53,8 @@ def _build(mock: ProjectManagerMock) -> FastAPI:
         project_id: str, resource_type: str, vendor_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
         key = f"{project_id}/{resource_type}/{vendor_id}"
+        if key not in mock.resources:  # no such record → 404, as the real provider does
+            raise HTTPException(404, detail=f"resource '{vendor_id}' not found")
         mock.resources[key].update(body)
         mock.patches.append({"vendor_id": vendor_id, **body})
         return mock.resources[key]

@@ -154,12 +154,14 @@ class ResourceManagerClient(abc.ABC):
     async def update_resource(
         self, project_id: str, resource_type: str, vendor_id: str, fields: dict[str, Any]
     ) -> None:
-        """Partial update (only changed fields) — e.g. in_progress=False on finalize."""
+        """Partial update (only changed fields) — e.g. the resource's state on each transition.
+        Raises ResourceNotFoundError when there is no record under vendor_id."""
 
     @abc.abstractmethod
     async def delete_resource(self, project_id: str, resource_type: str, vendor_id: str) -> None:
-        """Remove a project resource. Idempotent: a record that is already gone is not an error,
-        so a re-driven finalize cannot fail on the strength of its own earlier success."""
+        """Remove a project resource — or retire it, where that is how the provider deletes.
+        Idempotent: a record that is already gone is not an error, so a re-driven finalize cannot
+        fail on the strength of its own earlier success."""
 
 
 class WorkflowEngineClient(abc.ABC):

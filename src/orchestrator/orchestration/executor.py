@@ -233,9 +233,11 @@ class RunExecutor:
 
     async def _reject(self, run: WorkflowRun, step: StepName, rejection: RunRejected) -> None:
         # The request was denied in the ticket system — a clean terminal stop, not a failure:
-        # no retry, no rollback, no incident (the RITM already carries the rejection).
+        # no retry, no rollback, no incident (the RITM already carries the rejection). The
+        # resource it registered stops advertising it.
         run.run_state.errors[step] = str(rejection)
         run.status, run.scheduled_at = RunStatus.REJECTED, None
+        await self.escalator.reject(run)  # never raises
         await self._save(run)
         logger.info("Run %s REJECTED at step %s: %s", run.run_id, step, rejection)
 

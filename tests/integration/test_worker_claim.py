@@ -37,7 +37,7 @@ async def test_worker_drives_pg_run_to_completion(
         handlers,
         runs,
         Settings.model_construct(retry_base_seconds=1.0),
-        FailureEscalator(tickets, "cloudio"),
+        FailureEscalator(tickets, resources, "cloudio"),
     )
     run = await runs.create(make_run(run_type=RunType.RESOURCE))
     worker = RunWorker(runs, executor, poll_interval_seconds=0.01, lease_seconds=300)

@@ -11,6 +11,7 @@ from orchestrator.domain import (
     ApprovalStatus,
     EngineFailure,
     EngineRunStatus,
+    ResourceNotFoundError,
     RunStatus,
     StaleRunError,
     TicketOutcome,
@@ -232,6 +233,7 @@ class FakeResourceManagerClient(ResourceManagerClient):
         self.create_calls: list[str] = []  # idempotency keys, in order
         self.updated: list[tuple[str, str, str, dict[str, Any]]] = []
         self.deleted: list[tuple[str, str, str]] = []
+        self.missing: set[str] = set()  # vendor ids with no record: update_resource raises for them
 
     async def create_resource(
         self, project_id: str, resource_type: str, body: dict[str, Any], idempotency_key: str
@@ -239,13 +241,15 @@ class FakeResourceManagerClient(ResourceManagerClient):
         self.create_calls.append(idempotency_key)
         if idempotency_key in self.created_by_key:  # idempotent on the key
             return self.created_by_key[idempotency_key]
-        resource = {**body, "in_progress": True}
+        resource = {"in_progress": True, **body}  # the provider's default, unless the body sets it
         self.created_by_key[idempotency_key] = resource
         return resource
 
     async def update_resource(
         self, project_id: str, resource_type: str, vendor_id: str, fields: dict[str, Any]
     ) -> None:
+        if vendor_id in self.missing:
+            raise ResourceNotFoundError(f"resource '{vendor_id}' not found")
         self.updated.append((project_id, resource_type, vendor_id, fields))
 
     async def delete_resource(self, project_id: str, resource_type: str, vendor_id: str) -> None:

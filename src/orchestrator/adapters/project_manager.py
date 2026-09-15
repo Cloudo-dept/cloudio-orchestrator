@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from orchestrator.domain import ResourceNotFoundError
 from orchestrator.ports import ResourceManagerClient
 
 
@@ -33,6 +34,10 @@ class ProjectManagerResourceClient(ResourceManagerClient):
         resp = await self._http.patch(
             f"/projects/{project_id}/project_resources/{resource_type}/{vendor_id}", json=fields
         )
+        if resp.status_code == httpx.codes.NOT_FOUND:
+            raise ResourceNotFoundError(
+                f"No {resource_type} resource '{vendor_id}' in project '{project_id}'."
+            )
         resp.raise_for_status()
 
     async def delete_resource(self, project_id: str, resource_type: str, vendor_id: str) -> None:
