@@ -388,7 +388,8 @@ def _build_pm(mock: ProjectManagerMock) -> FastAPI:
         if idempotency_key in mock._by_key:                              # replay → same resource
             return mock.resources[mock._by_key[idempotency_key]]
         key = f"{project_id}/{resource_type}/{body['vendor_id']}"
-        mock.resources[key] = dict(body)          # the orchestrator sends state/in_progress/last_run_id
+        # the orchestrator sends state/in_progress; _id is the provider's own, one per document
+        mock.resources[key] = dict(body) | {"_id": f"pm-{len(mock.resources) + 1}"}
         mock._by_key[idempotency_key] = key
         return mock.resources[key]
 
@@ -522,9 +523,15 @@ async def test_token_refresh_on_401(airflow, airflow_client):
     assert airflow.requests.count(("POST", "/auth/token")) == 2
 
 
+async def test_create_returns_the_providers_resource_id(project_manager, pm_client):
+    resource_id = await pm_client.create_resource(
+        "proj-1", "vm", {"vendor_id": "vm-1"}, "run-1:configuring_resource")
+    assert resource_id == project_manager.resources["proj-1/vm/vm-1"]["_id"]
+
+
 async def test_finalize_patches_ready_state(project_manager, pm_client):
     await pm_client.create_resource("proj-1", "vm", {"vendor_id": "vm-1"}, "run-1:configuring_resource")
-    ready = {"state": "READY", "in_progress": False, "last_run_id": "run-1"}
+    ready = {"state": "READY", "in_progress": False}
     await pm_client.update_resource("proj-1", "vm", "vm-1", ready)
     assert project_manager.patches[-1] == {"vendor_id": "vm-1", **ready}
 
@@ -587,10 +594,11 @@ async def test_resource_run_reaches_completed(pg_session_factory, servicenow, ai
     final = await runs.get(run.run_id)
     assert final.status is RunStatus.COMPLETED
     assert any("servicecatalog" in p for _, p in servicenow.requests)   # ticket opened
-    states = [p["state"] for p in project_manager.patches]
-    assert states[-2:] == ["PROVISIONING", "READY"]                      # configured, then finalized
+    record = next(iter(project_manager.resources.values()))              # created PROVISIONING
+    assert project_manager.patches[-1]["state"] == "READY"               # then finalized
     assert project_manager.patches[-1]["in_progress"] is False
-    assert project_manager.patches[-1]["last_run_id"] == str(run.run_id)  # portal's link to the run
+    latest = await runs.find_last_by_resource_id(record["_id"])   # the portal's lookup
+    assert latest.run_id == run.run_id
     assert servicenow.ritms[-1].state == 3                              # RITM closed
     assert not servicenow.incidents                                     # no failure → no INC
 ```
@@ -599,15 +607,17 @@ Swap in `airflow.fail(...)` before the loop (and let retries exhaust) to assert 
 path: run ends `FAILED`, one `Incident` lands in `servicenow.incidents` routed to the responsible
 group, a work note is on the RITM, and the last PATCH marks the resource `state="FAILED"`,
 `in_progress=False` — nothing rolled back. A rejected RITM instead ends the run `REJECTED`, with no
-Incident, and a CREATE's placeholder record gone from `project_manager.resources`.
+Incident, and a CREATE's record gone from `project_manager.resources`.
 
 ## Verifying against the real Project Manager
 
 The mock stores whatever fields it is sent, so it cannot prove the real provider does. Before
 relying on the portal's status view, check against a real Project Manager instance that it
-**accepts and returns `state` and `last_run_id`** — on the create POST and on a PATCH — rather than
-rejecting or silently dropping unknown fields, and that a **PATCH to a missing record answers
-`404`** (what `ResourceNotFoundError`, and the re-driven DELETE finalize, rely on).
+**accepts and returns `state` and `in_progress`** — on the create POST and on a PATCH — rather than
+rejecting or silently dropping unknown fields; that its **create response carries the record's
+`_id`** (without it a `create` run stores no record id, and the latest-run lookup answers `404` for
+that resource); and that a **PATCH to a missing record answers `404`** (what
+`ResourceNotFoundError`, and the re-driven DELETE finalize, rely on).
 
 ## Why this shape
 

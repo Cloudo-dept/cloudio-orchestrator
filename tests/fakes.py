@@ -106,7 +106,7 @@ class FakeWorkflowRunRepository(WorkflowRunRepository):
         newest_first = sorted(self._runs.values(), key=lambda r: r.created_at, reverse=True)
         return [_copy(r) for r in newest_first[:limit]]
 
-    async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]:
+    async def find_by_vendor_id(self, vendor_id: str) -> list[WorkflowRun]:
         return [
             _copy(r)
             for r in self._runs.values()
@@ -115,6 +115,15 @@ class FakeWorkflowRunRepository(WorkflowRunRepository):
 
     async def find_by_engine_run_id(self, engine_run_id: str) -> list[WorkflowRun]:
         return [_copy(r) for r in self._runs.values() if r.run_state.engine_run_id == engine_run_id]
+
+    async def find_last_by_resource_id(self, resource_id: str) -> WorkflowRun | None:
+        matches = [
+            r
+            for r in self._runs.values()
+            if r.run_state.resource is not None and r.run_state.resource.resource_id == resource_id
+        ]
+        newest = max(matches, key=lambda r: r.created_at, default=None)
+        return _copy(newest) if newest is not None else None
 
     async def wake(self, run_id: uuid.UUID) -> bool:
         # A nudge outside the version scheme: make a non-terminal run due now, no version bump.
@@ -237,13 +246,19 @@ class FakeResourceManagerClient(ResourceManagerClient):
 
     async def create_resource(
         self, project_id: str, resource_type: str, body: dict[str, Any], idempotency_key: str
-    ) -> dict[str, Any]:
+    ) -> str | None:
         self.create_calls.append(idempotency_key)
         if idempotency_key in self.created_by_key:  # idempotent on the key
-            return self.created_by_key[idempotency_key]
-        resource = {"in_progress": True, **body}  # the provider's default, unless the body sets it
-        self.created_by_key[idempotency_key] = resource
-        return resource
+            existing: str = self.created_by_key[idempotency_key]["resource_id"]
+            return existing
+        resource_id = f"rec-{len(self.created_by_key) + 1}"  # the provider's own id for the record
+        # in_progress is the provider's default, unless the body sets it.
+        self.created_by_key[idempotency_key] = {
+            "in_progress": True,
+            **body,
+            "resource_id": resource_id,
+        }
+        return resource_id
 
     async def update_resource(
         self, project_id: str, resource_type: str, vendor_id: str, fields: dict[str, Any]

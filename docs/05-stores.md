@@ -41,7 +41,13 @@ class WorkflowRunRepository(abc.ABC):
     async def find_by_ticket_id(self, ticket_id: str) -> list[WorkflowRun]: ...
 
     @abc.abstractmethod
-    async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]: ...
+    async def find_by_vendor_id(self, vendor_id: str) -> list[WorkflowRun]: ...
+
+    @abc.abstractmethod
+    async def find_last_by_resource_id(self, resource_id: str) -> WorkflowRun | None:
+        """The most recently created run against one resource manager record, or None when that
+        record has never had one. Keyed on the record's own id rather than the vendor id, which
+        several records share — one per region/environment — while a run targets exactly one."""
 
 
 class WorkflowRepository(abc.ABC):
@@ -136,8 +142,23 @@ class PostgresWorkflowRunRepository(WorkflowRunRepository):
     async def find_by_ticket_id(self, ticket_id: str) -> list[WorkflowRun]:
         return await self._find_by_path(("ticket", "ticket_id"), ticket_id)
 
-    async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]:
+    async def find_by_vendor_id(self, vendor_id: str) -> list[WorkflowRun]:
         return await self._find_by_path(("resource", "vendor_id"), vendor_id)
+
+    async def find_last_by_resource_id(self, resource_id: str) -> WorkflowRun | None:
+        # Newest first, one row. The partial index carries created_at after the path expression
+        # (0004_resource_id_index), so this stops at the first row rather than sorting
+        # every run that record ever had.
+        async with self.session_factory() as session:
+            col = WorkflowRun.run_state
+            stmt = (select(WorkflowRun)
+                    .where(col["resource"]["resource_id"].astext == resource_id)
+                    .order_by(WorkflowRun.created_at.desc())
+                    .limit(1))
+            run = (await session.execute(stmt)).scalars().first()
+            if run is not None:
+                session.expunge(run)
+            return run
 
     async def _find_by_path(self, path: tuple[str, str], value: str) -> list[WorkflowRun]:
         async with self.session_factory() as session:
@@ -192,8 +213,9 @@ single-delivery work queue; a second transport would restate it.
 - **`create(run)` / `register(workflow)` take a constructed entity**, not `**fields` — typed at
   the call site, mypy-checked, nothing stringly.
 - **`find_by_state(key, value)` became explicit finders** (`find_by_ticket_id`,
-  `find_by_resource_id`, `find_by_engine_run_id`) matching the API filters and the callback
-  lookups that actually exist. A generic key/value query invited untyped state coupling.
+  `find_by_vendor_id`, `find_by_engine_run_id`, `find_last_by_resource_id`) matching the
+  API filters and the callback lookups that actually exist. A generic key/value query invited
+  untyped state coupling.
 - **`record_callback` never came back** — the wake-early callback does not record anything on the
   run; it calls `wake(run_id)`, a targeted `scheduled_at=now` UPDATE *outside* the optimistic
   `version` scheme (it never raises `StaleRunError`), and the authoritative status still comes from

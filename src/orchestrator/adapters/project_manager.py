@@ -18,15 +18,18 @@ class ProjectManagerResourceClient(ResourceManagerClient):
 
     async def create_resource(
         self, project_id: str, resource_type: str, body: dict[str, Any], idempotency_key: str
-    ) -> dict[str, Any]:
+    ) -> str | None:
         resp = await self._http.post(
             f"/projects/{project_id}/project_resources/{resource_type}",
             json=body,
             headers={"Idempotency-Key": idempotency_key},
         )  # orchestrator-added
         resp.raise_for_status()
-        result: dict[str, Any] = resp.json()
-        return result
+        record: dict[str, Any] = resp.json()
+        # Project Manager names its documents `_id`. That spelling stops here: the port promises
+        # only "the provider's id for the record", which is what the run stores.
+        resource_id = record.get("_id")
+        return str(resource_id) if resource_id is not None else None
 
     async def update_resource(
         self, project_id: str, resource_type: str, vendor_id: str, fields: dict[str, Any]

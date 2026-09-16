@@ -23,6 +23,7 @@ the callbacks** — they are network-trust only (see
 | `PUT /api/v1/workflows/{identifier}` | Update a workflow mapping | Platform admin / operator |
 | `POST /api/v1/workflow-runs` | Trigger a run of a workflow | **Automation:** ServiceNow (RITM outbound REST). **Resource:** self-service portal / upstream automation |
 | `GET /api/v1/workflow-runs/{run_id}` | Fetch one run's status/state | Requester / console UI polling for completion |
+| `GET /api/v1/workflow-runs/latest` | The latest run for one resource record | **Self-service portal** (via the gateway), beside a resource's `state` |
 | `GET /api/v1/workflow-runs` | List/search runs (by ticket or resource) | Console UI / operator / integrating systems |
 | `POST /api/v1/callbacks/ticket-approval` | Wake-early nudge on approval change | **ServiceNow** (business rule on approval change) |
 | `POST /api/v1/callbacks/engine-run` | Wake-early nudge on engine completion | **Airflow** (DAG `on_success`/`on_failure_callback`) |
@@ -136,37 +137,60 @@ the orchestrator resolves the registration to decide run type and build the run 
 
   `ResourceSpec`: `project_id`, `resource_type`, `vendor_id` (blank for a `create` — assigned from
   the run id; **required** for `update`/`delete`, which target a record that already exists),
-  `name`, `region?`, `environment?`, `description`, `tags[]`, `data{}`, `alert_groups[]`.
+  `resource_id` (the resource manager's own id for that record — blank for a `create`, which is
+  assigned it from the provider's create response; **required** for `update`/`delete`), `name`,
+  `region?`, `environment?`, `description`, `tags[]`, `data{}`, `alert_groups[]`.
 
   On an `update` the spec is the resource's **desired state**, the same way it is on a `create` —
   send the whole spec, not a delta. `FinalizeResourceStep` writes it to Project Manager once the
   engine has succeeded; a `delete` removes the record at the same point.
 
-  A resource run steps through `creating_ticket → registering_resource → awaiting_approval →
-  configuring_resource → running_engine → finalizing_resource → closing_ticket` (an automation run:
-  `running_engine → closing_ticket`). From `registering_resource` on, the Project Manager record
-  carries the request's `state` (`PENDING_APPROVAL` → `PROVISIONING`/`UPDATING`/`DELETING` →
-  `READY`, or `FAILED`) and `last_run_id` — this run's `run_id` — so the portal can show the request
-  and fetch its detail from `GET /api/v1/workflow-runs/{run_id}`. See
-  [07-orchestration](07-orchestration.md#the-resource-records-lifecycle-state).
+  A resource run steps through `creating_ticket → configuring_resource → awaiting_approval →
+  running_engine → finalizing_resource → closing_ticket` (an automation run:
+  `running_engine → closing_ticket`). From `configuring_resource` on — that is, *before* anyone
+  approves it — the Project Manager record carries the request's `state`
+  (`PROVISIONING`/`UPDATING`/`DELETING` → `READY`, or `FAILED`), so the portal can show the request
+  straight away; the detail behind that state comes from `GET /api/v1/workflow-runs/latest` below.
+  See [07-orchestration](07-orchestration.md#the-resource-records-lifecycle-state).
 
 - **Response `201` — `WorkflowRunResponse`:** `run_id` (UUID), `run_type`, `status` (`RunStatus`),
   `current_step` (`str \| None`), `created_by`, `max_retries`, `run_state` (typed `RunState`).
 - **Errors:** `404` — unknown workflow; `422` — `resource` missing for a resource workflow,
   `ticket` missing for an automation workflow, or an `operation` of `update`/`delete` with no
-  `resource.vendor_id`.
+  `resource.vendor_id` (which record to act on) or no `resource.resource_id` (which of the records
+  sharing that vendor id).
 
 ### `GET /api/v1/workflow-runs/{run_id}`  → `200`
 Fetch a single run's current status and state. This is the **polling** endpoint requesters use to
 observe completion (completion is poll-based; callbacks only cut latency).
 
-- **Source:** the requester / console UI polling for the run's outcome, and the **self-service
-  portal** (via the gateway): it reads a resource's `last_run_id` off the Project Manager record
-  and fetches that run here for the ticket, incident and failure detail behind the record's
-  `state`.
+- **Source:** the requester / console UI polling for the run's outcome. A portal showing a
+  *resource* asks `GET /api/v1/workflow-runs/latest` instead — it holds a record id, not a run id.
 - **Path param:** `run_id: uuid.UUID`.
 - **Response `200`:** `WorkflowRunResponse`.
 - **Errors:** `404 Not Found` — unknown run.
+
+### `GET /api/v1/workflow-runs/latest`  → `200`
+The most recent run against one resource manager record — what the portal shows beside a resource
+whose `state` says something is under way, or went wrong.
+
+> Declared **before** `/api/v1/workflow-runs/{run_id}` in `api.py`. That route parses its path
+> segment as a UUID, so whichever is declared first wins, and `latest` would otherwise be rejected
+> there as a malformed run id.
+
+- **Source:** the **self-service portal** (via the gateway). It lists a project's resources from
+  Project Manager, each carrying its own id, and asks here for the request behind a resource's
+  `state`.
+- **Query param (required):** `resource_id: str` — the resource manager's own id for the
+  record (Project Manager: `_id`). *Not* the `vendor_id`: that is shared by the records for every
+  region/environment, while a run targets exactly one of them.
+- **Response `200` — `ResourceRunSummary`:** `run_id`, `status`, `current_step`, `operation`,
+  `created_by`, `created_at`, `updated_at`, `ticket_id`, `incident_id`, `failure_detail` (what the
+  engine reported, else the last step error). Deliberately **not** a `WorkflowRunResponse`: the
+  run's working state — step attempts, engine payloads, parameter sets — is orchestration
+  bookkeeping, not something a resource's owner reads.
+- **Errors:** `404` — that record has no runs (including runs created before record ids were
+  stored); `422` — the query parameter is missing.
 
 ### `GET /api/v1/workflow-runs`  → `200`
 List recent runs, or search by ticket / resource.
@@ -174,9 +198,10 @@ List recent runs, or search by ticket / resource.
 - **Source:** console UI / operator / integrating systems.
 - **Query params (optional):**
   - `ticket_id: str` — return runs tied to that ticket.
-  - `resource_id: str` — return runs tied to that resource (`vendor_id`). A `create` run is keyed
-    by its run id until finalize re-keys it to the vendor id the engine reported, after which it
-    is found by that real id.
+  - `vendor_id: str` — return runs tied to that vendor id. Note this can span several records
+    (one per region/environment); `GET /workflow-runs/latest` is the per-record lookup. A `create`
+    run is keyed by its run id until finalize re-keys it to the vendor id the engine reported,
+    after which it is found by that real id.
   - Neither → most recent runs, newest first.
 - **Response `200`:** `list[WorkflowRunResponse]`.
 
@@ -224,8 +249,7 @@ error. **Auth: network-trust** (no HMAC/token). See [01-external-contracts](01-e
 - **`RunStatus`:** `pending`, `running`, `completed`, `failed`, `rejected`.
 - **`WorkflowEngineType`:** `airflow`.
 - **`ResourceOperation`:** `create`, `update`, `delete`.
-- **`current_step`** (`StepName` values): `creating_ticket`, `registering_resource`,
-  `awaiting_approval`, `configuring_resource`, `running_engine`, `finalizing_resource`,
-  `closing_ticket`.
+- **`current_step`** (`StepName` values): `creating_ticket`, `configuring_resource`,
+  `awaiting_approval`, `running_engine`, `finalizing_resource`, `closing_ticket`.
 - **`ResourceState`** (written to the Project Manager record's `state`, not returned by this API):
-  `PENDING_APPROVAL`, `PROVISIONING`, `UPDATING`, `DELETING`, `READY`, `FAILED`, `DELETED`.
+  `PROVISIONING`, `UPDATING`, `DELETING`, `READY`, `FAILED`, `DELETED`.

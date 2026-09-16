@@ -4,6 +4,7 @@ Requires Docker (testcontainers Postgres); skipped otherwise via the postgres_ur
 """
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -91,9 +92,28 @@ async def test_find_by_ticket_and_resource(pg_session_factory: async_sessionmake
 
     by_ticket = await repo.find_by_ticket_id("RITM0009999")
     assert [r.run_id for r in by_ticket] == [run.run_id]
-    by_resource = await repo.find_by_resource_id("vm-1")
+    by_resource = await repo.find_by_vendor_id("vm-1")
     assert [r.run_id for r in by_resource] == [run.run_id]
     assert await repo.find_by_ticket_id("absent") == []
+
+
+async def test_find_last_by_resource_id(pg_session_factory: async_sessionmaker) -> None:
+    repo = PostgresWorkflowRunRepository(pg_session_factory)
+    older = make_run(run_type=RunType.RESOURCE)
+    older.created_at = utcnow() - timedelta(hours=1)
+    newest = make_run(run_type=RunType.RESOURCE)
+    for run in (older, newest):  # two requests against the SAME record, over its lifetime
+        assert run.run_state.resource is not None
+        run.run_state.resource.resource_id = "rec-1"
+        await repo.create(run)
+    other = make_run(run_type=RunType.RESOURCE)
+    assert other.run_state.resource is not None
+    other.run_state.resource.resource_id = "rec-2"  # a different record, same vendor id
+    await repo.create(other)
+
+    found = await repo.find_last_by_resource_id("rec-1")
+    assert found is not None and found.run_id == newest.run_id  # the most recent one, not both
+    assert await repo.find_last_by_resource_id("absent") is None
 
 
 async def test_find_by_engine_run_id(pg_session_factory: async_sessionmaker) -> None:

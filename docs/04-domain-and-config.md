@@ -104,9 +104,9 @@ class WorkflowEngineType(str, Enum):
 
 class StepName(str, Enum):
     CREATE_TICKET = "creating_ticket"
-    REGISTER_RESOURCE = "registering_resource"  # create/mark the record PENDING_APPROVAL
+    CONFIGURE_RESOURCE = "configuring_resource" # create/mark the record PROVISIONING/UPDATING/
+                                                # DELETING — before the approval gate
     AWAIT_APPROVAL = "awaiting_approval"        # wait for the ticket to be approved
-    CONFIGURE_RESOURCE = "configuring_resource" # mark the record PROVISIONING/UPDATING/DELETING
     RUN_ENGINE = "running_engine"
     FINALIZE_RESOURCE = "finalizing_resource"   # apply the outcome: READY, or DELETED + remove
     CLOSE_TICKET = "closing_ticket"             # close out the RITM
@@ -170,6 +170,11 @@ class ResourceParamsRequired(Exception):
     """A resource workflow was triggered without a resource spec."""
 
 
+class ResourceIdRequired(Exception):
+    """An UPDATE/DELETE was triggered without the resource manager's id for its record — the id
+    the run is later found by (ResourceVendorIdRequired is its vendor-id counterpart)."""
+
+
 # --- Value objects (pure Pydantic) ---
 
 class TicketRef(BaseModel):
@@ -191,11 +196,11 @@ class ResourceState(str, Enum):
     """The lifecycle state written to the resource record's `state` field, so a portal reading the
     record sees where the request is (see 07-orchestration for the transitions). The values are
     the literal strings on the record. Always written together with `in_progress` — true exactly
-    for the four in-flight states — and `last_run_id`, the run that set it."""
-    PENDING_APPROVAL = "PENDING_APPROVAL"   # registered; the ticket awaits approval
-    PROVISIONING = "PROVISIONING"           # approved CREATE, engine at work
-    UPDATING = "UPDATING"                   # approved UPDATE, engine at work
-    DELETING = "DELETING"                   # approved DELETE, engine at work
+    for the three in-flight states. Whether the run behind an in-flight state is still waiting for
+    approval is the run's business (its current_step), not the record's."""
+    PROVISIONING = "PROVISIONING"           # a CREATE is under way
+    UPDATING = "UPDATING"                   # an UPDATE is under way
+    DELETING = "DELETING"                   # a DELETE is under way
     READY = "READY"                         # finalized — or an UPDATE/DELETE was rejected
     FAILED = "FAILED"                       # the run failed; nothing rolled back
     DELETED = "DELETED"                     # a DELETE finalized (the record is then removed)
@@ -205,11 +210,16 @@ class ResourceSpec(BaseModel):
     """The resource a resource run acts on (Project Manager fields)."""
     project_id: str
     resource_type: str
-    vendor_id: str = ""       # resource identity; a CREATE is assigned the run id when registered
-                              # (RegisterResourceStep), then re-keyed at finalize if the engine
+    vendor_id: str = ""       # resource identity; a CREATE is assigned the run id at configure
+                              # (ConfigureResourceStep), then re-keyed at finalize if the engine
                               # reported its own id;
                               # an UPDATE/DELETE REQUIRES the caller's (checked at trigger time,
                               # where the operation is known)
+    resource_id: str = ""       # the resource manager's OWN id for the record (PM: _id). It names
+                              # ONE record, where vendor_id is shared by the records for every
+                              # region/environment — so it is what "the latest run for this
+                              # resource" is looked up by. Assigned from the provider's create
+                              # response; REQUIRED from the caller on an UPDATE/DELETE
     name: str
     region: str
     environment: str
@@ -256,8 +266,7 @@ class RunState(BaseModel):
     # step progress / idempotency markers
     ticket: TicketRef | None = None
     engine_run_id: str | None = None
-    resource_registered: bool = False      # record created/marked PENDING_APPROVAL
-    resource_configured: bool = False      # record marked in flight (after approval)
+    resource_configured: bool = False      # record created/marked in flight (before approval)
     resource_finalized: bool = False
     ticket_closed: bool = False
 

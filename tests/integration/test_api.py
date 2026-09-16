@@ -205,6 +205,24 @@ async def test_trigger_without_vendor_id_for_an_existing_record_is_422(
     assert "vendor_id is required" in resp.json()["detail"]
 
 
+@pytest.mark.parametrize("operation", ["update", "delete"])
+async def test_trigger_without_resource_id_for_an_existing_record_is_422(
+    client: httpx.AsyncClient, operation: str
+) -> None:
+    await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
+    resp = await client.post(
+        "/api/v1/workflow-runs",
+        json={
+            "workflow_identifier": "provision-vm",
+            "created_by": "jdoe",
+            "operation": operation,
+            "resource": {**RESOURCE, "vendor_id": "vm-1"},  # names the vendor, but not the record
+        },
+    )
+    assert resp.status_code == 422
+    assert "resource_id is required" in resp.json()["detail"]
+
+
 async def test_trigger_carries_the_operation_beside_the_spec(client: httpx.AsyncClient) -> None:
     await client.post("/api/v1/workflows", json=WORKFLOW_BODY)
     resp = await client.post(
@@ -213,7 +231,7 @@ async def test_trigger_carries_the_operation_beside_the_spec(client: httpx.Async
             "workflow_identifier": "provision-vm",
             "created_by": "jdoe",
             "operation": "delete",
-            "resource": {**RESOURCE, "vendor_id": "vm-1"},
+            "resource": {**RESOURCE, "vendor_id": "vm-1", "resource_id": "rec-1"},
         },
     )
     assert resp.status_code == 201
@@ -302,11 +320,11 @@ async def test_list_by_resource_and_ticket(client: httpx.AsyncClient) -> None:
             "workflow_identifier": "provision-vm",
             "created_by": "jdoe",
             "operation": "update",
-            "resource": {**RESOURCE, "vendor_id": "vm-1"},
+            "resource": {**RESOURCE, "vendor_id": "vm-1", "resource_id": "rec-1"},
         },
     )
 
-    by_resource = await client.get("/api/v1/workflow-runs", params={"resource_id": "vm-1"})
+    by_resource = await client.get("/api/v1/workflow-runs", params={"vendor_id": "vm-1"})
     assert by_resource.status_code == 200 and len(by_resource.json()) == 1
 
     empty = await client.get("/api/v1/workflow-runs", params={"ticket_id": "RITM-absent"})
@@ -314,3 +332,68 @@ async def test_list_by_resource_and_ticket(client: httpx.AsyncClient) -> None:
 
     unfiltered = await client.get("/api/v1/workflow-runs")
     assert unfiltered.status_code == 200 and len(unfiltered.json()) == 1
+
+
+async def _seed_resource_run(
+    runs: FakeWorkflowRunRepository, *, resource_id: str, minutes_ago: int
+) -> uuid.UUID:
+    """A resource run against one resource manager record, created `minutes_ago` before now."""
+    from datetime import timedelta
+
+    from orchestrator.domain import RunType, utcnow
+    from tests.factories import make_run
+
+    run = make_run(run_type=RunType.RESOURCE)
+    assert run.run_state.resource is not None
+    run.run_state.resource.resource_id = resource_id
+    run.created_at = utcnow() - timedelta(minutes=minutes_ago)
+    await runs.create(run)
+    return run.run_id
+
+
+async def test_latest_run_for_a_resource_record(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    older = await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=10)
+    newest = await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1)
+    await _seed_resource_run(runs, resource_id="rec-2", minutes_ago=0)  # a different record
+
+    resp = await client.get("/api/v1/workflow-runs/latest", params={"resource_id": "rec-1"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["run_id"] == str(newest) and body["run_id"] != str(older)
+    # A summary of the request, not the run's internal working state.
+    assert body["operation"] == "create" and body["status"] == "pending"
+    assert set(body) == {
+        "run_id",
+        "status",
+        "current_step",
+        "operation",
+        "created_by",
+        "created_at",
+        "updated_at",
+        "ticket_id",
+        "incident_id",
+        "failure_detail",
+    }
+
+
+async def test_latest_run_for_an_unknown_resource_record_is_404(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/api/v1/workflow-runs/latest", params={"resource_id": "ghost"})
+    assert resp.status_code == 404 and "ghost" in resp.json()["detail"]
+
+
+async def test_latest_route_is_not_shadowed_by_the_run_id_route(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    # /workflow-runs/{run_id} parses its path segment as a UUID. Were it declared first, "latest"
+    # would come back 422 from that route instead of ever reaching this one.
+    await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1)
+    resp = await client.get("/api/v1/workflow-runs/latest", params={"resource_id": "rec-1"})
+    assert resp.status_code == 200
+
+
+async def test_latest_run_without_a_resource_id_is_422(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/api/v1/workflow-runs/latest")
+    assert resp.status_code == 422  # the query parameter is required

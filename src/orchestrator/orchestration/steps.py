@@ -79,14 +79,11 @@ OPERATION_STATES: dict[ResourceOperation, ResourceState] = {
 
 
 def resource_state_fields(run: WorkflowRun, state: ResourceState) -> dict[str, Any]:
-    """The fields every resource state change writes: the state, the in_progress flag derived from
-    it (so the two can never disagree), and the run that set it — which is how a reader of the
-    record finds the request behind it."""
-    return {
-        "state": state.value,
-        "in_progress": state in IN_FLIGHT_STATES,
-        "last_run_id": str(run.run_id),
-    }
+    """The fields every resource state change writes: the state, and the in_progress flag derived
+    from it, so the two can never disagree. The run behind that state is not written here — a
+    reader asks the orchestrator for it (GET /api/v1/workflow-runs/latest), rather than the
+    orchestrator copying its own run ids into another system's records."""
+    return {"state": state.value, "in_progress": state in IN_FLIGHT_STATES}
 
 
 class StepHandler(abc.ABC):
@@ -160,17 +157,25 @@ class ConfigureResourceStep(StepHandler):
         if st.operation is ResourceOperation.CREATE:
             resource.vendor_id = str(run.run_id)  # the run id is the new resource's identity
             body = (
-                resource.model_dump(exclude={"project_id", "resource_type"})
+                # resource_id is the provider's to assign, and it answers with it below.
+                resource.model_dump(exclude={"project_id", "resource_type", "resource_id"})
                 | fields
                 | {"last_modified_by": run.created_by}
             )
-            await self.resource_client.create_resource(
+            resource_id = await self.resource_client.create_resource(
                 project_id=resource.project_id,
                 resource_type=resource.resource_type,
                 body=body,
                 idempotency_key=idem_key(run, StepName.CONFIGURE_RESOURCE),
             )
-            logger.info("Run %s: created resource record %s.", run.run_id, resource.vendor_id)
+            if resource_id:  # what the record is looked up by afterwards; a vendor id can repeat
+                resource.resource_id = resource_id
+            logger.info(
+                "Run %s: created resource record %s (provider id %s).",
+                run.run_id,
+                resource.vendor_id,
+                resource_id,
+            )
         else:  # UPDATE / DELETE — the record already exists; only its state changes.
             await self.resource_client.update_resource(
                 resource.project_id, resource.resource_type, resource.vendor_id, fields
@@ -367,9 +372,11 @@ class FinalizeResourceStep(StepHandler):
         for a CREATE that replaces the run-id placeholder with the real vendor id."""
         fields = resource_state_fields(run, ResourceState.READY)  # done: nothing left in flight
         if run.run_state.operation is ResourceOperation.UPDATE:
-            fields |= resource.model_dump(exclude={"project_id", "resource_type", "vendor_id"}) | {
-                "last_modified_by": run.created_by
-            }
+            fields |= resource.model_dump(
+                # vendor_id and resource_id name the record rather than describe it, so neither is
+                # part of the desired state written into it.
+                exclude={"project_id", "resource_type", "vendor_id", "resource_id"}
+            ) | {"last_modified_by": run.created_by}
         engine_result = run.run_state.step_results.get(StepName.RUN_ENGINE)
         engine_vendor_id = engine_result.final_vendor_id if engine_result else None
         if engine_vendor_id and engine_vendor_id != resource.vendor_id:

@@ -6,7 +6,7 @@
 
 Two asynchronous workflow types (both create the RITM):
 1. **Automation Flow**: trigger → resolve workflow → create RITM → run workflow engine → close RITM.
-2. **Resource Flow**: trigger → resolve workflow → create RITM → Resource Manager (register: create/mark `PENDING_APPROVAL`) → await RITM approval → Resource Manager (mark in flight) → run workflow engine → finalize resource (`READY`, or `DELETED` + remove) → close RITM. A failed run's record is marked `FAILED`; a rejected one's is released.
+2. **Resource Flow**: trigger → resolve workflow → create RITM → Resource Manager (create/mark the record `PROVISIONING`/`UPDATING`/`DELETING`) → await RITM approval → run workflow engine → finalize resource (`READY`, or `DELETED` + remove) → close RITM. The record is written *before* the approval gate, so a portal shows the request from the moment it is made. A failed run's record is marked `FAILED`; a rejected one's is released.
 
 **Run state, one durable store.** The durable object is a **`WorkflowRun`** row (type, status, `current_step`, per-step `state`, `scheduled_at`, `version`) that *we* own. It holds no queue mechanics (no `locked_by`, no `lock_expires_at`); the one time-related field, `scheduled_at`, is application scheduling — "(re-)drive me at/after this time" — not a lease. A run is advanced by a worker claiming its row and driving it: load, step forward, persist, and (if the run must wait or retry) set `scheduled_at` to a future time.
 

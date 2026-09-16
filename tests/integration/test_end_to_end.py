@@ -108,7 +108,12 @@ async def test_resource_run_reaches_completed(
     assert any("servicecatalog" in p for _, p in servicenow.requests)  # ticket ordered
     finalized = project_manager.patches[-1]  # resource finalized
     assert finalized["state"] == "READY" and finalized["in_progress"] is False
-    assert finalized["last_run_id"] == str(run.run_id)
+    assert "last_run_id" not in finalized  # the record does not carry run ids
+    # The record's own id was captured from the provider's create response, so the run behind that
+    # state is found by asking the orchestrator — what GET /workflow-runs/latest serves.
+    record = next(iter(project_manager.resources.values()))
+    latest = await runs.find_last_by_resource_id(record["_id"])
+    assert latest is not None and latest.run_id == run.run_id
     assert servicenow.ritms[-1].state == 3  # RITM closed
     assert not servicenow.incidents  # no failure → no INC
 
@@ -182,7 +187,8 @@ async def test_failed_resource_run_marks_the_resource_failed(
     # Nothing is rolled back: the record stays, marked FAILED and no longer in progress.
     record = project_manager.resources[f"proj-1/vm/{run.run_id}"]
     assert record["state"] == "FAILED" and record["in_progress"] is False
-    assert record["last_run_id"] == str(run.run_id)
+    latest = await runs.find_last_by_resource_id(record["_id"])
+    assert latest is not None and latest.run_id == run.run_id
 
 
 async def test_delete_resource_run_removes_the_record(
@@ -195,6 +201,7 @@ async def test_delete_resource_run_removes_the_record(
         "vendor_id": "vm-1",
         "state": "READY",
         "in_progress": False,
+        "_id": "pm-1",
     }
     runs, run_service, workflows, executor = await _assemble(
         pg_session_factory, servicenow, airflow, project_manager
@@ -206,7 +213,7 @@ async def test_delete_resource_run_removes_the_record(
         max_retries=3,
         ticket_params={},
         workflow_params={},
-        resource=make_resource_spec(vendor_id="vm-1"),
+        resource=make_resource_spec(vendor_id="vm-1", resource_id="pm-1"),
         operation=ResourceOperation.DELETE,
         ticket=None,
     )

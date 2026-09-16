@@ -33,11 +33,12 @@ def make_workflow(
     )
 
 
-def make_resource_spec(*, vendor_id: str = "vm-1") -> ResourceSpec:
+def make_resource_spec(*, vendor_id: str = "vm-1", resource_id: str = "") -> ResourceSpec:
     return ResourceSpec(
         project_id="proj-1",
         resource_type="vm",
         vendor_id=vendor_id,
+        resource_id=resource_id,
         name="app-01",
         region="gvt",
         environment="prod",

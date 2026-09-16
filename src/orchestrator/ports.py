@@ -58,7 +58,13 @@ class WorkflowRunRepository(abc.ABC):
     async def find_by_ticket_id(self, ticket_id: str) -> list[WorkflowRun]: ...
 
     @abc.abstractmethod
-    async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]: ...
+    async def find_by_vendor_id(self, vendor_id: str) -> list[WorkflowRun]: ...
+
+    @abc.abstractmethod
+    async def find_last_by_resource_id(self, resource_id: str) -> WorkflowRun | None:
+        """The most recently created run against one resource manager record, or None when that
+        record has never had one. Keyed on the record's own id rather than the vendor id, which
+        several records share — one per region/environment — while a run targets exactly one."""
 
     @abc.abstractmethod
     async def find_by_engine_run_id(self, engine_run_id: str) -> list[WorkflowRun]:
@@ -147,8 +153,12 @@ class ResourceManagerClient(abc.ABC):
     @abc.abstractmethod
     async def create_resource(
         self, project_id: str, resource_type: str, body: dict[str, Any], idempotency_key: str
-    ) -> dict[str, Any]:
-        """Create a project resource; body carries vendor_id/name/region/etc."""
+    ) -> str | None:
+        """Create a project resource; body carries vendor_id/name/region/etc.
+
+        Returns the provider's own id for the new record, where it has one — the stable key the
+        record can be found by afterwards, since a vendor id can repeat across records. None when
+        the provider names its records by nothing but the fields it was given."""
 
     @abc.abstractmethod
     async def update_resource(

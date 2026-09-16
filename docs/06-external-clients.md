@@ -52,9 +52,11 @@ class ResourceManagerClient(abc.ABC):
 
     @abc.abstractmethod
     async def create_resource(self, project_id: str, resource_type: str,
-                              body: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+                              body: dict[str, Any], idempotency_key: str) -> str | None:
         """Create a project resource; body carries vendor_id/name/region/etc. plus the lifecycle
-        fields (state, in_progress, last_run_id)."""
+        fields (state, in_progress). Returns the provider's OWN id for the new record, where it has
+        one — the stable key the record is found by afterwards, since a vendor id repeats across
+        records. None when the provider names its records by nothing but their fields."""
 
     @abc.abstractmethod
     async def update_resource(self, project_id: str, resource_type: str, vendor_id: str,
@@ -478,13 +480,17 @@ class ServiceNowTicketClient(TicketSystemClient):
 ## `adapters/project_manager.py`
 
 **The record carries the request's lifecycle.** Besides the spec, every write the orchestrator
-makes to a record sends three fields together (see
+makes to a record sends two fields together (see
 [07-orchestration](07-orchestration.md#the-resource-records-lifecycle-state)): `state` (a
-`ResourceState` value such as `PENDING_APPROVAL` or `READY`), `in_progress` (kept for existing
-readers; true exactly while the state is `PENDING_APPROVAL`/`PROVISIONING`/`UPDATING`/`DELETING`),
-and `last_run_id` — the portal reads it off the record and calls `GET /api/v1/workflow-runs/{run_id}`
-for the ticket, incident and failure detail. The adapter passes them through like any other field;
-only the orchestration layer knows what they mean.
+`ResourceState` value such as `PROVISIONING` or `READY`) and `in_progress` (kept for existing
+readers; true exactly while the state is `PROVISIONING`/`UPDATING`/`DELETING`). The adapter passes
+them through like any other field; only the orchestration layer knows what they mean.
+
+**No run id is written to the record.** A reader that wants the request behind a state asks the
+orchestrator — `GET /api/v1/workflow-runs/latest?resource_id=…`
+([incoming-endpoints](incoming-endpoints.md)). That lookup is keyed on Project Manager's own `_id`,
+which `create_resource` reads off the create response and returns as a plain record id: the only
+part of the provider's answer that crosses the port, and the `_id` *spelling* stops at the adapter.
 
 **Not found is a domain error on PATCH.** A PATCH answered `404` raises `ResourceNotFoundError`
 rather than an `HTTPStatusError`, so a re-driven DELETE finalize (whose `DELETED` PATCH hits a
@@ -519,13 +525,15 @@ class ProjectManagerResourceClient(ResourceManagerClient):
                                  transport=self._transport)
 
     async def create_resource(self, project_id: str, resource_type: str,
-                              body: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+                              body: dict[str, Any], idempotency_key: str) -> str | None:
         async with self._client() as client:
             resp = await client.post(
                 f"/projects/{project_id}/project_resources/{resource_type}",
                 json=body, headers={"Idempotency-Key": idempotency_key})  # header is orchestrator-added
             resp.raise_for_status()
-            return resp.json()
+            record: dict[str, Any] = resp.json()
+            resource_id = record.get("_id")     # PM's own document id; the spelling stops here
+            return str(resource_id) if resource_id is not None else None
 
     async def update_resource(self, project_id: str, resource_type: str, vendor_id: str,
                               fields: dict[str, Any]) -> None:

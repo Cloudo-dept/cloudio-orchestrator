@@ -70,9 +70,9 @@ async def drive(
     return await runs.get(run_id)
 
 
-def state_fields(run_id: uuid.UUID, state: str, *, in_progress: bool) -> dict[str, Any]:
+def state_fields(state: str, *, in_progress: bool) -> dict[str, Any]:
     """What every resource state change writes."""
-    return {"state": state, "in_progress": in_progress, "last_run_id": str(run_id)}
+    return {"state": state, "in_progress": in_progress}
 
 
 class FlakyTicketClient(FakeTicketSystemClient):
@@ -131,7 +131,7 @@ async def test_resource_run_completes_and_finalizes(
     assert resources.created_by_key[resources.create_calls[0]]["state"] == "PROVISIONING"
     # ...then finalize marks it READY, and the RITM is closed.
     assert resources.updated == [
-        ("proj-1", "vm", str(run.run_id), state_fields(run.run_id, "READY", in_progress=False)),
+        ("proj-1", "vm", str(run.run_id), state_fields("READY", in_progress=False)),
     ]
     assert tickets.closed and tickets.closed[0][1] == "Resource create completed; request closed."
 
@@ -150,8 +150,8 @@ async def test_delete_resource_run_removes_the_record_end_to_end(
     assert resources.create_calls == []  # a delete provisions nothing
     # The caller's record goes DELETING → DELETED, and is then removed.
     assert resources.updated == [
-        ("proj-1", "vm", "vm-1", state_fields(created.run_id, "DELETING", in_progress=True)),
-        ("proj-1", "vm", "vm-1", state_fields(created.run_id, "DELETED", in_progress=False)),
+        ("proj-1", "vm", "vm-1", state_fields("DELETING", in_progress=True)),
+        ("proj-1", "vm", "vm-1", state_fields("DELETED", in_progress=False)),
     ]
     assert resources.deleted == [("proj-1", "vm", "vm-1")]
     assert tickets.closed and tickets.closed[0][1] == "Resource delete completed; request closed."
@@ -552,8 +552,8 @@ async def test_rejected_update_leaves_the_resource_ready(
     assert final.status is RunStatus.REJECTED
     assert resources.deleted == []  # an existing resource is never deleted over a rejected change
     assert resources.updated == [
-        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "UPDATING", in_progress=True)),
-        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "READY", in_progress=False)),
+        ("proj-1", "vm", "vm-1", state_fields("UPDATING", in_progress=True)),
+        ("proj-1", "vm", "vm-1", state_fields("READY", in_progress=False)),
     ]
 
 
@@ -598,8 +598,10 @@ async def test_configure_resource_step_create_assigns_run_id_as_vendor_id(resour
     assert created["vendor_id"] == str(run.run_id)
     assert created["state"] == "PROVISIONING"
     assert created["in_progress"] is True
-    assert created["last_run_id"] == str(run.run_id)
     assert created["last_modified_by"] == "jdoe"
+    # The provider's own id for the new record is stored on the run — the key a later "latest run
+    # for this resource" lookup uses, since a vendor id can repeat across records.
+    assert run.run_state.resource.resource_id == "rec-1"
     assert resources.updated == []  # no PATCH — the record was created, not updated
 
     assert await step.execute(run) is True  # re-drive: marker short-circuits
@@ -653,13 +655,25 @@ async def test_configure_resource_step_marks_an_existing_record_in_flight(
     assert run.run_state.resource_configured is True
     # An UPDATE/DELETE acts on an existing record — no create, only its state on the caller's id.
     assert resources.create_calls == []
-    assert resources.updated == [
-        ("proj-1", "vm", "vm-1", state_fields(run.run_id, state, in_progress=True))
-    ]
+    assert resources.updated == [("proj-1", "vm", "vm-1", state_fields(state, in_progress=True))]
     assert run.run_state.resource is not None
     assert run.run_state.resource.vendor_id == "vm-1"  # left untouched
     assert await step.execute(run) is True  # re-drive: marker short-circuits
     assert len(resources.updated) == 1
+
+
+async def test_configure_resource_keeps_the_callers_resource_id(resources) -> None:
+    # An UPDATE/DELETE names the record it acts on, and nothing is created, so nothing re-assigns
+    # it: the id the caller supplied at trigger time is what the run stays findable by.
+    step = ConfigureResourceStep(resources)
+    run = make_run(run_type=RunType.RESOURCE, operation=ResourceOperation.UPDATE)
+    assert run.run_state.resource is not None
+    run.run_state.resource.resource_id = "rec-caller"
+
+    assert await step.execute(run) is True
+
+    assert run.run_state.resource.resource_id == "rec-caller"
+    assert resources.create_calls == []
 
 
 async def test_finalize_resource_step(resources) -> None:
@@ -673,9 +687,7 @@ async def test_finalize_resource_step(resources) -> None:
     run = make_run(run_type=RunType.RESOURCE)
     assert await step.execute(run) is True
     assert run.run_state.resource_finalized is True
-    assert resources.updated == [
-        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "READY", in_progress=False))
-    ]
+    assert resources.updated == [("proj-1", "vm", "vm-1", state_fields("READY", in_progress=False))]
     assert await step.execute(run) is True  # re-drive: marker short-circuits
     assert len(resources.updated) == 1
 
@@ -696,7 +708,7 @@ async def test_finalize_resource_step_update_writes_the_spec_as_desired_state(re
             "vm",
             "vm-1",
             {
-                **state_fields(run.run_id, "READY", in_progress=False),
+                **state_fields("READY", in_progress=False),
                 "name": "app-01",
                 "region": "gvt",
                 "environment": "prod",
@@ -719,7 +731,7 @@ async def test_finalize_resource_step_delete_removes_the_record(resources) -> No
     assert run.run_state.resource_finalized is True
     # Marked DELETED first — a provider that retires records keeps one that says so — then deleted.
     assert resources.updated == [
-        ("proj-1", "vm", "vm-1", state_fields(run.run_id, "DELETED", in_progress=False))
+        ("proj-1", "vm", "vm-1", state_fields("DELETED", in_progress=False))
     ]
     assert resources.deleted == [("proj-1", "vm", "vm-1")]
     assert await step.execute(run) is True  # re-drive: marker short-circuits
@@ -770,12 +782,12 @@ async def test_engine_final_vendor_id_overrides_finalize_target(
         "proj-1",
         "vm",
         str(run.run_id),
-        {**state_fields(run.run_id, "READY", in_progress=False), "vendor_id": "vm-engine-99"},
+        {**state_fields("READY", in_progress=False), "vendor_id": "vm-engine-99"},
     )
     # The run follows the record to its real id, so looking runs up by that id finds this one.
     assert final.run_state.resource is not None
     assert final.run_state.resource.vendor_id == "vm-engine-99"
-    assert [r.run_id for r in await runs.find_by_resource_id("vm-engine-99")] == [run.run_id]
+    assert [r.run_id for r in await runs.find_by_vendor_id("vm-engine-99")] == [run.run_id]
 
 
 async def test_finalize_falls_back_to_original_vendor_id(
@@ -792,7 +804,7 @@ async def test_finalize_falls_back_to_original_vendor_id(
         "proj-1",
         "vm",
         str(run.run_id),
-        state_fields(run.run_id, "READY", in_progress=False),
+        state_fields("READY", in_progress=False),
     )
     assert final.run_state.resource is not None
     assert StepName.RUN_ENGINE not in final.run_state.step_results
@@ -856,7 +868,7 @@ async def test_failed_resource_run_marks_the_resource_failed(
         "proj-1",
         "vm",
         str(run.run_id),
-        state_fields(run.run_id, "FAILED", in_progress=False),
+        state_fields("FAILED", in_progress=False),
     )
     assert resources.deleted == []
 
@@ -877,7 +889,7 @@ async def test_a_failure_after_finalize_leaves_the_resource_ready(
         "proj-1",
         "vm",
         str(run.run_id),
-        state_fields(run.run_id, "READY", in_progress=False),
+        state_fields("READY", in_progress=False),
     )
 
 
@@ -907,4 +919,4 @@ async def test_a_ticket_system_outage_does_not_cost_the_resource_update(
     final = await drive(runs, executor, run.run_id, iters=20)
 
     assert final.status is RunStatus.FAILED
-    assert resources.updated[-1][3] == state_fields(run.run_id, "FAILED", in_progress=False)
+    assert resources.updated[-1][3] == state_fields("FAILED", in_progress=False)

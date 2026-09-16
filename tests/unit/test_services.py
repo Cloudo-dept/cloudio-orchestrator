@@ -3,6 +3,7 @@
 import pytest
 
 from orchestrator.domain import (
+    ResourceIdRequired,
     ResourceOperation,
     ResourceParamsRequired,
     ResourceVendorIdRequired,
@@ -195,7 +196,30 @@ async def test_trigger_without_vendor_id_for_an_existing_record_raises(
             max_retries=3,
             ticket_params={},
             workflow_params={},
-            resource=make_resource_spec(vendor_id=""),
+            resource=make_resource_spec(vendor_id="", resource_id="pm-1"),
+            operation=operation,
+            ticket=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "operation", [ResourceOperation.UPDATE, ResourceOperation.DELETE], ids=lambda op: op.value
+)
+async def test_trigger_without_resource_id_for_an_existing_record_raises(
+    runs, workflows, operation
+) -> None:
+    # A vendor id is not enough: it is shared by the records for every region/environment, and an
+    # UPDATE/DELETE acts on exactly one of them. Only the caller knows which.
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    svc = WorkflowRunService(runs, workflows)
+    with pytest.raises(ResourceIdRequired):
+        await svc.trigger(
+            workflow_identifier="provision-vm",
+            created_by="jdoe",
+            max_retries=3,
+            ticket_params={},
+            workflow_params={},
+            resource=make_resource_spec(vendor_id="vm-9"),  # names the vendor, not the record
             operation=operation,
             ticket=None,
         )
@@ -211,7 +235,7 @@ async def test_trigger_carries_the_operation_independently_of_the_spec(runs, wor
         max_retries=3,
         ticket_params={},
         workflow_params={},
-        resource=make_resource_spec(vendor_id="vm-9"),
+        resource=make_resource_spec(vendor_id="vm-9", resource_id="pm-9"),
         operation=ResourceOperation.DELETE,
         ticket=None,
     )
@@ -253,6 +277,6 @@ async def test_find_by_ticket_and_resource(runs, workflows) -> None:
         ticket=None,
     )
 
-    found = await svc.find_by_resource_id("vm-7")
+    found = await svc.find_by_vendor_id("vm-7")
     assert [r.run_id for r in found] == [run.run_id]
-    assert await svc.find_by_resource_id("absent") == []
+    assert await svc.find_by_vendor_id("absent") == []

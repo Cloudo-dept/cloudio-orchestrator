@@ -75,7 +75,7 @@ async def create_resource(
     # Idempotent on the orchestrator-supplied key, and on the natural key (vendor_id).
     by_key = await db["resources"].find_one({"idempotency_key": idempotency_key})
     if by_key is not None:
-        by_key_body: dict[str, Any] = by_key["body"]
+        by_key_body: dict[str, Any] = {**by_key["body"], "_id": str(by_key["_id"])}
         return by_key_body
 
     vendor_id = body["vendor_id"]
@@ -87,11 +87,11 @@ async def create_resource(
         }
     )
     if by_vendor is not None:
-        by_vendor_body: dict[str, Any] = by_vendor["body"]
+        by_vendor_body: dict[str, Any] = {**by_vendor["body"], "_id": str(by_vendor["_id"])}
         return by_vendor_body
 
     resource = {**body, "in_progress": body.get("in_progress", True)}
-    await db["resources"].insert_one(
+    result = await db["resources"].insert_one(
         {
             "idempotency_key": idempotency_key,
             "project_id": project_id,
@@ -100,7 +100,9 @@ async def create_resource(
             "body": resource,
         }
     )
-    return resource
+    # The document id the orchestrator stores on the run — what a later "latest run for this
+    # resource" lookup is keyed by.
+    return {**resource, "_id": str(result.inserted_id)}
 
 
 @app.patch("/projects/{project_id}/project_resources/{resource_type}/{vendor_id}")
@@ -151,4 +153,4 @@ async def list_resources(project_id: str, resource_type: str) -> list[dict[str, 
         .find({"project_id": project_id, "resource_type": resource_type})
         .to_list(length=None)
     )
-    return [r["body"] for r in rows]
+    return [{**r["body"], "_id": str(r["_id"])} for r in rows]

@@ -6,6 +6,7 @@ from typing import Any
 
 from orchestrator.domain import (
     ResolvedWorkflow,
+    ResourceIdRequired,
     ResourceOperation,
     ResourceParamsRequired,
     ResourceSpec,
@@ -82,6 +83,16 @@ class WorkflowRunService:
                     workflow_identifier,
                 )
                 raise ResourceVendorIdRequired(workflow_identifier)
+            # Likewise the resource manager's own record id: it is what the run is later found by,
+            # and only the caller — which listed the records — knows which one this acts on.
+            if operation is not ResourceOperation.CREATE and not resource.resource_id:
+                logger.warning(
+                    "Trigger rejected: a %s operation on workflow '%s' needs the resource_id of "
+                    "the record it acts on.",
+                    operation.value,
+                    workflow_identifier,
+                )
+                raise ResourceIdRequired(workflow_identifier)
         if wf.run_type is RunType.AUTOMATION and ticket is None:
             logger.warning(
                 "Trigger rejected: workflow '%s' is an automation run but no ticket was supplied.",
@@ -131,8 +142,11 @@ class WorkflowRunService:
     async def find_by_ticket_id(self, ticket_id: str) -> list[WorkflowRun]:
         return await self.runs.find_by_ticket_id(ticket_id)
 
-    async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]:
-        return await self.runs.find_by_resource_id(vendor_id)
+    async def find_by_vendor_id(self, vendor_id: str) -> list[WorkflowRun]:
+        return await self.runs.find_by_vendor_id(vendor_id)
+
+    async def find_last_by_resource_id(self, resource_id: str) -> WorkflowRun | None:
+        return await self.runs.find_last_by_resource_id(resource_id)
 
 
 class RunCallbackService:

@@ -136,11 +136,30 @@ class PostgresWorkflowRunRepository(WorkflowRunRepository):
     async def find_by_ticket_id(self, ticket_id: str) -> list[WorkflowRun]:
         return await self._find_by_path("{ticket,ticket_id}", ticket_id)
 
-    async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]:
+    async def find_by_vendor_id(self, vendor_id: str) -> list[WorkflowRun]:
         return await self._find_by_path("{resource,vendor_id}", vendor_id)
 
     async def find_by_engine_run_id(self, engine_run_id: str) -> list[WorkflowRun]:
         return await self._find_by_path("{engine_run_id}", engine_run_id)
+
+    async def find_last_by_resource_id(self, resource_id: str) -> WorkflowRun | None:
+        # Same inlined-path rule as _find_by_path (see the note there), plus newest-first. The
+        # index carries created_at after the path expression, so this stops at the first row
+        # instead of sorting every run the record ever had.
+        async with self.session_factory() as session:
+            column = WorkflowRun.run_state.op("#>>", return_type=String)(  # type: ignore[attr-defined]
+                literal_column("'{resource,resource_id}'")
+            )
+            stmt = (
+                select(WorkflowRun)
+                .where(column == resource_id)
+                .order_by(WorkflowRun.created_at.desc())  # type: ignore[attr-defined]
+                .limit(1)
+            )
+            run = (await session.execute(stmt)).scalars().first()
+            if run is not None:
+                session.expunge(run)
+            return run
 
     async def _find_by_path(self, json_path: str, value: str) -> list[WorkflowRun]:
         # `run_state #>> '{a,b}'` — matches the partial JSONB index in the migration.

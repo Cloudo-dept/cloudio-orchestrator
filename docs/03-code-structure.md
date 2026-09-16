@@ -73,7 +73,7 @@ cloudio-orchestrator/
         ├── services.py                 # WorkflowService · WorkflowRunService
         ├── orchestration/
         │   ├── __init__.py
-        │   ├── steps.py                # StepHandler ABC + CreateTicketStep/RegisterResourceStep/AwaitApprovalStep/ConfigureResourceStep/RunEngineStep/FinalizeResourceStep/CloseTicketStep + resource_state_fields
+        │   ├── steps.py                # StepHandler ABC + CreateTicketStep/ConfigureResourceStep/AwaitApprovalStep/RunEngineStep/FinalizeResourceStep/CloseTicketStep + resource_state_fields
         │   ├── plans.py                # RUN_PLANS (RunType → ordered StepNames) + build_handlers()
         │   ├── failure_policy.py       # FAILURE_POLICIES (FailureKind → retry? incident? ticket comment)
         │   ├── executor.py             # RunExecutor (drives one run per call)

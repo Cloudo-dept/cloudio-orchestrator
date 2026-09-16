@@ -74,8 +74,11 @@ class WorkflowRunService:
     async def find_by_ticket_id(self, ticket_id: str) -> list[WorkflowRun]:
         return await self.runs.find_by_ticket_id(ticket_id)
 
-    async def find_by_resource_id(self, vendor_id: str) -> list[WorkflowRun]:
-        return await self.runs.find_by_resource_id(vendor_id)
+    async def find_by_vendor_id(self, vendor_id: str) -> list[WorkflowRun]:
+        return await self.runs.find_by_vendor_id(vendor_id)
+
+    async def find_last_by_resource_id(self, resource_id: str) -> WorkflowRun | None:
+        return await self.runs.find_last_by_resource_id(resource_id)
 ```
 
 ## `api.py` — FastAPI app + HTTP schemas
@@ -199,6 +202,23 @@ async def trigger_workflow_run(request: WorkflowRunTriggerRequest,
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"resource.vendor_id is required for a {request.operation.value} operation "
                    "— it names the record to act on.")
+    except ResourceIdRequired:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"resource.resource_id is required for a {request.operation.value} operation "
+                   "— it names the resource manager record to act on.")
+
+
+# BEFORE /{run_id}: that route parses its path segment as a UUID, so whichever is declared first
+# wins and "latest" would be rejected there as a malformed run id.
+@app.get("/api/v1/workflow-runs/latest", response_model=ResourceRunSummary)
+async def get_latest_resource_run(resource_id: str,
+                                  svc: WorkflowRunService = Depends(get_run_service)):
+    run = await svc.find_last_by_resource_id(resource_id)
+    if run is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            detail=f"No runs for resource record '{resource_id}'.")
+    return summarize_run(run)          # a trimmed summary, not the internal run_state
 
 
 @app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)
@@ -211,13 +231,13 @@ async def get_workflow_run(run_id: uuid.UUID,
 
 
 @app.get("/api/v1/workflow-runs", response_model=list[WorkflowRunResponse])
-async def list_workflow_runs(ticket_id: str | None = None, resource_id: str | None = None,
+async def list_workflow_runs(ticket_id: str | None = None, vendor_id: str | None = None,
                              svc: WorkflowRunService = Depends(get_run_service)):
     if ticket_id:
         return await svc.find_by_ticket_id(ticket_id)
-    if resource_id:
-        return await svc.find_by_resource_id(resource_id)
-    raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Provide ticket_id or resource_id.")
+    if vendor_id:
+        return await svc.find_by_vendor_id(vendor_id)
+    return await svc.list_recent()     # unfiltered: the most recent runs, newest first
 ```
 
 ## `worker.py` — daemon: workers claim and drive runs directly

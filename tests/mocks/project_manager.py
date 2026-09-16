@@ -44,7 +44,13 @@ def _build(mock: ProjectManagerMock) -> FastAPI:
         if idempotency_key in mock._by_key:  # replay → same resource
             return mock.resources[mock._by_key[idempotency_key]]
         key = f"{project_id}/{resource_type}/{body['vendor_id']}"
-        mock.resources[key] = {"in_progress": True, **body}  # the default, unless the body sets it
+        # in_progress is the default unless the body sets it; _id is the provider's own id, which
+        # the real Project Manager mints per document.
+        mock.resources[key] = {
+            "in_progress": True,
+            **body,
+            "_id": f"pm-{len(mock.resources) + 1}",
+        }
         mock._by_key[idempotency_key] = key
         return mock.resources[key]
 

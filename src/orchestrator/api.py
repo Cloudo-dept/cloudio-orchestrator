@@ -9,12 +9,14 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.domain import (
+    ResourceIdRequired,
     ResourceOperation,
     ResourceParamsRequired,
     ResourceSpec,
@@ -28,6 +30,7 @@ from orchestrator.domain import (
     Workflow,
     WorkflowAlreadyExistsError,
     WorkflowEngineType,
+    WorkflowRun,
 )
 from orchestrator.log import RequestContextMiddleware, configure_logging
 from orchestrator.ports import HealthCheck
@@ -94,6 +97,46 @@ class WorkflowRunResponse(BaseModel):
     created_by: str
     max_retries: int
     run_state: RunState  # typed — clients see a real schema
+
+
+class ResourceRunSummary(BaseModel):
+    """The request behind a resource's current state, for the screen its owner is looking at:
+    what is happening, who asked for it, and where to go for the rest (the RITM, the Incident).
+    Deliberately not WorkflowRunResponse — the run's working state (step attempts, engine payloads,
+    parameter sets) is orchestration bookkeeping, not something a resource's owner reads."""
+
+    run_id: uuid.UUID
+    status: RunStatus
+    current_step: str | None
+    operation: ResourceOperation
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+    ticket_id: str | None
+    incident_id: str | None
+    failure_detail: str | None
+
+
+def summarize_run(run: WorkflowRun) -> ResourceRunSummary:
+    """Project a run onto the summary. The failure detail prefers what the engine reported — the
+    message that says what actually went wrong — and falls back to the last step error."""
+    st = run.run_state
+    failure = st.engine_failure
+    detail = failure.detail if failure is not None and failure.detail else None
+    if detail is None and st.errors:
+        detail = list(st.errors.values())[-1]
+    return ResourceRunSummary(
+        run_id=run.run_id,
+        status=run.status,
+        current_step=run.current_step,
+        operation=st.operation,
+        created_by=run.created_by,
+        created_at=run.created_at,
+        updated_at=run.updated_at,
+        ticket_id=st.ticket.ticket_id if st.ticket is not None else None,
+        incident_id=st.incident_id,
+        failure_detail=detail,
+    )
 
 
 class TicketApprovalCallbackRequest(BaseModel):
@@ -287,11 +330,39 @@ async def trigger_workflow_run(
                 "— it names the record to act on."
             ),
         ) from None
+    except ResourceIdRequired:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"resource.resource_id is required for a {request.operation.value} operation "
+                "— it names the resource manager record to act on."
+            ),
+        ) from None
     except TicketRefRequired:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="ticket is required for an automation workflow.",
         ) from None
+
+
+@app.get("/api/v1/workflow-runs/latest", response_model=ResourceRunSummary)
+async def get_latest_resource_run(
+    resource_id: str,
+    svc: WorkflowRunService = Depends(get_run_service),
+) -> ResourceRunSummary:
+    """The most recent run against one resource manager record — what a portal shows beside a
+    resource whose state says something is (or went) wrong.
+
+    Declared BEFORE /workflow-runs/{run_id}: that route parses its path segment as a UUID, so
+    whichever is declared first wins and "latest" would be rejected there as a malformed run id.
+    """
+    run = await svc.find_last_by_resource_id(resource_id)
+    if run is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"No runs for resource record '{resource_id}'.",
+        )
+    return summarize_run(run)
 
 
 @app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)
@@ -308,13 +379,13 @@ async def get_workflow_run(
 @app.get("/api/v1/workflow-runs", response_model=list[WorkflowRunResponse])
 async def list_workflow_runs(
     ticket_id: str | None = None,
-    resource_id: str | None = None,
+    vendor_id: str | None = None,
     svc: WorkflowRunService = Depends(get_run_service),
 ) -> Any:
     if ticket_id:
         return await svc.find_by_ticket_id(ticket_id)
-    if resource_id:
-        return await svc.find_by_resource_id(resource_id)
+    if vendor_id:
+        return await svc.find_by_vendor_id(vendor_id)
     return await svc.list_recent()  # unfiltered: the most recent runs, newest first
 
 
