@@ -488,9 +488,11 @@ them through like any other field; only the orchestration layer knows what they 
 
 **No run id is written to the record.** A reader that wants the request behind a state asks the
 orchestrator — `GET /api/v1/workflow-runs/latest?resource_id=…`
-([incoming-endpoints](incoming-endpoints.md)). That lookup is keyed on Project Manager's own `_id`,
-which `create_resource` reads off the create response and returns as a plain record id: the only
-part of the provider's answer that crosses the port, and the `_id` *spelling* stops at the adapter.
+([incoming-endpoints](incoming-endpoints.md)). That lookup is keyed on Project Manager's own id for
+the record, which it answers a create with: the response is an acknowledgement —
+`{message, project_resource_id}` — **not** the record it made. `create_resource` returns that id and
+nothing else, so it is the only part of the provider's answer that crosses the port, and the
+`project_resource_id` *spelling* stops at the adapter.
 
 **Not found is a domain error on PATCH.** A PATCH answered `404` raises `ResourceNotFoundError`
 rather than an `HTTPStatusError`, so a re-driven DELETE finalize (whose `DELETED` PATCH hits a
@@ -531,9 +533,9 @@ class ProjectManagerResourceClient(ResourceManagerClient):
                 f"/projects/{project_id}/project_resources/{resource_type}",
                 json=body, headers={"Idempotency-Key": idempotency_key})  # header is orchestrator-added
             resp.raise_for_status()
-            record: dict[str, Any] = resp.json()
-            resource_id = record.get("_id")     # PM's own document id; the spelling stops here
-            return str(resource_id) if resource_id is not None else None
+            created: dict[str, Any] = resp.json()   # {message, project_resource_id} — an
+            resource_id = created.get("project_resource_id")   # acknowledgement, not the record;
+            return str(resource_id) if resource_id is not None else None   # spelling stops here
 
     async def update_resource(self, project_id: str, resource_type: str, vendor_id: str,
                               fields: dict[str, Any]) -> None:

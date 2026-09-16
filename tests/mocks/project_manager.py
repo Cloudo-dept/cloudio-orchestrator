@@ -23,6 +23,11 @@ class ProjectManagerMock:
         return _build(self)
 
 
+def _ack(record: dict[str, Any]) -> dict[str, Any]:
+    """What the provider answers a create with: an acknowledgement, not the record it made."""
+    return {"message": "resource created", "project_resource_id": record["project_resource_id"]}
+
+
 def _build(mock: ProjectManagerMock) -> FastAPI:
     app = FastAPI()
 
@@ -42,17 +47,17 @@ def _build(mock: ProjectManagerMock) -> FastAPI:
         idempotency_key: str = Header(alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         if idempotency_key in mock._by_key:  # replay → same resource
-            return mock.resources[mock._by_key[idempotency_key]]
+            return _ack(mock.resources[mock._by_key[idempotency_key]])
         key = f"{project_id}/{resource_type}/{body['vendor_id']}"
-        # in_progress is the default unless the body sets it; _id is the provider's own id, which
+        # in_progress is the default unless the body sets it; the id is the provider's own, which
         # the real Project Manager mints per document.
         mock.resources[key] = {
             "in_progress": True,
             **body,
-            "_id": f"pm-{len(mock.resources) + 1}",
+            "project_resource_id": f"pm-{len(mock.resources) + 1}",
         }
         mock._by_key[idempotency_key] = key
-        return mock.resources[key]
+        return _ack(mock.resources[key])
 
     @app.patch("/projects/{project_id}/project_resources/{resource_type}/{vendor_id}")
     async def update(

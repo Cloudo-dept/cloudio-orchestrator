@@ -18,7 +18,7 @@ async def test_create_resource_posts_body_and_key(
     record = project_manager.resources["proj-1/vm/vm-1"]
     assert record["vendor_id"] == "vm-1" and record["in_progress"] is True
     # The provider's own id for the record comes back, so the run can be found by it later.
-    assert result == record["_id"]
+    assert result == record["project_resource_id"]
 
 
 async def test_create_resource_replay_is_idempotent(

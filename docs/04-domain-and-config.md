@@ -215,7 +215,7 @@ class ResourceSpec(BaseModel):
                               # reported its own id;
                               # an UPDATE/DELETE REQUIRES the caller's (checked at trigger time,
                               # where the operation is known)
-    resource_id: str = ""       # the resource manager's OWN id for the record (PM: _id). It names
+    resource_id: str = ""       # the resource manager's OWN id for the record (PM: project_resource_id). It names
                               # ONE record, where vendor_id is shared by the records for every
                               # region/environment — so it is what "the latest run for this
                               # resource" is looked up by. Assigned from the provider's create

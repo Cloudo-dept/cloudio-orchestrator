@@ -196,10 +196,11 @@ class ResourceSpec(BaseModel):
     # run id as the new record's identity. REQUIRED from the caller on an UPDATE/DELETE, which
     # target a record that already exists (enforced at trigger time, where the operation is known).
     vendor_id: str = ""
-    # The resource manager's own id for the record (provider-neutral name; Project Manager calls it
-    # _id). Unlike vendor_id, which several records share — one per region/environment — this names
-    # exactly one record, so it is what a run is looked up by. Assigned from the provider's response
-    # on a CREATE; REQUIRED from the caller on an UPDATE/DELETE, enforced at trigger time.
+    # The resource manager's own id for the record (provider-neutral name; Project Manager calls
+    # it project_resource_id). Unlike vendor_id, which several records share — one per
+    # region/environment — this names exactly one record, so it is what a run is looked up by.
+    # Assigned from the provider's create response on a CREATE; REQUIRED from the caller on an
+    # UPDATE/DELETE, enforced at trigger time.
     resource_id: str = ""
     name: str
     region: str | None = None

@@ -25,10 +25,10 @@ class ProjectManagerResourceClient(ResourceManagerClient):
             headers={"Idempotency-Key": idempotency_key},
         )  # orchestrator-added
         resp.raise_for_status()
-        record: dict[str, Any] = resp.json()
-        # Project Manager names its documents `_id`. That spelling stops here: the port promises
-        # only "the provider's id for the record", which is what the run stores.
-        resource_id = record.get("_id")
+        # The create answers an acknowledgement — {message, project_resource_id} — not the record
+        # it made. That spelling stops here: the port promises only "the provider's id for the
+        # record", which is what the run stores.
+        resource_id = resp.json().get("project_resource_id")
         return str(resource_id) if resource_id is not None else None
 
     async def update_resource(

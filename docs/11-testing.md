@@ -386,12 +386,12 @@ def _build_pm(mock: ProjectManagerMock) -> FastAPI:
     async def create(project_id: str, resource_type: str, body: dict[str, Any],
                      idempotency_key: str = Header(alias="Idempotency-Key")) -> dict[str, Any]:
         if idempotency_key in mock._by_key:                              # replay → same resource
-            return mock.resources[mock._by_key[idempotency_key]]
+            return _ack(mock.resources[mock._by_key[idempotency_key]])
         key = f"{project_id}/{resource_type}/{body['vendor_id']}"
-        # the orchestrator sends state/in_progress; _id is the provider's own, one per document
-        mock.resources[key] = dict(body) | {"_id": f"pm-{len(mock.resources) + 1}"}
+        # the orchestrator sends state/in_progress; the id is the provider's own, one per document
+        mock.resources[key] = dict(body) | {"project_resource_id": f"pm-{len(mock.resources) + 1}"}
         mock._by_key[idempotency_key] = key
-        return mock.resources[key]
+        return _ack(mock.resources[key])        # an acknowledgement, as the real provider answers
 
     @app.patch("/projects/{project_id}/project_resources/{resource_type}/{vendor_id}")
     async def update(project_id: str, resource_type: str, vendor_id: str,
@@ -526,7 +526,7 @@ async def test_token_refresh_on_401(airflow, airflow_client):
 async def test_create_returns_the_providers_resource_id(project_manager, pm_client):
     resource_id = await pm_client.create_resource(
         "proj-1", "vm", {"vendor_id": "vm-1"}, "run-1:configuring_resource")
-    assert resource_id == project_manager.resources["proj-1/vm/vm-1"]["_id"]
+    assert resource_id == project_manager.resources["proj-1/vm/vm-1"]["project_resource_id"]
 
 
 async def test_finalize_patches_ready_state(project_manager, pm_client):
@@ -597,7 +597,7 @@ async def test_resource_run_reaches_completed(pg_session_factory, servicenow, ai
     record = next(iter(project_manager.resources.values()))              # created PROVISIONING
     assert project_manager.patches[-1]["state"] == "READY"               # then finalized
     assert project_manager.patches[-1]["in_progress"] is False
-    latest = await runs.find_last_by_resource_id(record["_id"])   # the portal's lookup
+    latest = await runs.find_last_by_resource_id(record["project_resource_id"])  # portal's lookup
     assert latest.run_id == run.run_id
     assert servicenow.ritms[-1].state == 3                              # RITM closed
     assert not servicenow.incidents                                     # no failure → no INC
@@ -615,8 +615,8 @@ The mock stores whatever fields it is sent, so it cannot prove the real provider
 relying on the portal's status view, check against a real Project Manager instance that it
 **accepts and returns `state` and `in_progress`** — on the create POST and on a PATCH — rather than
 rejecting or silently dropping unknown fields; that its **create response carries the record's
-`_id`** (without it a `create` run stores no record id, and the latest-run lookup answers `404` for
-that resource); and that a **PATCH to a missing record answers `404`** (what
+`project_resource_id`** (without it a `create` run stores no record id, and the latest-run lookup
+answers `404` for that resource); and that a **PATCH to a missing record answers `404`** (what
 `ResourceNotFoundError`, and the re-driven DELETE finalize, rely on).
 
 ## Why this shape

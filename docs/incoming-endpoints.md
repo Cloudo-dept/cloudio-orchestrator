@@ -182,7 +182,7 @@ whose `state` says something is under way, or went wrong.
   Project Manager, each carrying its own id, and asks here for the request behind a resource's
   `state`.
 - **Query param (required):** `resource_id: str` — the resource manager's own id for the
-  record (Project Manager: `_id`). *Not* the `vendor_id`: that is shared by the records for every
+  record (Project Manager: `project_resource_id`). *Not* the `vendor_id`: that is shared by the records for every
   region/environment, while a run targets exactly one of them.
 - **Response `200` — `ResourceRunSummary`:** `run_id`, `status`, `current_step`, `operation`,
   `created_by`, `created_at`, `updated_at`, `ticket_id`, `incident_id`, `failure_detail` (what the
