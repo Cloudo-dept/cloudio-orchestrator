@@ -116,6 +116,28 @@ async def test_find_last_by_resource_id(pg_session_factory: async_sessionmaker) 
     assert await repo.find_last_by_resource_id("absent") is None
 
 
+async def test_find_last_by_resource_ids(pg_session_factory: async_sessionmaker) -> None:
+    repo = PostgresWorkflowRunRepository(pg_session_factory)
+    older = make_run(run_type=RunType.RESOURCE)
+    older.created_at = utcnow() - timedelta(hours=1)
+    newest = make_run(run_type=RunType.RESOURCE)
+    for run in (older, newest):  # two requests against the SAME record
+        assert run.run_state.resource is not None
+        run.run_state.resource.resource_id = "rec-1"
+        await repo.create(run)
+    other = make_run(run_type=RunType.RESOURCE)
+    assert other.run_state.resource is not None
+    other.run_state.resource.resource_id = "rec-2"
+    await repo.create(other)
+
+    found = await repo.find_last_by_resource_ids(["rec-1", "rec-2", "absent"])
+
+    # One row per record — its latest run — and records with no runs simply absent.
+    assert {r.run_id for r in found} == {newest.run_id, other.run_id}
+    assert await repo.find_last_by_resource_ids([]) == []
+    assert await repo.find_last_by_resource_ids(["absent"]) == []
+
+
 async def test_find_by_engine_run_id(pg_session_factory: async_sessionmaker) -> None:
     repo = PostgresWorkflowRunRepository(pg_session_factory)
     run = await repo.create(make_run())

@@ -6,6 +6,7 @@ and implements one of them. No provider vocabulary crosses a port boundary.
 
 import abc
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from orchestrator.domain import (
@@ -65,6 +66,12 @@ class WorkflowRunRepository(abc.ABC):
         """The most recently created run against one resource manager record, or None when that
         record has never had one. Keyed on the record's own id rather than the vendor id, which
         several records share — one per region/environment — while a run targets exactly one."""
+
+    @abc.abstractmethod
+    async def find_last_by_resource_ids(self, resource_ids: Sequence[str]) -> list[WorkflowRun]:
+        """``find_last_by_resource_id`` for several records at once: the most recently created run
+        against each of ``resource_ids``, at most one per record. Records with no runs are simply
+        absent from the result, so the caller matches rows back by the resource id on the run."""
 
     @abc.abstractmethod
     async def find_by_engine_run_id(self, engine_run_id: str) -> list[WorkflowRun]:

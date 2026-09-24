@@ -6,6 +6,7 @@ including the whole ``run_state`` model (no in-place tracking needed).
 """
 
 import uuid
+from collections.abc import Sequence
 from datetime import timedelta
 
 from sqlalchemy import String, text, update
@@ -160,6 +161,28 @@ class PostgresWorkflowRunRepository(WorkflowRunRepository):
             if run is not None:
                 session.expunge(run)
             return run
+
+    async def find_last_by_resource_ids(self, resource_ids: Sequence[str]) -> list[WorkflowRun]:
+        # One DISTINCT ON pass instead of a query per record: ordered by the record id then newest
+        # first, Postgres keeps the first row of each record's group — the same row (and the same
+        # idx_runs_resource_id index) find_last_by_resource_id would return one at a time.
+        # Records with no runs simply produce no group, so they drop out of the result.
+        if not resource_ids:
+            return []
+        async with self.session_factory() as session:
+            column = WorkflowRun.run_state.op("#>>", return_type=String)(  # type: ignore[attr-defined]
+                literal_column("'{resource,resource_id}'")
+            )
+            stmt = (
+                select(WorkflowRun)
+                .where(column.in_(list(resource_ids)))
+                .order_by(column, WorkflowRun.created_at.desc())  # type: ignore[attr-defined]
+                .distinct(column)
+            )
+            runs = list((await session.execute(stmt)).scalars().all())
+            for r in runs:
+                session.expunge(r)
+            return runs
 
     async def _find_by_path(self, json_path: str, value: str) -> list[WorkflowRun]:
         # `run_state #>> '{a,b}'` — matches the partial JSONB index in the migration.

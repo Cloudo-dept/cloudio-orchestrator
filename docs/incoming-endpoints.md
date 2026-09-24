@@ -24,6 +24,7 @@ the callbacks** — they are network-trust only (see
 | `POST /api/v1/workflow-runs` | Trigger a run of a workflow | **Automation:** ServiceNow (RITM outbound REST). **Resource:** self-service portal / upstream automation |
 | `GET /api/v1/workflow-runs/{run_id}` | Fetch one run's status/state | Requester / console UI polling for completion |
 | `GET /api/v1/workflow-runs/latest` | The latest run for one resource record | **Self-service portal** (via the gateway), beside a resource's `state` |
+| `GET /api/v1/workflow-runs/latest-batch` | The latest run for each of several resource records | **Self-service portal** (via the gateway), a screen listing a project's resources |
 | `GET /api/v1/workflow-runs` | List/search runs (by ticket or resource) | Console UI / operator / integrating systems |
 | `POST /api/v1/callbacks/ticket-approval` | Wake-early nudge on approval change | **ServiceNow** (business rule on approval change) |
 | `POST /api/v1/callbacks/engine-run` | Wake-early nudge on engine completion | **Airflow** (DAG `on_success`/`on_failure_callback`) |
@@ -184,13 +185,34 @@ whose `state` says something is under way, or went wrong.
 - **Query param (required):** `resource_id: str` — the resource manager's own id for the
   record (Project Manager: `project_resource_id`). *Not* the `vendor_id`: that is shared by the records for every
   region/environment, while a run targets exactly one of them.
-- **Response `200` — `ResourceRunSummary`:** `run_id`, `status`, `current_step`, `operation`,
-  `created_by`, `created_at`, `updated_at`, `ticket_id`, `incident_id`, `failure_detail` (what the
-  engine reported, else the last step error). Deliberately **not** a `WorkflowRunResponse`: the
-  run's working state — step attempts, engine payloads, parameter sets — is orchestration
-  bookkeeping, not something a resource's owner reads.
+- **Response `200` — `ResourceRunSummary`:** `run_id`, `resource_id` (the record the run targets),
+  `status`, `current_step`, `operation`, `created_by`, `created_at`, `updated_at`, `ticket_id`,
+  `incident_id`, `failure_detail` (what the engine reported, else the last step error).
+  Deliberately **not** a `WorkflowRunResponse`: the run's working state — step attempts, engine
+  payloads, parameter sets — is orchestration bookkeeping, not something a resource's owner reads.
 - **Errors:** `404` — that record has no runs (including runs created before record ids were
   stored); `422` — the query parameter is missing.
+
+### `GET /api/v1/workflow-runs/latest-batch`  → `200`
+The list form of the lookup above: the latest run for **each** of several resource manager records,
+in one round trip — what a portal screen listing a project's resources asks instead of a
+`/workflow-runs/latest` call per row.
+
+> Declared **before** `/api/v1/workflow-runs/{run_id}` for the same reason as `/latest` — that
+> route parses its path segment as a UUID and would reject `latest-batch` as a malformed run id.
+
+- **Source:** the **self-service portal** (via the gateway), showing a project's resources with the
+  request behind each one's `state`.
+- **Query param (required):** `resource_id: str` — the record ids, **comma-separated**
+  (`?resource_id=rec-1,rec-2,rec-3`). Blanks and duplicates are dropped; **at most 200** ids per
+  request (`MAX_BATCH_RESOURCE_IDS` in `api.py`), which keeps the URL and the query bounded — a
+  portal paging its resource list stays well under it. Ids themselves must not contain a comma.
+- **Response `200` — `list[ResourceRunSummary]`:** one entry per record **that has a run**, its
+  latest, **in the order the ids were asked for**. A record with no runs is simply **absent** — not
+  an error, and never a `404`; each entry carries its own `resource_id`, so the caller matches rows
+  back to its own list (all-unknown → `[]`).
+- **Errors:** `422` — the query parameter is missing, carries no id at all, or carries more than
+  200. Note there is no `404` here: unknown records are answered by omission.
 
 ### `GET /api/v1/workflow-runs`  → `200`
 List recent runs, or search by ticket / resource.

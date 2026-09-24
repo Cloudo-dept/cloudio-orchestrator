@@ -106,6 +106,7 @@ class ResourceRunSummary(BaseModel):
     parameter sets) is orchestration bookkeeping, not something a resource's owner reads."""
 
     run_id: uuid.UUID
+    resource_id: str  # the record this run targets — what a batch caller matches rows back by
     status: RunStatus
     current_step: str | None
     operation: ResourceOperation
@@ -127,6 +128,7 @@ def summarize_run(run: WorkflowRun) -> ResourceRunSummary:
         detail = list(st.errors.values())[-1]
     return ResourceRunSummary(
         run_id=run.run_id,
+        resource_id=st.resource.resource_id if st.resource is not None else "",
         status=run.status,
         current_step=run.current_step,
         operation=st.operation,
@@ -137,6 +139,36 @@ def summarize_run(run: WorkflowRun) -> ResourceRunSummary:
         incident_id=st.incident_id,
         failure_detail=detail,
     )
+
+
+MAX_BATCH_RESOURCE_IDS = 200
+"""Ceiling on one latest-batch lookup. Keeps the query (and the URL carrying the ids) bounded;
+a portal paging a project's resources asks per page, which is well under it."""
+
+
+def _parse_resource_ids(raw: str) -> list[str]:
+    """Parse the comma-separated ``resource_id`` query parameter of the batch lookup: blanks
+    dropped, duplicates collapsed, request order kept. 422 on an empty or oversized list."""
+    seen: dict[str, None] = {}  # insertion-ordered set
+    for part in raw.split(","):
+        record_id = part.strip()
+        if record_id:
+            seen.setdefault(record_id, None)
+    resource_ids = list(seen)
+    if not resource_ids:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="resource_id must carry at least one record id.",
+        )
+    if len(resource_ids) > MAX_BATCH_RESOURCE_IDS:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"resource_id carries {len(resource_ids)} record ids; "
+                f"at most {MAX_BATCH_RESOURCE_IDS} per request."
+            ),
+        )
+    return resource_ids
 
 
 class TicketApprovalCallbackRequest(BaseModel):
@@ -363,6 +395,27 @@ async def get_latest_resource_run(
             detail=f"No runs for resource record '{resource_id}'.",
         )
     return summarize_run(run)
+
+
+@app.get("/api/v1/workflow-runs/latest-batch", response_model=list[ResourceRunSummary])
+async def get_latest_resource_runs(
+    resource_id: str,
+    svc: WorkflowRunService = Depends(get_run_service),
+) -> list[ResourceRunSummary]:
+    """The latest run for each of several resource manager records — one round trip for a portal
+    screen listing a project's resources, instead of a /workflow-runs/latest call per row.
+
+    Records with no runs are absent from the response (not an error, and never a 404): each item
+    carries its ``resource_id``, so the caller matches rows back to what it asked for.
+
+    Declared BEFORE /workflow-runs/{run_id} for the same reason as /workflow-runs/latest — that
+    route parses its path segment as a UUID and would reject this one as a malformed run id.
+    """
+    resource_ids = _parse_resource_ids(resource_id)
+    runs = await svc.find_last_by_resource_ids(resource_ids)
+    by_record = {run.run_state.resource.resource_id: run for run in runs if run.run_state.resource}
+    # Answer in the order asked, so a caller can zip the response against its own list of records.
+    return [summarize_run(by_record[rid]) for rid in resource_ids if rid in by_record]
 
 
 @app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)

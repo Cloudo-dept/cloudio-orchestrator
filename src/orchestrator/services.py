@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from orchestrator.domain import (
@@ -147,6 +148,9 @@ class WorkflowRunService:
 
     async def find_last_by_resource_id(self, resource_id: str) -> WorkflowRun | None:
         return await self.runs.find_last_by_resource_id(resource_id)
+
+    async def find_last_by_resource_ids(self, resource_ids: Sequence[str]) -> list[WorkflowRun]:
+        return await self.runs.find_last_by_resource_ids(resource_ids)
 
 
 class RunCallbackService:

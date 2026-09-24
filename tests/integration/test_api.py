@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from orchestrator.api import app
+from orchestrator.api import MAX_BATCH_RESOURCE_IDS, app
 from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
 from tests.fakes import FakeHealthCheck, FakeWorkflowRepository, FakeWorkflowRunRepository
 
@@ -367,6 +367,7 @@ async def test_latest_run_for_a_resource_record(
     assert body["operation"] == "create" and body["status"] == "pending"
     assert set(body) == {
         "run_id",
+        "resource_id",
         "status",
         "current_step",
         "operation",
@@ -397,3 +398,66 @@ async def test_latest_route_is_not_shadowed_by_the_run_id_route(
 async def test_latest_run_without_a_resource_id_is_422(client: httpx.AsyncClient) -> None:
     resp = await client.get("/api/v1/workflow-runs/latest")
     assert resp.status_code == 422  # the query parameter is required
+
+
+async def test_latest_batch_answers_one_run_per_record_in_the_order_asked(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=10)  # older, same record
+    newest_1 = await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1)
+    newest_2 = await _seed_resource_run(runs, resource_id="rec-2", minutes_ago=5)
+    await _seed_resource_run(runs, resource_id="rec-3", minutes_ago=0)  # not asked for
+
+    resp = await client.get(
+        "/api/v1/workflow-runs/latest-batch", params={"resource_id": "rec-2,rec-1"}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [item["run_id"] for item in body] == [str(newest_2), str(newest_1)]
+    assert [item["resource_id"] for item in body] == ["rec-2", "rec-1"]  # match rows to the request
+
+
+async def test_latest_batch_omits_records_with_no_runs(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1)
+
+    resp = await client.get(
+        "/api/v1/workflow-runs/latest-batch", params={"resource_id": "ghost,rec-1, ,rec-1"}
+    )
+
+    # Unknown records drop out rather than 404-ing the batch; blanks and repeats are tolerated.
+    assert resp.status_code == 200
+    assert [item["resource_id"] for item in resp.json()] == ["rec-1"]
+
+
+async def test_latest_batch_for_only_unknown_records_is_an_empty_list(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.get("/api/v1/workflow-runs/latest-batch", params={"resource_id": "ghost"})
+    assert resp.status_code == 200 and resp.json() == []
+
+
+async def test_latest_batch_rejects_an_empty_or_oversized_list(client: httpx.AsyncClient) -> None:
+    missing = await client.get("/api/v1/workflow-runs/latest-batch")
+    assert missing.status_code == 422  # the query parameter is required
+
+    blank = await client.get("/api/v1/workflow-runs/latest-batch", params={"resource_id": " , "})
+    assert blank.status_code == 422 and "at least one" in blank.json()["detail"]
+
+    too_many = await client.get(
+        "/api/v1/workflow-runs/latest-batch",
+        params={"resource_id": ",".join(f"rec-{n}" for n in range(MAX_BATCH_RESOURCE_IDS + 1))},
+    )
+    assert too_many.status_code == 422 and "at most" in too_many.json()["detail"]
+
+
+async def test_latest_batch_route_is_not_shadowed_by_the_run_id_route(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    # Same shadowing rule as /workflow-runs/latest: /workflow-runs/{run_id} parses its path
+    # segment as a UUID, so "latest-batch" must be declared before it to ever be reached.
+    await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1)
+    resp = await client.get("/api/v1/workflow-runs/latest-batch", params={"resource_id": "rec-1"})
+    assert resp.status_code == 200

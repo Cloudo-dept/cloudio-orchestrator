@@ -5,6 +5,7 @@ version checks, due-claim + lease) without any I/O — they are the substitution
 """
 
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from orchestrator.domain import (
@@ -124,6 +125,18 @@ class FakeWorkflowRunRepository(WorkflowRunRepository):
         ]
         newest = max(matches, key=lambda r: r.created_at, default=None)
         return _copy(newest) if newest is not None else None
+
+    async def find_last_by_resource_ids(self, resource_ids: Sequence[str]) -> list[WorkflowRun]:
+        wanted = set(resource_ids)
+        newest_per_record: dict[str, WorkflowRun] = {}
+        for run in self._runs.values():
+            resource = run.run_state.resource
+            if resource is None or resource.resource_id not in wanted:
+                continue
+            current = newest_per_record.get(resource.resource_id)
+            if current is None or run.created_at > current.created_at:
+                newest_per_record[resource.resource_id] = run
+        return [_copy(r) for r in newest_per_record.values()]
 
     async def wake(self, run_id: uuid.UUID) -> bool:
         # A nudge outside the version scheme: make a non-terminal run due now, no version bump.

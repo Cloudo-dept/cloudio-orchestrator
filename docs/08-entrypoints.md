@@ -221,6 +221,18 @@ async def get_latest_resource_run(resource_id: str,
     return summarize_run(run)          # a trimmed summary, not the internal run_state
 
 
+# Also BEFORE /{run_id}, for the same reason. The list form of the lookup above: one round trip
+# for a portal screen listing a project's resources.
+@app.get("/api/v1/workflow-runs/latest-batch", response_model=list[ResourceRunSummary])
+async def get_latest_resource_runs(resource_id: str,      # comma-separated record ids
+                                   svc: WorkflowRunService = Depends(get_run_service)):
+    resource_ids = _parse_resource_ids(resource_id)       # blanks/dupes dropped; 422 if empty/>200
+    runs = await svc.find_last_by_resource_ids(resource_ids)
+    by_record = {run.run_state.resource.resource_id: run for run in runs if run.run_state.resource}
+    # Records with no runs drop out (never a 404); answered in the order asked.
+    return [summarize_run(by_record[rid]) for rid in resource_ids if rid in by_record]
+
+
 @app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)
 async def get_workflow_run(run_id: uuid.UUID,
                            svc: WorkflowRunService = Depends(get_run_service)):

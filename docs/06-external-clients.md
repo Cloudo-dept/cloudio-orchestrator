@@ -487,7 +487,8 @@ readers; true exactly while the state is `PROVISIONING`/`UPDATING`/`DELETING`). 
 them through like any other field; only the orchestration layer knows what they mean.
 
 **No run id is written to the record.** A reader that wants the request behind a state asks the
-orchestrator — `GET /api/v1/workflow-runs/latest?resource_id=…`
+orchestrator — `GET /api/v1/workflow-runs/latest?resource_id=…`, or
+`GET /api/v1/workflow-runs/latest-batch?resource_id=…,…` for a whole list of records at once
 ([incoming-endpoints](incoming-endpoints.md)). That lookup is keyed on Project Manager's own id for
 the record, which it answers a create with: the response is an acknowledgement —
 `{message, project_resource_id}` — **not** the record it made. `create_resource` returns that id and
