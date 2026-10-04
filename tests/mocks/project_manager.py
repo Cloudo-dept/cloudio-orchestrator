@@ -18,9 +18,10 @@ class ProjectManagerMock:
     overrides: list[Override] = field(default_factory=list)
     requests: list[tuple[str, str]] = field(default_factory=list)
     validations: list[dict[str, Any]] = field(default_factory=list)  # validate_resource bodies
-    # How validate_resource answers: 200 passes, and 400/404/409 are the provider's three ways of
-    # refusing a request (bad data / unknown name / name taken). Wallet capacity is not something
-    # a mock can model, so the verdict is set by the test rather than computed.
+    # How validate_resource answers: 200 passes, 400/404 refuse the request (bad data / unknown
+    # name), and 409 says the name is taken — which the adapter tolerates, since a create's own
+    # record already holds it. Wallet capacity is not something a mock can model, so the verdict is
+    # set by the test rather than computed.
     validation_status: int = 200
     validation_reason: str = "insufficient capacity in the virtualization wallet"
 

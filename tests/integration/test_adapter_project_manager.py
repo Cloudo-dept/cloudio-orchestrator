@@ -118,12 +118,12 @@ async def test_validate_resource_omits_an_absent_region_and_environment(
     assert "environment" not in project_manager.validations[-1]
 
 
-@pytest.mark.parametrize("status", [400, 404, 409])
+@pytest.mark.parametrize("status", [400, 404])
 async def test_validate_resource_refusals_cross_the_port_as_a_verdict(
     status: int, project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
 ) -> None:
-    # Bad data (400), an unknown name (404) and a taken name (409) are all answers about the
-    # request — identical on every re-ask — so none of them raises.
+    # Bad data (400) and an unknown name (404) are answers about the request — identical on every
+    # re-ask — so neither raises.
     project_manager.validation_status = status
     project_manager.validation_reason = "wallet exhausted"
 
@@ -131,6 +131,20 @@ async def test_validate_resource_refusals_cross_the_port_as_a_verdict(
 
     assert result.eligible is False
     assert result.reason == "wallet exhausted"  # the provider's own words, for the run's error
+
+
+async def test_validate_resource_tolerates_a_taken_name(
+    project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    # A create reaches this endpoint only after its own record exists (the orchestrator writes it
+    # before the approval gate), so the name is already taken — by this very run. A 409 must not
+    # stop the request on the strength of its own record.
+    project_manager.validation_status = 409
+    project_manager.validation_reason = "resource name 'app-01' already exists"
+
+    result = await pm_client.validate_resource(_request())
+
+    assert result.eligible is True
 
 
 async def test_validate_resource_5xx_is_surfaced(

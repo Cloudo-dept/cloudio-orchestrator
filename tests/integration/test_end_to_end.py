@@ -151,15 +151,48 @@ async def test_resource_run_rejected_stops_without_provisioning(
     assert not servicenow.incidents  # a rejection is not a failure → no INC
 
 
+async def test_resource_run_carries_on_when_validation_says_the_name_is_taken(
+    pg_session_factory: async_sessionmaker,
+    servicenow: ServiceNowMock,
+    airflow: AirflowMock,
+    project_manager: ProjectManagerMock,
+) -> None:
+    # The create's own record — written before the approval gate — already holds the name by the
+    # time the precheck is asked, so a 409 is the run meeting itself. It must not stop the request.
+    project_manager.validation_status = 409
+    project_manager.validation_reason = "resource name 'app-01' already exists"
+    runs, run_service, workflows, executor = await _assemble(
+        pg_session_factory, servicenow, airflow, project_manager
+    )
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    run = await run_service.trigger(
+        workflow_identifier="provision-vm",
+        created_by="jdoe",
+        max_retries=3,
+        ticket_params={},
+        workflow_params={},
+        resource=make_resource_spec(vendor_id="vm-1"),
+        operation=ResourceOperation.CREATE,
+        ticket=None,
+    )
+
+    final = await _drive(runs, executor, run.run_id)
+
+    assert final is not None and final.status is RunStatus.COMPLETED
+    assert len(project_manager.validations) == 1  # asked, answered 409, and carried on
+    assert project_manager.patches[-1]["state"] == "READY"  # the resource was provisioned
+    assert not servicenow.incidents
+
+
 async def test_resource_run_refused_by_validation_never_reaches_the_engine(
     pg_session_factory: async_sessionmaker,
     servicenow: ServiceNowMock,
     airflow: AirflowMock,
     project_manager: ProjectManagerMock,
 ) -> None:
-    # The approved request is refused by Project Manager's own precheck (here: the name is taken).
-    project_manager.validation_status = 409
-    project_manager.validation_reason = "resource name 'app-01' already exists"
+    # The approved request is refused by Project Manager's own precheck.
+    project_manager.validation_status = 400
+    project_manager.validation_reason = "insufficient vCPU in the virtualization wallet"
     runs, run_service, workflows, executor = await _assemble(
         pg_session_factory, servicenow, airflow, project_manager
     )

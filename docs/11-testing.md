@@ -368,7 +368,7 @@ class ProjectManagerMock:
     overrides: list[Override] = field(default_factory=list)
     requests: list[tuple[str, str]] = field(default_factory=list)
     validations: list[dict[str, Any]] = field(default_factory=list)      # validate_resource bodies
-    validation_status: int = 200                                         # 400/404/409 → refused
+    validation_status: int = 200                        # 400/404 → refused; 409 → name taken
     validation_reason: str = "insufficient capacity in the virtualization wallet"
 
     @property
@@ -400,8 +400,8 @@ def _build_pm(mock: ProjectManagerMock) -> FastAPI:
     async def validate(project_id: str, resource_type: str,
                        body: dict[str, Any]) -> dict[str, Any]:
         mock.validations.append(body)
-        # 200 passes; 400/404/409 are the provider's three refusals. Wallet capacity is not
-        # something a mock can model, so the verdict is a knob the test sets.
+        # 200 passes; 400/404 refuse; 409 says the name is taken (the adapter tolerates it).
+        # Wallet capacity is not something a mock can model, so the verdict is a knob the test sets.
         if mock.validation_status != 200:
             raise HTTPException(mock.validation_status, detail=mock.validation_reason)
         return {"message": "validation passed"}

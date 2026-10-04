@@ -40,6 +40,12 @@ it ends the run as a `FailureKind.INFRA_PRECHECK` failure: no retry, no incident
 RITM closed with the validation comment. A provider that cannot *answer* (a `5xx`, a timeout) is an
 ordinary transient failure and is retried.
 
+One answer is **not** a refusal: *the name is already taken*. By the time the precheck is asked,
+`configuring_resource` has already written the record — before the gate, so the request shows on the
+resource while a human decides — and that record holds the name the request is asking about. The
+adapter tolerates it and the run carries on; see
+[06-external-clients](06-external-clients.md#adaptersproject_managerpy).
+
 ## The resource record's lifecycle state
 
 The Project Manager record carries an explicit `state` (`ResourceState`, see

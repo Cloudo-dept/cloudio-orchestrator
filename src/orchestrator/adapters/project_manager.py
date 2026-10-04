@@ -1,5 +1,6 @@
 """Project Manager resource adapter."""
 
+import logging
 from typing import Any
 
 import httpx
@@ -11,16 +12,22 @@ from orchestrator.domain import (
 )
 from orchestrator.ports import ResourceManagerClient
 
-# How validate_resource says no: the request's data does not pass validation (400), an
-# update/delete names a record that does not exist (404), or a create names a name that already
-# does (409). All three are verdicts on the request — identical on every re-ask — so each crosses
-# the port as a refusal. Anything else (a 5xx, a timeout) is the check itself failing and is raised,
-# for the caller to retry.
+logger = logging.getLogger(__name__)
+
+# How validate_resource says no: the request's data does not pass validation (400), or an
+# update/delete names a record that does not exist (404). Both are verdicts on the request —
+# identical on every re-ask — so each crosses the port as a refusal. Anything else (a 5xx, a
+# timeout) is the check itself failing and is raised, for the caller to retry.
+#
+# 409 ("name already exists") is deliberately NOT here: a create reaches this endpoint only after
+# its own record exists, since the orchestrator writes the record before the approval gate. The
+# name the request is asking about is therefore already taken — by this very run — and a run must
+# not be refused on the strength of its own record. Tolerated as a pass rather than special-cased
+# to the create path: an update/delete answered 409 is just as much the run meeting itself.
 _REFUSAL_CODES = frozenset(
     {
         httpx.codes.BAD_REQUEST,
         httpx.codes.NOT_FOUND,
-        httpx.codes.CONFLICT,
     }
 )
 
@@ -88,6 +95,13 @@ class ProjectManagerResourceClient(ResourceManagerClient):
         )
         if resp.status_code in _REFUSAL_CODES:  # provider vocabulary stops here
             return ResourceValidationResult(eligible=False, reason=_refusal_reason(resp))
+        if resp.status_code == httpx.codes.CONFLICT:  # the name this run itself put there
+            logger.info(
+                "Validation of '%s' answered 409 (%s); the request carries on.",
+                request.name,
+                _refusal_reason(resp),
+            )
+            return ResourceValidationResult(eligible=True)
         resp.raise_for_status()
         return ResourceValidationResult(eligible=True)
 

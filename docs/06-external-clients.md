@@ -505,13 +505,20 @@ nothing else, so it is the only part of the provider's answer that crosses the p
 `project_resource_id` *spelling* stops at the adapter.
 
 **A refused precheck is a verdict, not an error.** `POST …/{resource_type}/validate_resource`
-answers `200` when the request may go ahead and `400` / `404` / `409` when it may not — the
-request's data does not validate, an `update`/`delete` names a record that does not exist, or a
-`create` names a name that already does. All three are answers *about the request*, identical on
-every re-ask, so each crosses the port as `ResourceValidationResult(eligible=False, reason=…)`
-rather than an exception; the step turns that into an `INFRA_PRECHECK` failure (no retry, no
-incident). Anything else — a `5xx`, a timeout — is the *check* failing and is raised, for the step
-to retry. The endpoint's own field names (`flow_type`, `db_operation`, `variables`) are written in
+answers `200` when the request may go ahead, `400` when its data does not validate, `404` when an
+`update`/`delete` names a record that does not exist, and `409` when the name is already taken.
+The first two are answers *about the request*, identical on every re-ask, so each crosses the port
+as `ResourceValidationResult(eligible=False, reason=…)` rather than an exception; the step turns
+that into an `INFRA_PRECHECK` failure (no retry, no incident). Anything else — a `5xx`, a timeout —
+is the *check* failing and is raised, for the step to retry.
+
+**`409` is tolerated, not a refusal.** A `create` reaches this endpoint only after its own record
+exists — `configuring_resource` writes it before the approval gate — so the name the request asks
+about is already taken *by this very run*, and a run must not be refused on the strength of its own
+record. The adapter logs the conflict and answers `eligible=True`, rather than special-casing the
+`create` path: an `update`/`delete` answered `409` is just as much the run meeting itself.
+
+The endpoint's own field names (`flow_type`, `db_operation`, `variables`) are written in
 this adapter and nowhere else: the port speaks `workflow_identifier` / `operation` / `params`. An
 absent `region` or `environment` is left out of the body rather than sent as `null` — both are
 optional, and a `null` is a value, not a silence.
@@ -533,10 +540,11 @@ from orchestrator.domain import (ResourceNotFoundError, ResourceValidationReques
 from orchestrator.ports import ResourceManagerClient
 
 
-# How validate_resource says no. All three are verdicts on the request — identical on every
-# re-ask — so they are answers; anything else is the check itself failing and is raised. The
-# reason comes from the error body where it has one (`_refusal_reason`), else the bare status.
-_REFUSAL_CODES = frozenset({httpx.codes.BAD_REQUEST, httpx.codes.NOT_FOUND, httpx.codes.CONFLICT})
+# How validate_resource says no. Both are verdicts on the request — identical on every re-ask — so
+# they are answers; anything else is the check itself failing and is raised. The reason comes from
+# the error body where it has one (`_refusal_reason`), else the bare status. 409 is deliberately
+# absent: it is the run meeting the record it wrote itself, before the gate.
+_REFUSAL_CODES = frozenset({httpx.codes.BAD_REQUEST, httpx.codes.NOT_FOUND})
 
 
 class ProjectManagerResourceClient(ResourceManagerClient):
@@ -583,6 +591,10 @@ class ProjectManagerResourceClient(ResourceManagerClient):
                 f"/validate_resource", json=body)
             if resp.status_code in _REFUSAL_CODES:        # provider vocabulary stops here
                 return ResourceValidationResult(eligible=False, reason=_refusal_reason(resp))
+            if resp.status_code == httpx.codes.CONFLICT:   # the name this run itself put there
+                logger.info("Validation of '%s' answered 409 (%s); the request carries on.",
+                            request.name, _refusal_reason(resp))
+                return ResourceValidationResult(eligible=True)
             resp.raise_for_status()
             return ResourceValidationResult(eligible=True)
 
