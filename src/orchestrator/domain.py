@@ -49,6 +49,8 @@ class StepName(str, Enum):
     # approval, so the request shows on the resource while it waits
     CONFIGURE_RESOURCE = "configuring_resource"
     AWAIT_APPROVAL = "awaiting_approval"  # wait for the ticket to be approved before provisioning
+    # ask the resource manager whether the approved request may actually go ahead (wallet capacity)
+    VALIDATE_RESOURCE = "validating_resource"
     RUN_ENGINE = "running_engine"
     FINALIZE_RESOURCE = "finalizing_resource"  # mark the resource operation done
     CLOSE_TICKET = "closing_ticket"  # close out the RITM
@@ -209,6 +211,32 @@ class ResourceSpec(BaseModel):
     tags: list[str] = PyField(default_factory=list)
     data: dict[str, Any] = PyField(default_factory=dict)
     alert_groups: list[str] = PyField(default_factory=list)
+
+
+class ResourceValidationRequest(BaseModel):
+    """The question put to the resource manager before a run provisions anything: may this request
+    go ahead? It answers on its own terms — whether the project's virtualization wallet still has
+    the compute the request needs, and whether the name is free for a create (or known for an
+    update/delete) — so the orchestrator only has to describe the request."""
+
+    project_id: str
+    resource_type: str
+    name: str
+    operation: ResourceOperation
+    workflow_identifier: str  # which workflow is asking (the registry identifier)
+    # The engine conf the run would be started with. Free-form pass-through (the same value as
+    # RunState.workflow_params): the validator reads whatever the request's own workflow puts there.
+    params: dict[str, Any] = PyField(default_factory=dict)
+    region: str | None = None
+    environment: str | None = None
+
+
+class ResourceValidationResult(BaseModel):
+    """The resource manager's verdict on a ``ResourceValidationRequest``. A refusal is an answer,
+    not an error — ``reason`` is the provider's own explanation, for the run's error record."""
+
+    eligible: bool
+    reason: str | None = None
 
 
 class ResolvedWorkflow(BaseModel):

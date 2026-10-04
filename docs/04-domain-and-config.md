@@ -107,6 +107,9 @@ class StepName(str, Enum):
     CONFIGURE_RESOURCE = "configuring_resource" # create/mark the record PROVISIONING/UPDATING/
                                                 # DELETING — before the approval gate
     AWAIT_APPROVAL = "awaiting_approval"        # wait for the ticket to be approved
+    VALIDATE_RESOURCE = "validating_resource"   # the resource manager's precheck on the approved
+                                                # request (wallet capacity, the name) — after the
+                                                # gate, before anything is provisioned
     RUN_ENGINE = "running_engine"
     FINALIZE_RESOURCE = "finalizing_resource"   # apply the outcome: READY, or DELETED + remove
     CLOSE_TICKET = "closing_ticket"             # close out the RITM
@@ -227,6 +230,27 @@ class ResourceSpec(BaseModel):
     tags: list[str] = PyField(default_factory=list)
     data: dict[str, Any] = PyField(default_factory=dict)
     alert_groups: list[str] = PyField(default_factory=list)
+
+
+class ResourceValidationRequest(BaseModel):
+    """The question put to the resource manager before a run provisions anything (the
+    `validating_resource` step). It answers on its own terms — the project's virtualization wallet,
+    the name — so the orchestrator only describes the request."""
+    project_id: str
+    resource_type: str
+    name: str
+    operation: ResourceOperation
+    workflow_identifier: str             # which workflow is asking (the registry identifier)
+    params: dict[str, Any] = PyField(default_factory=dict)   # the engine conf, pass-through
+    region: str | None = None
+    environment: str | None = None
+
+
+class ResourceValidationResult(BaseModel):
+    """The verdict. A refusal is an answer, not an error — `reason` is the provider's own
+    explanation, recorded on the run."""
+    eligible: bool
+    reason: str | None = None
 
 
 class ResolvedWorkflow(BaseModel):

@@ -13,6 +13,8 @@ from orchestrator.domain import (
     EngineFailure,
     EngineRunStatus,
     ResourceNotFoundError,
+    ResourceValidationRequest,
+    ResourceValidationResult,
     RunStatus,
     StaleRunError,
     TicketOutcome,
@@ -256,6 +258,16 @@ class FakeResourceManagerClient(ResourceManagerClient):
         self.updated: list[tuple[str, str, str, dict[str, Any]]] = []
         self.deleted: list[tuple[str, str, str]] = []
         self.missing: set[str] = set()  # vendor ids with no record: update_resource raises for them
+        self.validations: list[ResourceValidationRequest] = []  # every precheck asked, in order
+        # Eligible by default so a resource run drives straight through VALIDATE_RESOURCE; set a
+        # refusal (or an exception) to exercise the precheck-failure path.
+        self.validation_result = ResourceValidationResult(eligible=True)
+
+    async def validate_resource(
+        self, request: ResourceValidationRequest
+    ) -> ResourceValidationResult:
+        self.validations.append(request)
+        return self.validation_result
 
     async def create_resource(
         self, project_id: str, resource_type: str, body: dict[str, Any], idempotency_key: str

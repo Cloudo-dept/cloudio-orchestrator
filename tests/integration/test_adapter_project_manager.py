@@ -4,7 +4,11 @@ import httpx
 import pytest
 
 from orchestrator.adapters.project_manager import ProjectManagerResourceClient
-from orchestrator.domain import ResourceNotFoundError
+from orchestrator.domain import (
+    ResourceNotFoundError,
+    ResourceOperation,
+    ResourceValidationRequest,
+)
 from tests.mocks.base import Override
 from tests.mocks.project_manager import ProjectManagerMock
 
@@ -71,6 +75,71 @@ async def test_delete_5xx_is_surfaced(
     project_manager.overrides.append(Override(path_contains="/project_resources", status=503))
     with pytest.raises(httpx.HTTPStatusError):
         await pm_client.delete_resource("proj-1", "vm", "vm-1")
+
+
+def _request(operation: ResourceOperation = ResourceOperation.CREATE) -> ResourceValidationRequest:
+    return ResourceValidationRequest(
+        project_id="proj-1",
+        resource_type="vm",
+        name="app-01",
+        operation=operation,
+        workflow_identifier="provision-vm",
+        params={"size": "large"},
+        region="gvt",
+        environment="prod",
+    )
+
+
+async def test_validate_resource_posts_the_providers_field_names(
+    project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    result = await pm_client.validate_resource(_request())
+
+    assert result.eligible is True and result.reason is None
+    # The endpoint's own spelling of the question is written in the adapter and nowhere else.
+    assert project_manager.validations[-1] == {
+        "flow_type": "provision-vm",
+        "db_operation": "create",
+        "variables": {"size": "large"},
+        "name": "app-01",
+        "environment": "prod",
+        "region": "gvt",
+    }
+
+
+async def test_validate_resource_omits_an_absent_region_and_environment(
+    project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    # Both are optional; a null is a value, not a silence, so neither key is sent at all.
+    await pm_client.validate_resource(
+        _request().model_copy(update={"region": None, "environment": None})
+    )
+    assert "region" not in project_manager.validations[-1]
+    assert "environment" not in project_manager.validations[-1]
+
+
+@pytest.mark.parametrize("status", [400, 404, 409])
+async def test_validate_resource_refusals_cross_the_port_as_a_verdict(
+    status: int, project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    # Bad data (400), an unknown name (404) and a taken name (409) are all answers about the
+    # request — identical on every re-ask — so none of them raises.
+    project_manager.validation_status = status
+    project_manager.validation_reason = "wallet exhausted"
+
+    result = await pm_client.validate_resource(_request())
+
+    assert result.eligible is False
+    assert result.reason == "wallet exhausted"  # the provider's own words, for the run's error
+
+
+async def test_validate_resource_5xx_is_surfaced(
+    project_manager: ProjectManagerMock, pm_client: ProjectManagerResourceClient
+) -> None:
+    # The check itself failing is not a verdict on the request — it must be retryable.
+    project_manager.validation_status = 503
+    with pytest.raises(httpx.HTTPStatusError):
+        await pm_client.validate_resource(_request())
 
 
 async def test_create_5xx_is_surfaced(

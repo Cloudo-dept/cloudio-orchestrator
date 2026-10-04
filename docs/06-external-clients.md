@@ -59,6 +59,15 @@ class ResourceManagerClient(abc.ABC):
         records. None when the provider names its records by nothing but their fields."""
 
     @abc.abstractmethod
+    async def validate_resource(self,
+                                request: ResourceValidationRequest) -> ResourceValidationResult:
+        """Whether the request may go ahead — the resource manager's own precheck (compute left in
+        the project's virtualization wallet; the name free for a create, known for an
+        update/delete). Changes nothing, so it is safe to repeat. A refusal comes back as
+        `eligible=False` with the provider's reason; this raises only when the question could not
+        be asked at all, which the caller retries."""
+
+    @abc.abstractmethod
     async def update_resource(self, project_id: str, resource_type: str, vendor_id: str,
                               fields: dict[str, Any]) -> None:
         """Partial update (only changed fields) — e.g. state=READY, in_progress=False on finalize.
@@ -495,6 +504,18 @@ the record, which it answers a create with: the response is an acknowledgement �
 nothing else, so it is the only part of the provider's answer that crosses the port, and the
 `project_resource_id` *spelling* stops at the adapter.
 
+**A refused precheck is a verdict, not an error.** `POST …/{resource_type}/validate_resource`
+answers `200` when the request may go ahead and `400` / `404` / `409` when it may not — the
+request's data does not validate, an `update`/`delete` names a record that does not exist, or a
+`create` names a name that already does. All three are answers *about the request*, identical on
+every re-ask, so each crosses the port as `ResourceValidationResult(eligible=False, reason=…)`
+rather than an exception; the step turns that into an `INFRA_PRECHECK` failure (no retry, no
+incident). Anything else — a `5xx`, a timeout — is the *check* failing and is raised, for the step
+to retry. The endpoint's own field names (`flow_type`, `db_operation`, `variables`) are written in
+this adapter and nowhere else: the port speaks `workflow_identifier` / `operation` / `params`. An
+absent `region` or `environment` is left out of the body rather than sent as `null` — both are
+optional, and a `null` is a value, not a silence.
+
 **Not found is a domain error on PATCH.** A PATCH answered `404` raises `ResourceNotFoundError`
 rather than an `HTTPStatusError`, so a re-driven DELETE finalize (whose `DELETED` PATCH hits a
 record its earlier attempt already removed) can tell "already gone" from a failure. DELETE itself
@@ -507,8 +528,15 @@ from typing import Any
 
 import httpx
 
-from orchestrator.domain import ResourceNotFoundError
+from orchestrator.domain import (ResourceNotFoundError, ResourceValidationRequest,
+                                 ResourceValidationResult)
 from orchestrator.ports import ResourceManagerClient
+
+
+# How validate_resource says no. All three are verdicts on the request — identical on every
+# re-ask — so they are answers; anything else is the check itself failing and is raised. The
+# reason comes from the error body where it has one (`_refusal_reason`), else the bare status.
+_REFUSAL_CODES = frozenset({httpx.codes.BAD_REQUEST, httpx.codes.NOT_FOUND, httpx.codes.CONFLICT})
 
 
 class ProjectManagerResourceClient(ResourceManagerClient):
@@ -537,6 +565,26 @@ class ProjectManagerResourceClient(ResourceManagerClient):
             created: dict[str, Any] = resp.json()   # {message, project_resource_id} — an
             resource_id = created.get("project_resource_id")   # acknowledgement, not the record;
             return str(resource_id) if resource_id is not None else None   # spelling stops here
+
+    async def validate_resource(self,
+                                request: ResourceValidationRequest) -> ResourceValidationResult:
+        body: dict[str, Any] = {          # the endpoint's own spelling stops here
+            "flow_type": request.workflow_identifier,
+            "db_operation": request.operation.value,
+            "variables": request.params,
+            "name": request.name}
+        if request.environment is not None:       # optional: left out rather than sent as null
+            body["environment"] = request.environment
+        if request.region is not None:
+            body["region"] = request.region
+        async with self._client() as client:
+            resp = await client.post(
+                f"/projects/{request.project_id}/project_resources/{request.resource_type}"
+                f"/validate_resource", json=body)
+            if resp.status_code in _REFUSAL_CODES:        # provider vocabulary stops here
+                return ResourceValidationResult(eligible=False, reason=_refusal_reason(resp))
+            resp.raise_for_status()
+            return ResourceValidationResult(eligible=True)
 
     async def update_resource(self, project_id: str, resource_type: str, vendor_id: str,
                               fields: dict[str, Any]) -> None:

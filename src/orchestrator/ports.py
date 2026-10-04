@@ -13,6 +13,8 @@ from orchestrator.domain import (
     ApprovalStatus,
     EngineFailure,
     EngineRunStatus,
+    ResourceValidationRequest,
+    ResourceValidationResult,
     TicketOutcome,
     TicketRef,
     Workflow,
@@ -166,6 +168,19 @@ class ResourceManagerClient(abc.ABC):
         Returns the provider's own id for the new record, where it has one — the stable key the
         record can be found by afterwards, since a vendor id can repeat across records. None when
         the provider names its records by nothing but the fields it was given."""
+
+    @abc.abstractmethod
+    async def validate_resource(
+        self, request: ResourceValidationRequest
+    ) -> ResourceValidationResult:
+        """Ask whether the request may go ahead — the resource manager's own precheck (is there
+        compute left in the project's virtualization wallet, is the name free for a create or known
+        for an update/delete). Makes no change to anything, so it is safe to repeat.
+
+        A refusal comes back as ``eligible=False`` with the provider's reason: the request as filed
+        cannot succeed, which is a verdict rather than a malfunction. Raises only when the question
+        could not be asked at all (the provider is unreachable or broken) — a transient failure the
+        caller retries."""
 
     @abc.abstractmethod
     async def update_resource(

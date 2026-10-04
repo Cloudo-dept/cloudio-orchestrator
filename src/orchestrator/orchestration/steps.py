@@ -27,6 +27,7 @@ from orchestrator.domain import (
     ResourceOperation,
     ResourceSpec,
     ResourceState,
+    ResourceValidationRequest,
     RunRejected,
     RunState,
     StepFailure,
@@ -217,6 +218,65 @@ class AwaitApprovalStep(StepHandler):
         if status is ApprovalStatus.REJECTED:
             raise RunRejected(f"Ticket {st.ticket.ticket_id} was rejected.")
         return False  # pending → executor sets scheduled_at forward, worker re-drives
+
+
+class ValidateResourceStep(StepHandler):
+    """Ask the resource manager whether the approved request may actually go ahead: has the
+    project's virtualization wallet the compute this create/update needs, and is the name free for
+    a create (or known for an update/delete)?
+
+    It sits *after* the approval gate on purpose. The answer is only worth having for a request a
+    human has agreed to, and capacity is a moving target — checked here, it describes the wallet as
+    it stands when the work is about to start rather than when the request was filed, days earlier.
+
+    A refusal is terminal: the request as filed cannot succeed, so no retry would change it. It is
+    raised as a ``FailureKind.INFRA_PRECHECK`` failure — the kind the failure policy already defines
+    for a precheck that refused a request: no incident (nobody is on call for a full wallet), and
+    the requester's ticket closed with the validation comment. A provider that cannot *answer*
+    raises out of the adapter instead, which is an ordinary transient failure and is retried.
+
+    There is no idempotency marker: the check changes nothing, so a re-driven step simply asks
+    again — and gets a fresher answer for it.
+    """
+
+    def __init__(self, resource_client: ResourceManagerClient) -> None:
+        self.resource_client = resource_client
+
+    async def execute(self, run: WorkflowRun) -> bool:
+        st = run.run_state
+        resource = st.resource
+        assert resource is not None  # guaranteed by the trigger validation
+        logger.info(
+            "Run %s: validating the %s of resource '%s' (type=%s, project=%s).",
+            run.run_id,
+            st.operation.value,
+            resource.name,
+            resource.resource_type,
+            resource.project_id,
+        )
+        result = await self.resource_client.validate_resource(
+            ResourceValidationRequest(
+                project_id=resource.project_id,
+                resource_type=resource.resource_type,
+                name=resource.name,
+                operation=st.operation,
+                workflow_identifier=st.workflow.identifier,
+                params=st.workflow_params,
+                region=resource.region,
+                environment=resource.environment,
+            )
+        )
+        if not result.eligible:
+            logger.warning(
+                "Run %s: resource validation refused the request: %s", run.run_id, result.reason
+            )
+            raise StepFailure(
+                f"Validation refused the {st.operation.value} of resource "
+                f"'{resource.name}': {result.reason or 'no reason given'}",
+                kind=FailureKind.INFRA_PRECHECK,
+            )
+        logger.info("Run %s: resource validation passed.", run.run_id)
+        return True
 
 
 class RunEngineStep(StepHandler):

@@ -367,6 +367,9 @@ class ProjectManagerMock:
     deletes: list[str] = field(default_factory=list)                     # resource keys, in order
     overrides: list[Override] = field(default_factory=list)
     requests: list[tuple[str, str]] = field(default_factory=list)
+    validations: list[dict[str, Any]] = field(default_factory=list)      # validate_resource bodies
+    validation_status: int = 200                                         # 400/404/409 → refused
+    validation_reason: str = "insufficient capacity in the virtualization wallet"
 
     @property
     def app(self) -> FastAPI:
@@ -392,6 +395,16 @@ def _build_pm(mock: ProjectManagerMock) -> FastAPI:
         mock.resources[key] = dict(body) | {"project_resource_id": f"pm-{len(mock.resources) + 1}"}
         mock._by_key[idempotency_key] = key
         return _ack(mock.resources[key])        # an acknowledgement, as the real provider answers
+
+    @app.post("/projects/{project_id}/project_resources/{resource_type}/validate_resource")
+    async def validate(project_id: str, resource_type: str,
+                       body: dict[str, Any]) -> dict[str, Any]:
+        mock.validations.append(body)
+        # 200 passes; 400/404/409 are the provider's three refusals. Wallet capacity is not
+        # something a mock can model, so the verdict is a knob the test sets.
+        if mock.validation_status != 200:
+            raise HTTPException(mock.validation_status, detail=mock.validation_reason)
+        return {"message": "validation passed"}
 
     @app.patch("/projects/{project_id}/project_resources/{resource_type}/{vendor_id}")
     async def update(project_id: str, resource_type: str, vendor_id: str,

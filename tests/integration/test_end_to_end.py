@@ -151,6 +151,43 @@ async def test_resource_run_rejected_stops_without_provisioning(
     assert not servicenow.incidents  # a rejection is not a failure → no INC
 
 
+async def test_resource_run_refused_by_validation_never_reaches_the_engine(
+    pg_session_factory: async_sessionmaker,
+    servicenow: ServiceNowMock,
+    airflow: AirflowMock,
+    project_manager: ProjectManagerMock,
+) -> None:
+    # The approved request is refused by Project Manager's own precheck (here: the name is taken).
+    project_manager.validation_status = 409
+    project_manager.validation_reason = "resource name 'app-01' already exists"
+    runs, run_service, workflows, executor = await _assemble(
+        pg_session_factory, servicenow, airflow, project_manager
+    )
+    await workflows.register(make_workflow(identifier="provision-vm", run_type=RunType.RESOURCE))
+    run = await run_service.trigger(
+        workflow_identifier="provision-vm",
+        created_by="jdoe",
+        max_retries=3,  # the policy, not the budget, is what stops the retrying
+        ticket_params={},
+        workflow_params={"size": "large"},
+        resource=make_resource_spec(vendor_id="vm-1"),
+        operation=ResourceOperation.CREATE,
+        ticket=None,
+    )
+
+    final = await _drive(runs, executor, run.run_id)
+
+    assert final is not None and final.status is RunStatus.FAILED
+    assert len(project_manager.validations) == 1  # not retryable: asked once
+    assert project_manager.validations[0]["db_operation"] == "create"
+    assert project_manager.validations[0]["variables"] == {"size": "large"}
+    assert not any("dagRuns" in p for _, p in airflow.requests)  # nothing was provisioned
+    assert not servicenow.incidents  # a precheck refusal pages nobody
+    assert servicenow.ritms[-1].state == 4  # RITM closed unsuccessful
+    # Nothing is rolled back; the record the request was put on says so.
+    assert project_manager.resources[f"proj-1/vm/{run.run_id}"]["state"] == "FAILED"
+
+
 async def test_failed_resource_run_marks_the_resource_failed(
     pg_session_factory: async_sessionmaker,
     servicenow: ServiceNowMock,

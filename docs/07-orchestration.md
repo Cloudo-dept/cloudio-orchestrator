@@ -28,7 +28,17 @@ no compensation:
 - **automation**: `running_engine → closing_ticket` — attaches to the caller's pre-existing RITM
   (supplied at trigger time), so there is no `creating_ticket` step; it never touches Project
   Manager
-- **resource**: `creating_ticket → configuring_resource → awaiting_approval → running_engine → finalizing_resource → closing_ticket`
+- **resource**: `creating_ticket → configuring_resource → awaiting_approval → validating_resource → running_engine → finalizing_resource → closing_ticket`
+
+`validating_resource` is Project Manager's own precheck on the approved request: has the project's
+virtualization wallet the compute this create/update needs, and is the name free for a `create` (or
+known for an `update`/`delete`). It sits *after* the gate deliberately — the answer is only worth
+having for a request a human agreed to, and capacity is a moving target, so checked here it
+describes the wallet as it stands when the work is about to start rather than when the request was
+filed, possibly days earlier. A refusal is a verdict on the request, identical on every re-ask, so
+it ends the run as a `FailureKind.INFRA_PRECHECK` failure: no retry, no incident, the requester's
+RITM closed with the validation comment. A provider that cannot *answer* (a `5xx`, a timeout) is an
+ordinary transient failure and is retried.
 
 ## The resource record's lifecycle state
 
@@ -70,14 +80,16 @@ from collections.abc import Mapping
 from orchestrator.domain import RunType, StepName, WorkflowEngineType
 from orchestrator.orchestration.steps import (AwaitApprovalStep, ConfigureResourceStep,
                                               CloseTicketStep, CreateTicketStep,
-                                              FinalizeResourceStep, RunEngineStep, StepHandler)
+                                              FinalizeResourceStep, RunEngineStep, StepHandler,
+                                              ValidateResourceStep)
 from orchestrator.ports import ResourceManagerClient, TicketSystemClient, WorkflowEngineClient
 
 RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
     RunType.AUTOMATION: (StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
     RunType.RESOURCE: (StepName.CREATE_TICKET, StepName.CONFIGURE_RESOURCE,
-                       StepName.AWAIT_APPROVAL, StepName.RUN_ENGINE,
-                       StepName.FINALIZE_RESOURCE, StepName.CLOSE_TICKET),
+                       StepName.AWAIT_APPROVAL, StepName.VALIDATE_RESOURCE,
+                       StepName.RUN_ENGINE, StepName.FINALIZE_RESOURCE,
+                       StepName.CLOSE_TICKET),
 }
 
 
@@ -90,6 +102,7 @@ def build_handlers(
         StepName.CREATE_TICKET: CreateTicketStep(ticket_client),
         StepName.CONFIGURE_RESOURCE: ConfigureResourceStep(resource_client),
         StepName.AWAIT_APPROVAL: AwaitApprovalStep(ticket_client),
+        StepName.VALIDATE_RESOURCE: ValidateResourceStep(resource_client),
         StepName.RUN_ENGINE: RunEngineStep(engines),
         StepName.FINALIZE_RESOURCE: FinalizeResourceStep(resource_client),
         StepName.CLOSE_TICKET: CloseTicketStep(ticket_client),
@@ -233,6 +246,33 @@ class AwaitApprovalStep(StepHandler):
         if status is ApprovalStatus.REJECTED:
             raise RunRejected(f"Ticket {st.ticket.ticket_id} was rejected.")
         return status is ApprovalStatus.APPROVED
+
+
+class ValidateResourceStep(StepHandler):
+    """Project Manager's precheck on the approved request: wallet capacity, and the name being
+    free for a create (or known for an update/delete). A refusal is terminal — no retry would
+    change it — and is raised as the INFRA_PRECHECK failure the policy table already covers: no
+    incident, ticket closed with the validation comment. No idempotency marker: the check changes
+    nothing, so a re-driven step simply asks again, and gets a fresher answer for it."""
+
+    def __init__(self, resource_client: ResourceManagerClient) -> None:
+        self.resource_client = resource_client
+
+    async def execute(self, run: WorkflowRun) -> bool:
+        st = run.run_state
+        resource = st.resource
+        assert resource is not None                 # guaranteed by the trigger validation
+        result = await self.resource_client.validate_resource(ResourceValidationRequest(
+            project_id=resource.project_id, resource_type=resource.resource_type,
+            name=resource.name, operation=st.operation,
+            workflow_identifier=st.workflow.identifier, params=st.workflow_params,
+            region=resource.region, environment=resource.environment))
+        if not result.eligible:
+            raise StepFailure(
+                f"Validation refused the {st.operation.value} of resource "
+                f"'{resource.name}': {result.reason or 'no reason given'}",
+                kind=FailureKind.INFRA_PRECHECK)
+        return True
 
 
 class RunEngineStep(StepHandler):

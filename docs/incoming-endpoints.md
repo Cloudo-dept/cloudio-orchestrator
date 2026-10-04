@@ -147,7 +147,7 @@ the orchestrator resolves the registration to decide run type and build the run 
   engine has succeeded; a `delete` removes the record at the same point.
 
   A resource run steps through `creating_ticket → configuring_resource → awaiting_approval →
-  running_engine → finalizing_resource → closing_ticket` (an automation run:
+  validating_resource → running_engine → finalizing_resource → closing_ticket` (an automation run:
   `running_engine → closing_ticket`). From `configuring_resource` on — that is, *before* anyone
   approves it — the Project Manager record carries the request's `state`
   (`PROVISIONING`/`UPDATING`/`DELETING` → `READY`, or `FAILED`), so the portal can show the request
@@ -272,6 +272,7 @@ error. **Auth: network-trust** (no HMAC/token). See [01-external-contracts](01-e
 - **`WorkflowEngineType`:** `airflow`.
 - **`ResourceOperation`:** `create`, `update`, `delete`.
 - **`current_step`** (`StepName` values): `creating_ticket`, `configuring_resource`,
-  `awaiting_approval`, `running_engine`, `finalizing_resource`, `closing_ticket`.
+  `awaiting_approval`, `validating_resource`, `running_engine`, `finalizing_resource`,
+  `closing_ticket`.
 - **`ResourceState`** (written to the Project Manager record's `state`, not returned by this API):
   `PROVISIONING`, `UPDATING`, `DELETING`, `READY`, `FAILED`, `DELETED`.

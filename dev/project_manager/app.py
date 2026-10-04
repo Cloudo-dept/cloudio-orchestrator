@@ -109,6 +109,42 @@ async def create_resource(
     return _ack(result.inserted_id)
 
 
+IN_FLIGHT_STATES = {"PROVISIONING", "UPDATING", "DELETING"}
+
+
+@app.post("/projects/{project_id}/project_resources/{resource_type}/validate_resource")
+async def validate_resource(
+    project_id: str,
+    resource_type: str,
+    body: dict[str, Any],
+) -> dict[str, str]:
+    """Stand in for the real precheck: 200 passes, 400/404/409 refuse the request.
+
+    The real Project Manager also weighs the project's virtualization wallet, which this mock has
+    no notion of — it only checks the name, so a dev run always has the capacity it asks for.
+
+    Records that are *in flight* are ignored when deciding whether a name is taken: a `create`
+    reaches this endpoint only after its own `PROVISIONING` record exists (the orchestrator writes
+    it before the approval gate), and a run must not be refused on the strength of its own record.
+    """
+    name = body.get("name")
+    operation = body.get("db_operation")
+    if not name:
+        raise HTTPException(400, detail="name is required")
+    rows = (
+        await db["resources"]
+        .find({"project_id": project_id, "resource_type": resource_type})
+        .to_list(length=None)
+    )
+    named = [r for r in rows if r["body"].get("name") == name]
+    if operation == "create":
+        if any(r["body"].get("state") not in IN_FLIGHT_STATES for r in named):
+            raise HTTPException(409, detail=f"resource name '{name}' already exists")
+    elif not named:
+        raise HTTPException(404, detail=f"no resource named '{name}'")
+    return {"message": "validation passed"}
+
+
 @app.patch("/projects/{project_id}/project_resources/{resource_type}/{vendor_id}")
 async def update_resource(
     project_id: str,

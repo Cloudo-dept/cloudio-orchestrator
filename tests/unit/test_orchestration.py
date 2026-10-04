@@ -12,9 +12,11 @@ from orchestrator.domain import (
     EngineRunStatus,
     FailureKind,
     ResourceOperation,
+    ResourceValidationResult,
     RunRejected,
     RunStatus,
     RunType,
+    StepFailure,
     StepName,
     TicketOutcome,
     TicketRef,
@@ -31,6 +33,7 @@ from orchestrator.orchestration.steps import (
     CreateTicketStep,
     FinalizeResourceStep,
     StepHandler,
+    ValidateResourceStep,
     engine_run_key,
     idem_key,
 )
@@ -555,6 +558,75 @@ async def test_rejected_update_leaves_the_resource_ready(
         ("proj-1", "vm", "vm-1", state_fields("UPDATING", in_progress=True)),
         ("proj-1", "vm", "vm-1", state_fields("READY", in_progress=False)),
     ]
+
+
+async def test_validate_resource_step_describes_the_request(resources) -> None:
+    step = ValidateResourceStep(resources)
+    run = make_run(run_type=RunType.RESOURCE, operation=ResourceOperation.UPDATE)
+
+    assert await step.execute(run) is True
+
+    asked = resources.validations[-1]
+    assert asked.project_id == "proj-1" and asked.resource_type == "vm"
+    assert asked.name == "app-01" and asked.region == "gvt" and asked.environment == "prod"
+    assert asked.operation is ResourceOperation.UPDATE  # what is being done to it
+    assert asked.workflow_identifier == "provision-vm"  # which workflow is asking
+    assert asked.params == {"size": "large"}  # the engine conf the run would be started with
+
+
+async def test_validate_resource_step_refusal_is_a_precheck_failure(resources) -> None:
+    resources.validation_result = ResourceValidationResult(
+        eligible=False, reason="insufficient vCPU in the virtualization wallet"
+    )
+    step = ValidateResourceStep(resources)
+    run = make_run(run_type=RunType.RESOURCE)
+
+    with pytest.raises(StepFailure) as raised:
+        await step.execute(run)
+
+    # INFRA_PRECHECK: not retryable (the wallet will not refill on a backoff), no incident.
+    assert raised.value.kind is FailureKind.INFRA_PRECHECK
+    assert "insufficient vCPU" in str(raised.value)
+
+
+async def test_resource_run_refused_by_validation_fails_without_an_incident(
+    runs, tickets, resources, engine, settings
+) -> None:
+    resources.validation_result = ResourceValidationResult(eligible=False, reason="no capacity")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=3))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert "no capacity" in final.run_state.errors[StepName.VALIDATE_RESOURCE]
+    assert len(resources.validations) == 1  # not retryable: asked once, no backoff
+    assert engine.trigger_calls == []  # nothing was provisioned
+    assert tickets.incidents == []  # a full wallet pages nobody
+    assert tickets.closed == [
+        (
+            "RITM0000001",
+            "Your request was closed due to a validation error",
+            TicketOutcome.UNSUCCESSFUL,
+        )
+    ]
+    # Nothing is rolled back; the record the request was put on says so.
+    assert resources.updated[-1] == (
+        "proj-1",
+        "vm",
+        str(run.run_id),
+        state_fields("FAILED", in_progress=False),
+    )
+
+
+async def test_validation_sits_between_the_approval_gate_and_the_engine() -> None:
+    # Capacity is only worth checking for a request a human agreed to, and only as it stands when
+    # the work is about to start — so the precheck runs after the gate and before any provisioning.
+    plan = RUN_PLANS[RunType.RESOURCE]
+    assert plan.index(StepName.AWAIT_APPROVAL) + 1 == plan.index(StepName.VALIDATE_RESOURCE)
+    assert plan.index(StepName.VALIDATE_RESOURCE) + 1 == plan.index(StepName.RUN_ENGINE)
+    # An automation run touches no resource, so there is nothing to validate.
+    assert StepName.VALIDATE_RESOURCE not in RUN_PLANS[RunType.AUTOMATION]
 
 
 def test_resource_is_configured_before_the_approval_gate() -> None:

@@ -11,6 +11,7 @@ from orchestrator.orchestration.steps import (
     FinalizeResourceStep,
     RunEngineStep,
     StepHandler,
+    ValidateResourceStep,
 )
 from orchestrator.ports import (
     ResourceManagerClient,
@@ -23,11 +24,14 @@ RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
     # is no CREATE_TICKET step — the run only drives the engine and closes the ticket.
     RunType.AUTOMATION: (StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
     # Resource runs put the request on its resource before waiting for approval, so the resource
-    # shows the request under way from the moment it is made.
+    # shows the request under way from the moment it is made. Validation comes after the gate:
+    # wallet capacity is only worth checking for a request a human agreed to, and only as it
+    # stands when the work is about to start.
     RunType.RESOURCE: (
         StepName.CREATE_TICKET,
         StepName.CONFIGURE_RESOURCE,
         StepName.AWAIT_APPROVAL,
+        StepName.VALIDATE_RESOURCE,
         StepName.RUN_ENGINE,
         StepName.FINALIZE_RESOURCE,
         StepName.CLOSE_TICKET,
@@ -44,6 +48,7 @@ def build_handlers(
         StepName.CREATE_TICKET: CreateTicketStep(ticket_client),
         StepName.CONFIGURE_RESOURCE: ConfigureResourceStep(resource_client),
         StepName.AWAIT_APPROVAL: AwaitApprovalStep(ticket_client),
+        StepName.VALIDATE_RESOURCE: ValidateResourceStep(resource_client),
         StepName.RUN_ENGINE: RunEngineStep(engines),
         StepName.FINALIZE_RESOURCE: FinalizeResourceStep(resource_client),
         StepName.CLOSE_TICKET: CloseTicketStep(ticket_client),
