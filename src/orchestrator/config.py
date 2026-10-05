@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     pm_base_url: str
     pm_token: SecretStr
 
+    # Legacy automation runner. Required like every other provider URL: a legacy run that reached
+    # the handover only to find no endpoint configured would fail after being accepted with a 201,
+    # which is worse than refusing to start. Retire these three with the runner itself.
+    legacy_runner_base_url: str
+    legacy_runner_token: SecretStr = SecretStr("")  # empty → no Authorization header is sent
+    # The runner's submit path. Deployment knowledge, so it is configuration rather than a constant
+    # in the adapter — CONFIRM this against the real runner before first use.
+    legacy_runner_submit_path: str = "/api/v1/requests"
+
     external_call_timeout_seconds: float = 10.0
 
     # Outbound HTTP connection pool, applied per provider. A pooled client reuses connections

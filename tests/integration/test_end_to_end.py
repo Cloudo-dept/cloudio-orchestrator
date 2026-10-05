@@ -27,6 +27,7 @@ from orchestrator.orchestration.executor import RunExecutor
 from orchestrator.orchestration.plans import build_handlers
 from orchestrator.services import WorkflowRunService
 from tests.factories import make_resource_spec, make_workflow
+from tests.fakes import FakeLegacyAutomationClient
 from tests.mocks.airflow import AirflowMock
 from tests.mocks.base import mock_client
 from tests.mocks.project_manager import ProjectManagerMock
@@ -53,7 +54,9 @@ async def _assemble(pg_session_factory, servicenow, airflow, project_manager):
     )
     runs = PostgresWorkflowRunRepository(pg_session_factory)
     workflows = PostgresWorkflowRepository(pg_session_factory)
-    handlers = build_handlers(tickets, resources, {WorkflowEngineType.AIRFLOW: engine})
+    handlers = build_handlers(
+        tickets, resources, {WorkflowEngineType.AIRFLOW: engine}, FakeLegacyAutomationClient()
+    )
     handlers[StepName.RUN_ENGINE].poll_interval_seconds = 0  # re-drive immediately
     handlers[StepName.AWAIT_APPROVAL].poll_interval_seconds = 0  # re-drive immediately
     executor = RunExecutor(

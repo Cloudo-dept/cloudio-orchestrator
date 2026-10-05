@@ -65,9 +65,9 @@ def test_run_state_operation_defaults_to_create() -> None:
 
 
 def test_enum_values_are_lowercase_strings() -> None:
-    assert _enum_values(RunType) == ["automation", "resource"]
+    assert _enum_values(RunType) == ["automation", "resource", "legacy"]
     assert _enum_values(RunStatus) == ["pending", "running", "completed", "failed", "rejected"]
-    assert _enum_values(WorkflowEngineType) == ["airflow"]
+    assert _enum_values(WorkflowEngineType) == ["airflow", "legacy"]
     # str-enum comparison against a raw string works (used for current_step column).
     assert StepName.CREATE_TICKET == "creating_ticket"
     assert EngineRunStatus.IN_PROGRESS.value == "in_progress"

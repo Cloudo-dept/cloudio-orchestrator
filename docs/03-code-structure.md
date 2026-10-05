@@ -13,7 +13,7 @@ Everything else is deliberately flat: modules are grouped **by role**, not one-c
 | Module group | Holds | Depends on |
 |---|---|---|
 | `domain.py` | enums, typed entities (`WorkflowRun`, `Workflow`, `RunState`, …), exceptions, `utcnow` | pydantic, sqlmodel |
-| `ports.py` | the five ABCs every adapter implements (the two repositories, the three clients) | `domain` |
+| `ports.py` | the six ABCs every adapter implements (the two repositories, the four clients) | `domain` |
 | `orchestration/` | step handlers, run plans, `RunExecutor`, `FailureEscalator` | `domain`, `ports` |
 | `services.py` | `WorkflowService`, `WorkflowRunService` (use-cases the API delegates to) | `domain`, `ports` |
 | `adapters/` | concrete port implementations + Alembic migrations | `domain`, `ports`, tech libs |
@@ -41,7 +41,8 @@ cloudio-orchestrator/
 │   │   ├── base.py                     # Override/apply_overrides + MockServer (ephemeral-port option)
 │   │   ├── servicenow.py               # ServiceNowMock
 │   │   ├── airflow.py                  # AirflowMock
-│   │   └── project_manager.py          # ProjectManagerMock
+│   │   ├── project_manager.py          # ProjectManagerMock
+│   │   └── legacy_runner.py            # LegacyRunnerMock
 │   ├── unit/                           # port-level: domain, orchestration, worker, services (fakes)
 │   │   ├── test_domain.py
 │   │   ├── test_orchestration.py       # executor, steps, retry/failure paths
@@ -52,6 +53,7 @@ cloudio-orchestrator/
 │       ├── test_adapter_airflow.py     # real client vs AirflowMock
 │       ├── test_adapter_servicenow.py
 │       ├── test_adapter_project_manager.py
+│       ├── test_adapter_legacy_automation.py
 │       ├── test_repository.py          # testcontainers Postgres: concurrency, claim_due, JSONB finders
 │       ├── test_worker_claim.py        # testcontainers: claim_due + drive, SKIP LOCKED disjoint, lease re-drive
 │       ├── test_api.py
@@ -69,11 +71,12 @@ cloudio-orchestrator/
         ├── log.py                      # configure_logging + LOG_CONFIG_PATH + request log context
         ├── domain.py                   # enums · TicketRef/ResourceSpec/RunState · WorkflowRun/Workflow (SQLModel) · exceptions
         ├── ports.py                    # WorkflowRunRepository · WorkflowRepository ·
-        │                               # TicketSystemClient · ResourceManagerClient · WorkflowEngineClient
+        │                               # TicketSystemClient · ResourceManagerClient · WorkflowEngineClient ·
+        │                               # LegacyAutomationClient
         ├── services.py                 # WorkflowService · WorkflowRunService
         ├── orchestration/
         │   ├── __init__.py
-        │   ├── steps.py                # StepHandler ABC + CreateTicketStep/ConfigureResourceStep/AwaitApprovalStep/ValidateResourceStep/RunEngineStep/FinalizeResourceStep/CloseTicketStep + resource_state_fields
+        │   ├── steps.py                # StepHandler ABC + CreateTicketStep/ConfigureResourceStep/AwaitApprovalStep/ValidateResourceStep/RunEngineStep/FinalizeResourceStep/CloseTicketStep/SubmitLegacyStep + resource_state_fields
         │   ├── plans.py                # RUN_PLANS (RunType → ordered StepNames) + build_handlers()
         │   ├── failure_policy.py       # FAILURE_POLICIES (FailureKind → retry? incident? ticket comment)
         │   ├── executor.py             # RunExecutor (drives one run per call)
@@ -84,6 +87,7 @@ cloudio-orchestrator/
         │   ├── servicenow.py           # ServiceNowTicketClient → implements TicketSystemClient
         │   ├── airflow.py              # AirflowWorkflowEngineClient → implements WorkflowEngineClient
         │   ├── project_manager.py      # ProjectManagerResourceClient → implements ResourceManagerClient
+        │   ├── legacy_automation.py    # HttpLegacyAutomationClient → implements LegacyAutomationClient
         │   └── migrations/             # Alembic env.py + versions/0001_initial.py
         ├── api.py                      # FastAPI app + request/response schemas + routers
         ├── worker.py                   # OrchestratorWorker (daemon) + RunWorker (claim-and-drive loop)
@@ -101,9 +105,9 @@ package out of the repo root so tests import the *installed* copy.
 |---|---|
 | `Settings` | `config.py` |
 | enums, `TicketRef`, `ResourceSpec`, `ResolvedWorkflow`, `EngineFailure`, `RunState`, `WorkflowRun`, `Workflow`, exceptions, `utcnow`, `PydanticJSONB` | `domain.py` |
-| all five port ABCs | `ports.py` |
+| all six port ABCs | `ports.py` |
 | session factory, `PostgresWorkflowRunRepository`, `PostgresWorkflowRepository` | `adapters/database.py` |
-| `ServiceNowTicketClient` / `AirflowWorkflowEngineClient` / `ProjectManagerResourceClient` | `adapters/servicenow.py` / `airflow.py` / `project_manager.py` |
+| `ServiceNowTicketClient` / `AirflowWorkflowEngineClient` / `ProjectManagerResourceClient` / `HttpLegacyAutomationClient` | `adapters/servicenow.py` / `airflow.py` / `project_manager.py` / `legacy_automation.py` |
 | `StepHandler` + the step handlers, `resource_state_fields` | `orchestration/steps.py` |
 | `RUN_PLANS`, `build_handlers` | `orchestration/plans.py` |
 | `RunExecutor` | `orchestration/executor.py` |
@@ -176,7 +180,7 @@ asyncio_mode = "auto"
 
 ### Design notes
 
-- **Ports in one module.** All six ABCs are small (2–5 methods); a single `ports.py` shows the
+- **Ports in one module.** All seven ABCs are small (1–5 methods); a single `ports.py` shows the
   entire external surface of the system on one page. Adapters grow independently.
 - **One model, not three.** `WorkflowRun` is a single SQLModel class — it *is* a Pydantic model
   and *is* the table. The previous revision's pure-entity + `WorkflowRunTable` + mapper trio is

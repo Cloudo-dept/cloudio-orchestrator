@@ -4,9 +4,23 @@
 
 **Workflow registry.** A `workflow` table is registered ahead of time (admin API) and maps a stable **`identifier`** → `run_type` (automation | resource), `engine_type`, `automation_id` (Airflow: DAG id), and `ticket_template_id` (provider-agnostic; ServiceNow: the catalog item to order). An external service (Cloud Portal, Ticket System) triggers a run by naming the workflow `identifier` and supplying three parameter sets — **ticket_params** (RITM variables), **workflow_params** (engine conf), and **resource** (a typed `ResourceSpec`, resource flow only). The orchestrator resolves the registration to decide the run type and how to build it. Both flows **create** the RITM by ordering the mapped catalog item.
 
-Two asynchronous workflow types (both create the RITM):
+Two asynchronous workflow types (both create the RITM), plus a legacy pass-through:
 1. **Automation Flow**: trigger → resolve workflow → create RITM → run workflow engine → close RITM.
 2. **Resource Flow**: trigger → resolve workflow → create RITM → Resource Manager (create/mark the record `PROVISIONING`/`UPDATING`/`DELETING`) → await RITM approval → validate the request against the Resource Manager (virtualization-wallet capacity, the name) → run workflow engine → finalize resource (`READY`, or `DELETED` + remove) → close RITM. The record is written *before* the approval gate, so a portal shows the request from the moment it is made. A run that ends badly — failed or rejected — releases its record: a `create`'s is deleted, an `update`/`delete`'s goes back to `READY`.
+
+**Legacy pass-through (`RunType.LEGACY`).** Callers still speaking the old wire format
+(`flow_type` / `db_operation` / `variables` / …) post to their **own endpoint**,
+`POST /api/v1/legacy-runs` — the route is the discriminator, so no endpoint ever has to sniff a
+body to work out which contract it was handed. The request is carried verbatim (`LegacyRequest`)
+and handed to the legacy automation runner in a **one-step plan**: no RITM, no resource record, no
+engine poll, because the legacy runner owns all of that itself. The runner is **fire-and-forget**,
+so it is deliberately *not* a `WorkflowEngineClient` — three of that port's four methods would be
+inventing answers — but implements its own one-method `LegacyAutomationClient`. The consequence is
+load-bearing: a legacy run reaching `COMPLETED` means the runner **accepted** the request, never
+that the work succeeded, and only the handover itself can fail visibly. This whole flow is
+temporary by construction — when the runner is switched off, the run type, the engine-type label,
+the step, the port and its adapter are deleted together. See
+[incoming-endpoints](incoming-endpoints.md#post-apiv1legacy-runs).
 
 **Run state, one durable store.** The durable object is a **`WorkflowRun`** row (type, status, `current_step`, per-step `state`, `scheduled_at`, `version`) that *we* own. It holds no queue mechanics (no `locked_by`, no `lock_expires_at`); the one time-related field, `scheduled_at`, is application scheduling — "(re-)drive me at/after this time" — not a lease. A run is advanced by a worker claiming its row and driving it: load, step forward, persist, and (if the run must wait or retry) set `scheduled_at` to a future time.
 

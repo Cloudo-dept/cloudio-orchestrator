@@ -12,10 +12,12 @@ from sqlmodel import SQLModel
 
 import orchestrator.domain  # noqa: F401  (populates SQLModel.metadata)
 from orchestrator.adapters.airflow import AirflowWorkflowEngineClient
+from orchestrator.adapters.legacy_automation import HttpLegacyAutomationClient
 from orchestrator.adapters.project_manager import ProjectManagerResourceClient
 from orchestrator.adapters.servicenow import ServiceNowTicketClient
 from tests.mocks.airflow import AirflowMock
 from tests.mocks.base import mock_client
+from tests.mocks.legacy_runner import LegacyRunnerMock
 from tests.mocks.project_manager import ProjectManagerMock
 from tests.mocks.servicenow import ServiceNowMock
 
@@ -51,6 +53,21 @@ async def servicenow_client(servicenow: ServiceNowMock) -> AsyncIterator[Service
 
 
 @pytest.fixture
+def legacy_runner() -> LegacyRunnerMock:
+    return LegacyRunnerMock()
+
+
+@pytest.fixture
+async def legacy_client(
+    legacy_runner: LegacyRunnerMock,
+) -> AsyncIterator[HttpLegacyAutomationClient]:
+    async with mock_client(
+        legacy_runner.app, "http://legacy.local", headers={"Authorization": "Bearer t"}
+    ) as http:
+        yield HttpLegacyAutomationClient(http, legacy_runner.submit_path)
+
+
+@pytest.fixture
 def project_manager() -> ProjectManagerMock:
     return ProjectManagerMock()
 
@@ -68,9 +85,11 @@ async def pm_client(
 # --- Postgres (testcontainers) — skipped when Docker is unavailable ---
 
 _ENUM_DDL = [
-    "CREATE TYPE run_type AS ENUM ('automation', 'resource')",
+    # The enum labels as of the latest migration (0001_initial plus 0002 and 0005), so a run of
+    # any type round-trips here exactly as it would against a migrated database.
+    "CREATE TYPE run_type AS ENUM ('automation', 'resource', 'legacy')",
     "CREATE TYPE run_status AS ENUM ('pending','running','completed','failed','rejected')",
-    "CREATE TYPE workflow_engine_type AS ENUM ('airflow')",
+    "CREATE TYPE workflow_engine_type AS ENUM ('airflow', 'legacy')",
 ]
 _INDEX_DDL = [
     "CREATE INDEX idx_runs_scheduled_at ON workflow_runs (scheduled_at) "

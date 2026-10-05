@@ -19,6 +19,7 @@ REQUIRED_ENV = {
     "ORCH_SERVICENOW_PASSWORD": "sn-secret",
     "ORCH_PM_BASE_URL": "https://pm.example",
     "ORCH_PM_TOKEN": "pm-token",
+    "ORCH_LEGACY_RUNNER_BASE_URL": "https://legacy.example",
     "ORCH_WORKER_CONCURRENCY_LIMIT": "3",
 }
 
@@ -39,3 +40,5 @@ async def test_build_wires_the_container(env: None) -> None:
     assert isinstance(container.health_check, PostgresHealthCheck)
     # concurrency_limit → that many RunWorker loops.
     assert len(container.worker._workers) == 3
+    # One pooled client per provider, the legacy runner included, all closed on shutdown.
+    assert len(container.http_clients) == 4

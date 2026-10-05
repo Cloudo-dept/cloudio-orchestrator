@@ -14,6 +14,7 @@ from orchestrator.orchestration.plans import build_handlers
 from orchestrator.worker import RunWorker
 from tests.factories import make_run
 from tests.fakes import (
+    FakeLegacyAutomationClient,
     FakeResourceManagerClient,
     FakeTicketSystemClient,
     FakeWorkflowEngineClient,
@@ -31,7 +32,9 @@ async def test_worker_drives_pg_run_to_completion(
         FakeResourceManagerClient(),
         FakeWorkflowEngineClient(),
     )
-    handlers = build_handlers(tickets, resources, {WorkflowEngineType.AIRFLOW: engine})
+    handlers = build_handlers(
+        tickets, resources, {WorkflowEngineType.AIRFLOW: engine}, FakeLegacyAutomationClient()
+    )
     handlers[StepName.RUN_ENGINE].poll_interval_seconds = 0
     executor = RunExecutor(
         handlers,

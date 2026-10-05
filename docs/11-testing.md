@@ -569,7 +569,7 @@ async def test_incident_open_5xx_is_surfaced(servicenow, servicenow_client):
 
 ## End-to-end integration test
 
-Assemble exactly what [bootstrap.py](08-entrypoints.md) builds, but with the three clients pointed at
+Assemble exactly what [bootstrap.py](08-entrypoints.md) builds, but with the provider clients pointed at
 the mocks and a **real Postgres** repository (the same `pg_session_factory` fixture the repository
 tests use). Drive the run the way the worker does — `claim_due` → `executor.handle` — until terminal.
 Poll intervals are set to `0` in the fixture so a re-claim is immediate, and

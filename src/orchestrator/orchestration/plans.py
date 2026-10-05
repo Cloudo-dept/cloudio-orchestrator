@@ -11,9 +11,11 @@ from orchestrator.orchestration.steps import (
     FinalizeResourceStep,
     RunEngineStep,
     StepHandler,
+    SubmitLegacyStep,
     ValidateResourceStep,
 )
 from orchestrator.ports import (
+    LegacyAutomationClient,
     ResourceManagerClient,
     TicketSystemClient,
     WorkflowEngineClient,
@@ -36,6 +38,12 @@ RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
         StepName.FINALIZE_RESOURCE,
         StepName.CLOSE_TICKET,
     ),
+    # A legacy run hands its request to the legacy automation runner and is done. No ticket (the
+    # runner opens its own), no resource record, no engine poll — the runner reports nothing back,
+    # so there is nothing to wait for and nothing to finalize. One step is the whole flow, and the
+    # plan being data is what makes that a one-line statement rather than a special case: if the
+    # runner ever learns to report status, a poll step is appended here and nothing else moves.
+    RunType.LEGACY: (StepName.SUBMIT_LEGACY,),
 }
 
 
@@ -43,6 +51,7 @@ def build_handlers(
     ticket_client: TicketSystemClient,
     resource_client: ResourceManagerClient,
     engines: Mapping[WorkflowEngineType, WorkflowEngineClient],
+    legacy_client: LegacyAutomationClient,
 ) -> dict[StepName, StepHandler]:
     return {
         StepName.CREATE_TICKET: CreateTicketStep(ticket_client),
@@ -52,4 +61,5 @@ def build_handlers(
         StepName.RUN_ENGINE: RunEngineStep(engines),
         StepName.FINALIZE_RESOURCE: FinalizeResourceStep(resource_client),
         StepName.CLOSE_TICKET: CloseTicketStep(ticket_client),
+        StepName.SUBMIT_LEGACY: SubmitLegacyStep(legacy_client),
     }

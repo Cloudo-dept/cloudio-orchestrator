@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from orchestrator.domain import (
+    LegacyRequest,
     ResolvedWorkflow,
     ResourceIdRequired,
     ResourceOperation,
@@ -19,6 +20,7 @@ from orchestrator.domain import (
     TicketRefRequired,
     UnknownWorkflowError,
     Workflow,
+    WorkflowEngineType,
     WorkflowRun,
 )
 from orchestrator.ports import WorkflowRepository, WorkflowRunRepository
@@ -131,6 +133,58 @@ class WorkflowRunService:
             created.run_id,
             created.run_type,
             wf.identifier,
+        )
+        return created
+
+    async def trigger_legacy(
+        self,
+        *,
+        request: LegacyRequest,
+        created_by: str,
+        max_retries: int,
+    ) -> WorkflowRun:
+        """Create a LEGACY run for a request in the legacy runner's own wire shape.
+
+        Separate from ``trigger`` rather than a branch inside it: the two take different requests
+        and build different runs, and the registry lookup that opens ``trigger`` has no part here.
+        A legacy ``flow_type`` is **not** registered — the legacy runner resolves its own flows, and
+        requiring an admin to pre-register every retiring flow would add an ops step whose only
+        purpose is to let the orchestrator reject a flow the runner itself would have accepted.
+
+        The cost of that is worth stating: an unknown ``flow_type`` is not caught here. It fails at
+        the handover, as a FAILED run with the runner's own refusal on it, rather than as a 404 at
+        trigger time.
+        """
+        logger.info(
+            "Legacy trigger requested for flow_type '%s' by %s.", request.flow_type, created_by
+        )
+        state = RunState(
+            # The run carries a ResolvedWorkflow like any other, built from the request rather than
+            # from the registry: the flow_type is the identifier, and the engine type says
+            # truthfully what will run it. ticket_template_id is empty because a legacy run opens
+            # no ticket — the legacy runner does its own ticketing.
+            workflow=ResolvedWorkflow(
+                identifier=request.flow_type,
+                name=None,
+                engine_type=WorkflowEngineType.LEGACY,
+                automation_id=request.flow_type,
+                ticket_template_id="",
+            ),
+            legacy=request,
+        )
+        run = WorkflowRun(
+            run_type=RunType.LEGACY,
+            status=RunStatus.PENDING,
+            workflow_identifier=request.flow_type,
+            created_by=created_by,
+            max_retries=max_retries,
+            run_state=state,
+        )
+        created = await self.runs.create(run)
+        logger.info(
+            "Created legacy run %s for flow_type '%s'; queued for immediate handover.",
+            created.run_id,
+            request.flow_type,
         )
         return created
 

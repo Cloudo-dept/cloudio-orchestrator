@@ -22,6 +22,7 @@ the callbacks** — they are network-trust only (see
 | `GET /api/v1/workflows/{identifier}` | Fetch one workflow | Platform admin / operator / console UI |
 | `PUT /api/v1/workflows/{identifier}` | Update a workflow mapping | Platform admin / operator |
 | `POST /api/v1/workflow-runs` | Trigger a run of a workflow | **Automation:** ServiceNow (RITM outbound REST). **Resource:** self-service portal / upstream automation |
+| `POST /api/v1/legacy-runs` | Hand a legacy request to the legacy automation runner | **Legacy callers** still speaking the old wire format |
 | `GET /api/v1/workflow-runs/{run_id}` | Fetch one run's status/state | Requester / console UI polling for completion |
 | `GET /api/v1/workflow-runs/latest` | The latest run for one resource record | **Self-service portal** (via the gateway), beside a resource's `state` |
 | `GET /api/v1/workflow-runs/latest-batch` | The latest run for each of several resource records | **Self-service portal** (via the gateway), a screen listing a project's resources |
@@ -164,6 +165,54 @@ the orchestrator resolves the registration to decide run type and build the run 
   `resource.vendor_id` (which record to act on) or no `resource.resource_id` (which of the records
   sharing that vendor id).
 
+### `POST /api/v1/legacy-runs`  → `201 Created`
+Accept a request in the **legacy automation runner's own wire format** and hand it straight to that
+runner. The run is tracked in the same store, driven by the same workers, and observable through
+`GET /api/v1/workflow-runs/{run_id}` like any other.
+
+> [!IMPORTANT]
+> **Why this is a separate endpoint, not a second shape on `POST /api/v1/workflow-runs`.** The two
+> payloads share no required field, so the route *is* the discriminator. Sniffing one endpoint's
+> body instead (`has flow_type?` / `no workflow_identifier?`) would put branching logic at the one
+> boundary where a declared contract matters most, force every field of both shapes to become
+> optional so a union could parse, and produce an OpenAPI schema documenting neither. Two
+> contracts, two doors.
+
+> [!WARNING]
+> **The legacy runner is fire-and-forget.** It returns no pollable run id and reports nothing after
+> it accepts a request. So a `201` here — and a later `status` of `completed` — mean **the runner
+> accepted the request**, *not* that the work succeeded. The only failure the orchestrator can see
+> is a failure to hand the request over at all; everything after that is invisible to it. A legacy
+> run therefore never opens a ticket, never writes a Project Manager record, and never reaches
+> `FAILED` for a reason inside the legacy runner.
+
+- **Source:** legacy callers that still speak the old format. Not the portal (it uses
+  `POST /api/v1/workflow-runs`) and not ServiceNow.
+- **Request — `LegacyRunRequest`:**
+
+  | Field | Type | Required | Notes |
+  | --- | --- | --- | --- |
+  | `flow_type` | `str` (≤255) | ✔ | Which legacy flow to run. **Not registered** in the workflow registry — the legacy runner resolves its own flows (see below). |
+  | `created_by` | `str` (≤255) | ✔ | Requesting user. Orchestrator bookkeeping; **not** forwarded to the runner. |
+  | `max_retries` | `int` (0–10) | ✗ (default `3`) | Retry budget for the **handover call only**. Orchestrator bookkeeping; not forwarded. |
+  | `project_id` | `str \| None` | ✗ | Forwarded as-is; omitted from the body entirely when absent. |
+  | `resource_type` | `str \| None` | ✗ | Forwarded as-is; omitted from the body entirely when absent. |
+  | `variables` | `dict[str, Any]` | ✗ (`{}`) | The legacy flow's own parameters. Free-form pass-through — the orchestrator never looks inside. |
+  | `db_operation` | `str` | ✔ | Forwarded as-is. Deliberately **not** constrained to `create`/`update`/`delete`: a legacy run never branches on it, so validating it here could only reject a value the runner itself accepts. |
+  | `name` | `str` | ✔ | Forwarded as-is. |
+  | `region` | `str` | ✔ | Forwarded as-is. |
+
+  Everything but `created_by` and `max_retries` is forwarded to the runner **untranslated**, under
+  these exact field names (`LegacyRequest` in `domain.py`). A legacy run steps through
+  `submitting_legacy` and nothing else.
+
+- **Response `201` — `WorkflowRunResponse`:** the same shape as a native trigger. `run_type` is
+  `legacy`, `run_state.legacy` carries the request as it will be sent, and
+  `run_state.workflow.engine_type` is `legacy`.
+- **Errors:** `422` — a required field is missing or malformed. **There is no `404`:** an unknown
+  `flow_type` is not caught here (nothing is pre-registered), so it surfaces as a `FAILED` run
+  carrying the runner's own refusal, not as an error on this response.
+
 ### `GET /api/v1/workflow-runs/{run_id}`  → `200`
 Fetch a single run's current status and state. This is the **polling** endpoint requesters use to
 observe completion (completion is poll-based; callbacks only cut latency).
@@ -270,12 +319,15 @@ error. **Auth: network-trust** (no HMAC/token). See [01-external-contracts](01-e
 
 ## Enum reference
 
-- **`RunType`:** `automation`, `resource`.
-- **`RunStatus`:** `pending`, `running`, `completed`, `failed`, `rejected`.
-- **`WorkflowEngineType`:** `airflow`.
+- **`RunType`:** `automation`, `resource`, `legacy`.
+- **`RunStatus`:** `pending`, `running`, `completed`, `failed`, `rejected`. Note that on a `legacy`
+  run, `completed` means the legacy runner *accepted* the request — see
+  `POST /api/v1/legacy-runs`.
+- **`WorkflowEngineType`:** `airflow`, `legacy`. `legacy` is a label only: the legacy runner cannot
+  be polled, so it has no `WorkflowEngineClient` and no entry in the engines mapping.
 - **`ResourceOperation`:** `create`, `update`, `delete`.
 - **`current_step`** (`StepName` values): `creating_ticket`, `configuring_resource`,
   `awaiting_approval`, `validating_resource`, `running_engine`, `finalizing_resource`,
-  `closing_ticket`.
+  `closing_ticket`, `submitting_legacy`.
 - **`ResourceState`** (written to the Project Manager record's `state`, not returned by this API):
   `PROVISIONING`, `UPDATING`, `DELETING`, `READY`, `DELETED`.

@@ -1,4 +1,4 @@
-"""The ABCs every adapter implements: two repositories, three external clients, and a health probe.
+"""The ABCs every adapter implements: two repositories, four external clients, and a health probe.
 
 Business logic depends only on these ports; every technology-specific class lives in ``adapters/``
 and implements one of them. No provider vocabulary crosses a port boundary.
@@ -13,6 +13,7 @@ from orchestrator.domain import (
     ApprovalStatus,
     EngineFailure,
     EngineRunStatus,
+    LegacyRequest,
     ResourceValidationRequest,
     ResourceValidationResult,
     TicketOutcome,
@@ -194,6 +195,34 @@ class ResourceManagerClient(abc.ABC):
         """Remove a project resource — or retire it, where that is how the provider deletes.
         Idempotent: a record that is already gone is not an error, so a re-driven finalize cannot
         fail on the strength of its own earlier success."""
+
+
+class LegacyAutomationClient(abc.ABC):
+    """The legacy automation runner: one capability, hand a request over.
+
+    Deliberately **not** a ``WorkflowEngineClient``. That port promises a run you can trigger and
+    then interrogate — ``query_run_status``, ``get_failure``, ``get_output`` — and the legacy runner
+    offers none of those: it accepts a request and reports nothing afterwards. Implementing the
+    engine port here would mean three methods inventing an answer, which is exactly the failure the
+    port rules are there to prevent. A capability this system genuinely has gets a port its own
+    size; when the runner is retired, this port is deleted whole.
+
+    The consequence runs all the way up: a LEGACY run reaching COMPLETED means *the runner accepted
+    the request*, never that the work succeeded. Nothing downstream of the handover is observable
+    to the orchestrator, so no legacy run ever FAILs for a reason inside the legacy runner.
+    """
+
+    @abc.abstractmethod
+    async def submit(self, request: LegacyRequest, idempotency_key: str) -> str | None:
+        """Hand the request to the runner, returning whatever reference it answers with (or None
+        when it answers with nothing useful). Fire-and-forget: a normal return means *accepted*,
+        not *done*.
+
+        Raises on a failure to hand over at all — unreachable, refused, timed out — which the
+        caller retries like any other transient provider failure. ``idempotency_key`` is stable per
+        (run, step), so a runner that dedups on it will not double-accept a re-driven request; see
+        the note on SubmitLegacyStep for what happens when it does not.
+        """
 
 
 class WorkflowEngineClient(abc.ABC):

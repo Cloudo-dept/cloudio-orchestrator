@@ -12,9 +12,10 @@ from orchestrator.domain import (
     TicketRef,
     TicketRefRequired,
     UnknownWorkflowError,
+    WorkflowEngineType,
 )
 from orchestrator.services import WorkflowRunService, WorkflowService
-from tests.factories import make_resource_spec, make_workflow
+from tests.factories import make_legacy_request, make_resource_spec, make_workflow
 
 RITM = TicketRef(ticket_id="RITM0000001", native_id="sys1")  # a caller-supplied automation ticket
 
@@ -280,3 +281,61 @@ async def test_find_by_ticket_and_resource(runs, workflows) -> None:
     found = await svc.find_by_vendor_id("vm-7")
     assert [r.run_id for r in found] == [run.run_id]
     assert await svc.find_by_vendor_id("absent") == []
+
+
+# --- Legacy triggers: no registry lookup, and a run built from the request itself ---
+
+
+async def test_trigger_legacy_builds_a_legacy_run_without_the_registry(runs, workflows) -> None:
+    svc = WorkflowRunService(runs, workflows)
+
+    run = await svc.trigger_legacy(
+        request=make_legacy_request(flow_type="legacy-provision-vm"),
+        created_by="jdoe",
+        max_retries=5,
+    )
+
+    assert run.run_type is RunType.LEGACY
+    assert run.status is RunStatus.PENDING
+    assert run.max_retries == 5
+    # The flow_type is the run's workflow identifier, so the existing run listings and the log
+    # context keep working without knowing anything about legacy requests.
+    assert run.workflow_identifier == "legacy-provision-vm"
+    st = run.run_state
+    assert st.workflow.identifier == "legacy-provision-vm"
+    assert st.workflow.engine_type is WorkflowEngineType.LEGACY
+    assert st.workflow.ticket_template_id == ""  # a legacy run opens no ticket
+    # Nothing was registered, and nothing had to be.
+    assert await workflows.list() == []
+    # The request is carried verbatim; no resource or ticket state is invented for it.
+    assert st.legacy is not None and st.legacy.flow_type == "legacy-provision-vm"
+    assert st.legacy.db_operation == "create"
+    assert st.resource is None and st.ticket is None
+    assert st.legacy_submitted is False and st.legacy_reference is None
+    # Due immediately, like any other new run.
+    assert run.scheduled_at is not None
+
+
+async def test_trigger_legacy_does_not_reject_an_unregistered_flow_type(runs, workflows) -> None:
+    # Deliberate: the legacy runner resolves its own flows, so an unknown one fails at the
+    # handover rather than being refused here.
+    svc = WorkflowRunService(runs, workflows)
+    run = await svc.trigger_legacy(
+        request=make_legacy_request(flow_type="never-heard-of-it"),
+        created_by="jdoe",
+        max_retries=0,
+    )
+    assert run.run_type is RunType.LEGACY
+    assert run.workflow_identifier == "never-heard-of-it"
+
+
+async def test_trigger_legacy_run_is_retrievable_like_any_other(runs, workflows) -> None:
+    svc = WorkflowRunService(runs, workflows)
+    created = await svc.trigger_legacy(
+        request=make_legacy_request(), created_by="jdoe", max_retries=3
+    )
+
+    fetched = await svc.get(created.run_id)
+
+    assert fetched is not None and fetched.run_id == created.run_id
+    assert [r.run_id for r in await svc.list_recent()] == [created.run_id]

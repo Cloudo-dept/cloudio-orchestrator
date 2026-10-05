@@ -7,7 +7,7 @@ Architecture, persistence, run scheduling, step state machine, and Python interf
 >
 > **Design principles this revision enforces:**
 > 1. **Simple over clever.** ~16 modules instead of ~50; run plans are a dict literal, not a Strategy class hierarchy; one `WorkflowRun` model, not entity+table+mappers; polling is authoritative and callbacks are a thin wake-early nudge over it (not a second status writer); the separate queue *and* the scheduler are cut too (workers claim straight from the run store — `scheduled_at` + `SKIP LOCKED` + lease already are a durable queue); unused port methods are deleted.
-> 2. **Generic at every seam.** Business logic depends only on five small ports (two repositories, three clients); every technology-specific class lives in `adapters/` and is bound in `bootstrap.py` alone. Swapping Airflow→another engine or ServiceNow→another ITSM is one new adapter + one wiring line.
+> 2. **Generic at every seam.** Business logic depends only on six small ports (two repositories, four clients); every technology-specific class lives in `adapters/` and is bound in `bootstrap.py` alone. Swapping Airflow→another engine or ServiceNow→another ITSM is one new adapter + one wiring line.
 > 3. **Typed end to end.** The run's working state is an explicit `RunState` Pydantic model persisted as JSONB (no magic-key dicts); engine results and failures are typed (`EngineRunStatus`, `EngineFailure`); mypy strict must pass.
 >
 > **Two structural decisions:**
@@ -24,7 +24,7 @@ Read in order, or jump to what you need:
 |---|---|---|
 | — | **[Overview](README.md)** (this page) | Stack, design principles, and the two structural decisions. |
 | 01 | [External contracts](01-external-contracts.md) | Assumptions on ServiceNow / Airflow / Project Manager that need confirming: idempotency keys, polling completion, failure model. |
-| 02 | [Architecture](02-architecture.md) | Workflow registry, the two flows, the single run-state store, the workers-claim-directly coordination model, and the system diagram. |
+| 02 | [Architecture](02-architecture.md) | Workflow registry, the two flows plus the legacy pass-through, the single run-state store, the workers-claim-directly coordination model, and the system diagram. |
 | 03 | [Code structure](03-code-structure.md) | Ports-and-adapters layout (~16 modules), directory tree, component→module map, and the uv/ruff/mypy toolchain. |
 | 04 | [Domain & config](04-domain-and-config.md) | `Settings`, enums, the typed `RunState`, the `WorkflowRun`/`Workflow` SQLModels, and the DDL. |
 | 05 | [Stores](05-stores.md) | The two Postgres repositories — the run store and the workflow registry. |

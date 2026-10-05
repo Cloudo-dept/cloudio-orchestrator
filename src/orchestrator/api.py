@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.domain import (
+    LegacyRequest,
     ResourceIdRequired,
     ResourceOperation,
     ResourceParamsRequired,
@@ -85,6 +86,44 @@ class WorkflowRunTriggerRequest(BaseModel):
     # What to do to that resource. Independent of the spec, which only describes the resource.
     operation: ResourceOperation = ResourceOperation.CREATE
     ticket: TicketRef | None = None  # the pre-existing ticket to attach to (automation only)
+
+
+class LegacyRunRequest(BaseModel):
+    """A request for the legacy automation runner, in the legacy caller's own wire shape.
+
+    This is a **separate schema on a separate route** from ``WorkflowRunTriggerRequest``, and that
+    is the whole mechanism for telling the two apart. The alternative — one endpoint sniffing the
+    body ("is ``flow_type`` present?", "is ``workflow_identifier`` missing?") — puts branching
+    logic at the one boundary where a declared contract matters most, leaves both shapes'
+    required fields unenforceable (every field has to become optional for the union to parse), and
+    produces an OpenAPI schema that documents neither. Two contracts, two doors.
+
+    The fields are the legacy runner's, passed through untranslated; see ``LegacyRequest``.
+    """
+
+    flow_type: str = Field(..., max_length=255)
+    created_by: str = Field(..., max_length=255)
+    max_retries: int = Field(3, ge=0, le=10)
+    project_id: str | None = None
+    resource_type: str | None = None
+    variables: dict[str, Any] = Field(default_factory=dict)
+    db_operation: str
+    name: str
+    region: str
+
+    def to_domain(self) -> LegacyRequest:
+        """The anti-corruption boundary: the HTTP DTO becomes the domain value object here, and the
+        orchestration fields (``created_by``, ``max_retries``) stay behind — they are the
+        orchestrator's business, not part of what the legacy runner is sent."""
+        return LegacyRequest(
+            flow_type=self.flow_type,
+            project_id=self.project_id,
+            resource_type=self.resource_type,
+            variables=self.variables,
+            db_operation=self.db_operation,
+            name=self.name,
+            region=self.region,
+        )
 
 
 class WorkflowRunResponse(BaseModel):
@@ -375,6 +414,33 @@ async def trigger_workflow_run(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="ticket is required for an automation workflow.",
         ) from None
+
+
+@app.post(
+    "/api/v1/legacy-runs", response_model=WorkflowRunResponse, status_code=status.HTTP_201_CREATED
+)
+async def trigger_legacy_run(
+    request: LegacyRunRequest,
+    svc: WorkflowRunService = Depends(get_run_service),
+) -> Any:
+    """Accept a request in the legacy automation runner's wire shape and hand it over.
+
+    Its own route, rather than a second shape on POST /api/v1/workflow-runs, so the two contracts
+    are told apart by the URL instead of by inspecting the body — see ``LegacyRunRequest``.
+
+    The run is tracked like any other (same store, same workers, observable through
+    GET /api/v1/workflow-runs/{run_id}), but the runner is fire-and-forget: **a 201 here, and a
+    later status of `completed`, mean the runner accepted the request — not that the work
+    succeeded.** Only the handover itself can fail visibly.
+
+    No 404: a legacy ``flow_type`` is not pre-registered, so an unknown flow is the runner's to
+    refuse at handover, surfacing as a FAILED run rather than an error on this response.
+    """
+    return await svc.trigger_legacy(
+        request=request.to_domain(),
+        created_by=request.created_by,
+        max_retries=request.max_retries,
+    )
 
 
 @app.get("/api/v1/workflow-runs/latest", response_model=ResourceRunSummary)

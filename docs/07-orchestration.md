@@ -90,8 +90,9 @@ from orchestrator.domain import RunType, StepName, WorkflowEngineType
 from orchestrator.orchestration.steps import (AwaitApprovalStep, ConfigureResourceStep,
                                               CloseTicketStep, CreateTicketStep,
                                               FinalizeResourceStep, RunEngineStep, StepHandler,
-                                              ValidateResourceStep)
-from orchestrator.ports import ResourceManagerClient, TicketSystemClient, WorkflowEngineClient
+                                              SubmitLegacyStep, ValidateResourceStep)
+from orchestrator.ports import (LegacyAutomationClient, ResourceManagerClient, TicketSystemClient,
+                                WorkflowEngineClient)
 
 RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
     RunType.AUTOMATION: (StepName.RUN_ENGINE, StepName.CLOSE_TICKET),
@@ -99,6 +100,9 @@ RUN_PLANS: dict[RunType, tuple[StepName, ...]] = {
                        StepName.AWAIT_APPROVAL, StepName.VALIDATE_RESOURCE,
                        StepName.RUN_ENGINE, StepName.FINALIZE_RESOURCE,
                        StepName.CLOSE_TICKET),
+    # The legacy runner owns its own ticketing and resource bookkeeping, and reports nothing back,
+    # so the handover is the whole flow. Adding a poll step later is a one-line change here.
+    RunType.LEGACY: (StepName.SUBMIT_LEGACY,),
 }
 
 
@@ -106,6 +110,7 @@ def build_handlers(
     ticket_client: TicketSystemClient,
     resource_client: ResourceManagerClient,
     engines: Mapping[WorkflowEngineType, WorkflowEngineClient],
+    legacy_client: LegacyAutomationClient,
 ) -> dict[StepName, StepHandler]:
     return {
         StepName.CREATE_TICKET: CreateTicketStep(ticket_client),
@@ -115,8 +120,12 @@ def build_handlers(
         StepName.RUN_ENGINE: RunEngineStep(engines),
         StepName.FINALIZE_RESOURCE: FinalizeResourceStep(resource_client),
         StepName.CLOSE_TICKET: CloseTicketStep(ticket_client),
+        StepName.SUBMIT_LEGACY: SubmitLegacyStep(legacy_client),
     }
 ```
+
+`RunType.LEGACY` is the clearest evidence that plans-as-data pays off: a third flow with entirely
+different mechanics is one dict entry and one handler, with no branch added anywhere else.
 
 ## `orchestration/steps.py` — the step handlers
 

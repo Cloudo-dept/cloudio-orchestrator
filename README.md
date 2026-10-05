@@ -184,7 +184,7 @@ src/orchestrator/
 ├── config.py          # Settings (pydantic-settings)
 ├── log.py             # configure_logging · LOG_CONFIG_PATH · request log context
 ├── domain.py          # enums · value objects · RunState · WorkflowRun/Workflow (SQLModel)
-├── ports.py           # the five ABCs (two repositories, three clients)
+├── ports.py           # the six ABCs (two repositories, four clients)
 ├── services.py        # WorkflowService · WorkflowRunService
 ├── orchestration/     # step handlers · run plans · RunExecutor · FailureEscalator
 ├── adapters/          # Postgres repos · ServiceNow · Airflow · Project Manager · migrations
@@ -196,7 +196,7 @@ tests/
 ├── unit/              # domain, orchestration, services, worker loop — over in-memory fakes
 ├── integration/       # HTTP adapters vs mock servers · Postgres repo · API · end-to-end
 ├── mocks/             # one FastAPI mock server per provider
-├── fakes.py           # in-memory implementations of the five ports
+├── fakes.py           # in-memory implementations of the six ports
 └── factories.py       # entity builders
 ```
 

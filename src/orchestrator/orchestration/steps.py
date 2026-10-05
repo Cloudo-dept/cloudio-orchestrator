@@ -37,6 +37,7 @@ from orchestrator.domain import (
     WorkflowRun,
 )
 from orchestrator.ports import (
+    LegacyAutomationClient,
     ResourceManagerClient,
     TicketSystemClient,
     WorkflowEngineClient,
@@ -448,6 +449,55 @@ class FinalizeResourceStep(StepHandler):
                 engine_vendor_id,
             )
         return fields
+
+
+class SubmitLegacyStep(StepHandler):
+    """Hand a legacy request to the legacy automation runner — the only step of a LEGACY run.
+
+    The runner is fire-and-forget, so this step is complete the moment the handover returns: there
+    is no run id to poll and nothing further to wait for. That makes the step synchronous (it never
+    returns False) and it makes the run's COMPLETED status mean *accepted by the runner*, not
+    *the work succeeded*. Whatever the legacy runner then does, or fails to do, is invisible here.
+
+    Retries and escalation still apply to the **handover itself**: a runner that is unreachable or
+    refuses raises, and the executor retries with backoff and then FAILs the run and opens an
+    incident, exactly as for any other provider call.
+
+    Idempotent on ``legacy_submitted``, with ``idem_key`` as the backstop. The backstop only holds
+    if the runner actually dedups on the Idempotency-Key header — a legacy system may well not. A
+    crash in the window between the handover returning and the marker being saved would then
+    re-drive into a second submission. That window is narrow and the residual risk is the same
+    shape as the one 01-external-contracts already documents for ServiceNow ordering; it is called
+    out here so it is a known limitation rather than a surprise.
+    """
+
+    def __init__(self, legacy_client: LegacyAutomationClient) -> None:
+        self.legacy_client = legacy_client
+
+    async def execute(self, run: WorkflowRun) -> bool:
+        st = run.run_state
+        if st.legacy_submitted:
+            logger.debug("Run %s: legacy request already submitted; skipping.", run.run_id)
+            return True
+        request = st.legacy
+        assert request is not None  # guaranteed by the trigger validation
+        logger.info(
+            "Run %s: handing the '%s' request for '%s' to the legacy automation runner.",
+            run.run_id,
+            request.flow_type,
+            request.name,
+        )
+        st.legacy_reference = await self.legacy_client.submit(
+            request, idempotency_key=idem_key(run, StepName.SUBMIT_LEGACY)
+        )
+        st.legacy_submitted = True
+        logger.info(
+            "Run %s: legacy runner accepted the request%s. The orchestrator learns nothing "
+            "further about its outcome.",
+            run.run_id,
+            f" as {st.legacy_reference}" if st.legacy_reference else "",
+        )
+        return True
 
 
 class CloseTicketStep(StepHandler):

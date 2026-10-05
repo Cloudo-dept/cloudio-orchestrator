@@ -39,6 +39,7 @@ from orchestrator.orchestration.steps import (
 )
 from tests.factories import make_run
 from tests.fakes import (
+    FakeLegacyAutomationClient,
     FakeResourceManagerClient,
     FakeTicketSystemClient,
     FakeWorkflowEngineClient,
@@ -54,8 +55,14 @@ def build_executor(
     settings: Settings,
     *,
     incident_team: str = "cloudio",
+    legacy: FakeLegacyAutomationClient | None = None,
 ) -> tuple[RunExecutor, dict[StepName, StepHandler]]:
-    handlers = build_handlers(tickets, resources, {WorkflowEngineType.AIRFLOW: engine})
+    handlers = build_handlers(
+        tickets,
+        resources,
+        {WorkflowEngineType.AIRFLOW: engine},
+        legacy or FakeLegacyAutomationClient(),
+    )
     escalator = FailureEscalator(tickets, resources, incident_team)
     return RunExecutor(handlers, runs, settings, escalator), handlers
 
@@ -1001,3 +1008,107 @@ async def test_a_ticket_system_outage_does_not_cost_the_resource_update(
 
     assert final.status is RunStatus.FAILED
     assert resources.deleted == [("proj-1", "vm", str(run.run_id))]
+
+
+# --- Legacy runs: one step, fire-and-forget, nothing observable after the handover ---
+
+
+def test_the_legacy_plan_is_the_handover_and_nothing_else() -> None:
+    # No ticket, no resource record, no engine poll: the legacy runner owns all of that, and the
+    # orchestrator has nothing to wait for once the request is accepted.
+    assert RUN_PLANS[RunType.LEGACY] == (StepName.SUBMIT_LEGACY,)
+    # And the handover step belongs to no other plan.
+    assert StepName.SUBMIT_LEGACY not in RUN_PLANS[RunType.AUTOMATION]
+    assert StepName.SUBMIT_LEGACY not in RUN_PLANS[RunType.RESOURCE]
+
+
+async def test_a_legacy_run_hands_the_request_over_and_completes(
+    runs, tickets, resources, engine, settings, legacy
+) -> None:
+    executor, _ = build_executor(runs, tickets, resources, engine, settings, legacy=legacy)
+    run = await runs.create(make_run(run_type=RunType.LEGACY))
+
+    final = await drive(runs, executor, run.run_id)
+
+    assert final.status is RunStatus.COMPLETED
+    assert final.current_step is None
+    # Handed over exactly once, under the (run, step) key.
+    assert len(legacy.submitted) == 1
+    request, key = legacy.submitted[0]
+    assert key == idem_key(run, StepName.SUBMIT_LEGACY)
+    # The legacy fields reach the runner untranslated — that is the point of the pass-through.
+    assert request.flow_type == "legacy-provision-vm"
+    assert request.db_operation == "create"
+    assert request.variables == {"size": "large"}
+    assert final.run_state.legacy_submitted is True
+    assert final.run_state.legacy_reference == "legacy-ref-1"
+    # Nothing else was touched: no ticket opened or closed, no resource record written.
+    assert tickets.open_ticket_calls == [] and tickets.closed == []
+    assert resources.create_calls == [] and resources.updated == []
+    assert engine.trigger_calls == []
+
+
+async def test_a_re_driven_legacy_run_does_not_hand_the_request_over_twice(
+    runs, tickets, resources, engine, settings, legacy
+) -> None:
+    executor, _ = build_executor(runs, tickets, resources, engine, settings, legacy=legacy)
+    run = await runs.create(make_run(run_type=RunType.LEGACY))
+    await drive(runs, executor, run.run_id)
+
+    # A stale re-delivery of a terminal run is ignored outright, and the legacy_submitted marker
+    # guards the step itself even if it were not.
+    await executor.handle(run.run_id)
+
+    assert len(legacy.submitted) == 1
+
+
+async def test_a_legacy_run_whose_reference_is_absent_still_completes(
+    runs, tickets, resources, engine, settings, legacy
+) -> None:
+    # The runner's acknowledgement shape is its own; losing the reference is not a failure.
+    legacy.reference = None
+    executor, _ = build_executor(runs, tickets, resources, engine, settings, legacy=legacy)
+    run = await runs.create(make_run(run_type=RunType.LEGACY))
+
+    final = await drive(runs, executor, run.run_id)
+
+    assert final.status is RunStatus.COMPLETED
+    assert final.run_state.legacy_submitted is True
+    assert final.run_state.legacy_reference is None
+
+
+async def test_a_failed_handover_is_retried_then_fails_the_run(
+    runs, tickets, resources, engine, settings, legacy
+) -> None:
+    # The handover is the one thing about a legacy run that CAN fail visibly, and it gets the
+    # ordinary transient treatment: retried to the budget, then FAILED with an incident.
+    legacy.error = RuntimeError("legacy runner unreachable")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings, legacy=legacy)
+    run = await runs.create(make_run(run_type=RunType.LEGACY, max_retries=2))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert len(legacy.submitted) == 3  # the first attempt plus two retries
+    assert "legacy runner unreachable" in final.run_state.errors[StepName.SUBMIT_LEGACY]
+    assert final.run_state.legacy_submitted is False
+    # Escalated like any unclassified failure: an incident to the default team. There is no ticket
+    # to annotate or close — a legacy run never opens one.
+    assert len(tickets.incidents) == 1
+    assert tickets.incidents[0]["responsible_group"] == "cloudio"
+    assert tickets.incidents[0]["flow_type"] == "provision-vm"
+    assert tickets.closed == [] and tickets.notes == []
+
+
+async def test_a_failed_legacy_handover_releases_no_resource(
+    runs, tickets, resources, engine, settings, legacy
+) -> None:
+    # A legacy run holds no resource record, so there is nothing for the escalator to release.
+    legacy.error = RuntimeError("boom")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings, legacy=legacy)
+    run = await runs.create(make_run(run_type=RunType.LEGACY, max_retries=0))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
+    assert resources.updated == [] and resources.deleted == []

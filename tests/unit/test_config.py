@@ -14,6 +14,7 @@ REQUIRED_ENV = {
     "ORCH_SERVICENOW_PASSWORD": "sn-secret",
     "ORCH_PM_BASE_URL": "https://pm.example",
     "ORCH_PM_TOKEN": "pm-token",
+    "ORCH_LEGACY_RUNNER_BASE_URL": "https://legacy.example",
 }
 
 
@@ -37,6 +38,10 @@ def test_settings_load_from_env_with_defaults(env: None) -> None:
     assert settings.servicenow_responsible_groups == {}
     assert settings.servicenow_group_lookup_field == "name"
     assert settings.servicenow_user_lookup_field == "user_param"
+    # The legacy runner's submit path is configuration with a default; its token is optional, and
+    # an empty one means bootstrap sends no Authorization header at all.
+    assert settings.legacy_runner_submit_path == "/api/v1/requests"
+    assert settings.legacy_runner_token.get_secret_value() == ""
 
 
 def test_lookup_fields_read_from_env(env: None, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -29,6 +29,9 @@ def utcnow() -> datetime:
 class RunType(str, Enum):
     AUTOMATION = "automation"
     RESOURCE = "resource"
+    # A request in the legacy automation runner's own wire shape, handed straight over to it. The
+    # orchestrator tracks the handover and nothing else — see ``LegacyRequest`` and RUN_PLANS.
+    LEGACY = "legacy"
 
 
 class RunStatus(str, Enum):
@@ -41,6 +44,12 @@ class RunStatus(str, Enum):
 
 class WorkflowEngineType(str, Enum):
     AIRFLOW = "airflow"  # first engine; extend here (e.g. TEMPORAL = "temporal")
+    # The retiring automation runner. Unlike AIRFLOW it has NO entry in the engines mapping and no
+    # WorkflowEngineClient: it cannot be polled, so three of that port's four methods would be
+    # fiction (see LegacyAutomationClient). It is named here so a legacy run's ResolvedWorkflow can
+    # say truthfully what will run it; the LEGACY plan has no RUN_ENGINE step, so nothing ever
+    # looks this value up in the mapping.
+    LEGACY = "legacy"
 
 
 class StepName(str, Enum):
@@ -54,6 +63,8 @@ class StepName(str, Enum):
     RUN_ENGINE = "running_engine"
     FINALIZE_RESOURCE = "finalizing_resource"  # mark the resource operation done
     CLOSE_TICKET = "closing_ticket"  # close out the RITM
+    # Hand a legacy request over to the legacy automation runner. The only step of a LEGACY run.
+    SUBMIT_LEGACY = "submitting_legacy"
 
 
 class ResourceOperation(str, Enum):
@@ -217,6 +228,37 @@ class ResourceSpec(BaseModel):
     alert_groups: list[str] = PyField(default_factory=list)
 
 
+class LegacyRequest(BaseModel):
+    """A request for the legacy automation runner, in that runner's own field names.
+
+    This is the one model in the domain deliberately shaped like a single external system, and it
+    is an exception taken with its eyes open. The usual rule — provider vocabulary stops at the
+    adapter — exists so that business logic does not grow a second provider's idea of the world.
+    Nothing here is business logic: the orchestrator does not read, branch on, or interpret any of
+    these fields. It accepts the request, records it, and hands it over verbatim. Translating it
+    into ``ResourceSpec`` + ``ResourceOperation`` and back again in the adapter would be round-trip
+    work that buys no decision, and would quietly claim the two vocabularies mean the same thing.
+
+    It is also temporary by construction: when the legacy runner is switched off, this model,
+    ``RunType.LEGACY``, ``WorkflowEngineType.LEGACY``, ``StepName.SUBMIT_LEGACY`` and the port all
+    go with it, and nothing else has to be unpicked.
+
+    ``db_operation`` is typed ``str`` rather than ``ResourceOperation`` on purpose: a LEGACY run
+    never branches on it, so constraining it here would only let the orchestrator reject a value
+    the legacy runner itself accepts.
+    """
+
+    flow_type: str  # which legacy flow to run; the runner resolves it, the orchestrator does not
+    project_id: str | None = None
+    resource_type: str | None = None
+    # Free-form pass-through to the legacy runner (the documented exception to "no untyped dicts"):
+    # these are the legacy flow's own parameters and the orchestrator never looks inside.
+    variables: dict[str, Any] = PyField(default_factory=dict)
+    db_operation: str
+    name: str
+    region: str
+
+
 class ResourceValidationRequest(BaseModel):
     """The question put to the resource manager before a run provisions anything: may this request
     go ahead? It answers on its own terms — whether the project's virtualization wallet still has
@@ -288,6 +330,7 @@ class RunState(BaseModel):
     # What this run does to that resource. Independent of the spec (which only describes the
     # resource) and meaningless for an automation run, which touches no resource at all.
     operation: ResourceOperation = ResourceOperation.CREATE
+    legacy: LegacyRequest | None = None  # legacy runs only: the request to hand over, verbatim
 
     # step progress / idempotency markers
     ticket: TicketRef | None = None
@@ -295,6 +338,11 @@ class RunState(BaseModel):
     resource_configured: bool = False
     resource_finalized: bool = False
     ticket_closed: bool = False
+    legacy_submitted: bool = False
+    # Whatever reference the legacy runner handed back when it accepted the request, if any. Not an
+    # idempotency marker (``legacy_submitted`` is) and never polled — the runner reports nothing
+    # further. Kept only so an operator chasing a request has the runner's own id for it.
+    legacy_reference: str | None = None
 
     # retry / deadline bookkeeping (keyed by StepName)
     step_attempts: dict[StepName, int] = PyField(default_factory=dict)

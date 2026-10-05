@@ -12,6 +12,7 @@ from orchestrator.orchestration.plans import build_handlers
 from orchestrator.worker import OrchestratorWorker, RunWorker
 from tests.factories import make_run
 from tests.fakes import (
+    FakeLegacyAutomationClient,
     FakeResourceManagerClient,
     FakeTicketSystemClient,
     FakeWorkflowEngineClient,
@@ -106,7 +107,9 @@ async def test_worker_drives_a_real_run_to_completion(
     engine: FakeWorkflowEngineClient,
     settings: Settings,
 ) -> None:
-    handlers = build_handlers(tickets, resources, {WorkflowEngineType.AIRFLOW: engine})
+    handlers = build_handlers(
+        tickets, resources, {WorkflowEngineType.AIRFLOW: engine}, FakeLegacyAutomationClient()
+    )
     handlers[StepName.RUN_ENGINE].poll_interval_seconds = 0  # re-drive immediately
     escalator = FailureEscalator(tickets, resources, "cloudio")
     executor = RunExecutor(handlers, runs, settings, escalator)

@@ -12,6 +12,7 @@ from orchestrator.domain import (
     ApprovalStatus,
     EngineFailure,
     EngineRunStatus,
+    LegacyRequest,
     ResourceNotFoundError,
     ResourceValidationRequest,
     ResourceValidationResult,
@@ -26,6 +27,7 @@ from orchestrator.domain import (
 )
 from orchestrator.ports import (
     HealthCheck,
+    LegacyAutomationClient,
     ResourceManagerClient,
     TicketSystemClient,
     WorkflowEngineClient,
@@ -294,6 +296,28 @@ class FakeResourceManagerClient(ResourceManagerClient):
 
     async def delete_resource(self, project_id: str, resource_type: str, vendor_id: str) -> None:
         self.deleted.append((project_id, resource_type, vendor_id))
+
+
+class FakeLegacyAutomationClient(LegacyAutomationClient):
+    """Fire-and-forget: records what was handed over, answers with a reference, reports nothing
+    afterwards. Set ``error`` to make the handover itself fail (the only failure mode a legacy run
+    has)."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple[LegacyRequest, str]] = []  # (request, idempotency_key), in order
+        self.references_by_key: dict[str, str] = {}
+        self.reference: str | None = "legacy-ref-1"  # None → the runner acknowledged with nothing
+        self.error: Exception | None = None
+
+    async def submit(self, request: LegacyRequest, idempotency_key: str) -> str | None:
+        self.submitted.append((request.model_copy(deep=True), idempotency_key))
+        if self.error is not None:
+            raise self.error
+        if idempotency_key in self.references_by_key:  # idempotent on the key
+            return self.references_by_key[idempotency_key]
+        if self.reference is not None:
+            self.references_by_key[idempotency_key] = self.reference
+        return self.reference
 
 
 class FakeWorkflowEngineClient(WorkflowEngineClient):

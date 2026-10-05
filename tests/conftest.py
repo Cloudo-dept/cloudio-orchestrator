@@ -4,6 +4,7 @@ import pytest
 
 from orchestrator.config import Settings
 from tests.fakes import (
+    FakeLegacyAutomationClient,
     FakeResourceManagerClient,
     FakeTicketSystemClient,
     FakeWorkflowEngineClient,
@@ -35,6 +36,11 @@ def resources() -> FakeResourceManagerClient:
 @pytest.fixture
 def engine() -> FakeWorkflowEngineClient:
     return FakeWorkflowEngineClient()
+
+
+@pytest.fixture
+def legacy() -> FakeLegacyAutomationClient:
+    return FakeLegacyAutomationClient()
 
 
 @pytest.fixture

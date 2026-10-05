@@ -461,3 +461,77 @@ async def test_latest_batch_route_is_not_shadowed_by_the_run_id_route(
     await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1)
     resp = await client.get("/api/v1/workflow-runs/latest-batch", params={"resource_id": "rec-1"})
     assert resp.status_code == 200
+
+
+# --- Legacy runs: a separate route is how the two payload shapes are told apart ---
+
+LEGACY_BODY = {
+    "flow_type": "legacy-provision-vm",
+    "created_by": "jdoe",
+    "project_id": "proj-1",
+    "resource_type": "vm",
+    "variables": {"size": "large"},
+    "db_operation": "create",
+    "name": "app-01",
+    "region": "gvt",
+}
+
+
+async def test_legacy_run_is_created_from_the_legacy_payload(client: httpx.AsyncClient) -> None:
+    resp = await client.post("/api/v1/legacy-runs", json=LEGACY_BODY)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["run_type"] == "legacy"
+    assert body["status"] == "pending"
+    assert body["created_by"] == "jdoe"
+    state = body["run_state"]
+    assert state["legacy"]["flow_type"] == "legacy-provision-vm"
+    assert state["legacy"]["db_operation"] == "create"
+    assert state["legacy"]["variables"] == {"size": "large"}
+    assert state["workflow"]["engine_type"] == "legacy"
+    # The orchestration fields stay behind: they are not part of what the runner is sent.
+    assert "created_by" not in state["legacy"]
+    assert "max_retries" not in state["legacy"]
+    # No ticket, no resource, nothing handed over yet.
+    assert state["ticket"] is None and state["resource"] is None
+    assert state["legacy_submitted"] is False
+
+
+async def test_legacy_run_needs_no_registered_workflow(client: httpx.AsyncClient) -> None:
+    # Unlike POST /api/v1/workflow-runs, nothing is registered first and there is no 404 path.
+    resp = await client.post(
+        "/api/v1/legacy-runs", json={**LEGACY_BODY, "flow_type": "never-registered"}
+    )
+    assert resp.status_code == 201
+    assert (await client.get("/api/v1/workflows")).json() == []
+
+
+@pytest.mark.parametrize("missing", ["flow_type", "created_by", "db_operation", "name", "region"])
+async def test_legacy_run_rejects_a_payload_missing_a_required_field(
+    client: httpx.AsyncClient, missing: str
+) -> None:
+    body = {k: v for k, v in LEGACY_BODY.items() if k != missing}
+    resp = await client.post("/api/v1/legacy-runs", json=body)
+    assert resp.status_code == 422
+
+
+async def test_legacy_optional_fields_may_be_omitted(client: httpx.AsyncClient) -> None:
+    body = {k: v for k, v in LEGACY_BODY.items() if k not in ("project_id", "resource_type")}
+    resp = await client.post("/api/v1/legacy-runs", json=body)
+    assert resp.status_code == 201
+    legacy = resp.json()["run_state"]["legacy"]
+    assert legacy["project_id"] is None and legacy["resource_type"] is None
+
+
+async def test_the_two_payload_shapes_are_told_apart_by_route_not_by_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """The reason there are two endpoints: each enforces its own required fields, so neither
+    payload is accepted at the other's door. One endpoint sniffing the body could not do this —
+    every field would have to be optional for a union to parse."""
+    # A legacy payload posted to the native trigger is missing workflow_identifier.
+    assert (await client.post("/api/v1/workflow-runs", json=LEGACY_BODY)).status_code == 422
+    # And a native trigger payload posted to the legacy route is missing flow_type/db_operation.
+    native = {"workflow_identifier": "provision-vm", "created_by": "jdoe", "ticket_params": {}}
+    assert (await client.post("/api/v1/legacy-runs", json=native)).status_code == 422

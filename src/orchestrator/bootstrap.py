@@ -12,6 +12,7 @@ from orchestrator.adapters.database import (
     PostgresWorkflowRunRepository,
     make_session_factory,
 )
+from orchestrator.adapters.legacy_automation import HttpLegacyAutomationClient
 from orchestrator.adapters.logging_transport import FailureLoggingTransport
 from orchestrator.adapters.project_manager import ProjectManagerResourceClient
 from orchestrator.adapters.servicenow import ServiceNowTicketClient
@@ -117,6 +118,18 @@ async def build(settings: Settings) -> Container:
             httpx.AsyncHTTPTransport(verify=False, limits=limits),  # noqa: S501 — per spec
         ),
     )
+    legacy_token = settings.legacy_runner_token.get_secret_value()
+    legacy_http = _provider_client(
+        settings.legacy_runner_base_url,
+        settings,
+        FailureLoggingTransport(
+            "Legacy automation runner",
+            httpx.AsyncHTTPTransport(verify=False, limits=limits),  # noqa: S501 — private cloud
+        ),
+        # Omitted entirely when unset: an `Authorization: Bearer ` with nothing after it is a
+        # malformed header, which some servers reject outright rather than treating as absent.
+        headers={"Authorization": f"Bearer {legacy_token}"} if legacy_token else None,
+    )
 
     ticket_client = ServiceNowTicketClient(
         servicenow_http,
@@ -134,12 +147,17 @@ async def build(settings: Settings) -> Container:
         ),
     }
 
+    # Not in `engines`: the legacy runner cannot be polled, so it implements its own one-method
+    # port rather than WorkflowEngineClient. See LegacyAutomationClient.
+    legacy_client = HttpLegacyAutomationClient(legacy_http, settings.legacy_runner_submit_path)
+
     logger.debug(
-        "Adapters bound: ServiceNow ticket system, Project Manager resource client, engines=%s.",
+        "Adapters bound: ServiceNow ticket system, Project Manager resource client, engines=%s, "
+        "legacy automation runner.",
         [e.value for e in engines],
     )
 
-    handlers = build_handlers(ticket_client, resource_client, engines)
+    handlers = build_handlers(ticket_client, resource_client, engines, legacy_client)
     escalator = FailureEscalator(ticket_client, resource_client, settings.servicenow_incident_team)
     executor = RunExecutor(handlers, runs, settings, escalator)  # sets scheduled_at
     worker = OrchestratorWorker(
@@ -165,5 +183,5 @@ async def build(settings: Settings) -> Container:
         callback_service=RunCallbackService(runs),
         worker=worker,
         health_check=PostgresHealthCheck(session_factory),
-        http_clients=[servicenow_http, pm_http, airflow_http],
+        http_clients=[servicenow_http, pm_http, airflow_http, legacy_http],
     )
