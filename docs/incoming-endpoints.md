@@ -150,8 +150,11 @@ the orchestrator resolves the registration to decide run type and build the run 
   validating_resource → running_engine → finalizing_resource → closing_ticket` (an automation run:
   `running_engine → closing_ticket`). From `configuring_resource` on — that is, *before* anyone
   approves it — the Project Manager record carries the request's `state`
-  (`PROVISIONING`/`UPDATING`/`DELETING` → `READY`, or `FAILED`), so the portal can show the request
+  (`PROVISIONING`/`UPDATING`/`DELETING` → `READY`), so the portal can show the request
   straight away; the detail behind that state comes from `GET /api/v1/workflow-runs/latest` below.
+  A run that ends badly releases its record rather than leaving a failed state on it — a `create`'s
+  record is deleted, an `update`/`delete`'s goes back to `READY` — so a failure is only ever read
+  off the run, not the record.
   See [07-orchestration](07-orchestration.md#the-resource-records-lifecycle-state).
 
 - **Response `201` — `WorkflowRunResponse`:** `run_id` (UUID), `run_type`, `status` (`RunStatus`),
@@ -275,4 +278,4 @@ error. **Auth: network-trust** (no HMAC/token). See [01-external-contracts](01-e
   `awaiting_approval`, `validating_resource`, `running_engine`, `finalizing_resource`,
   `closing_ticket`.
 - **`ResourceState`** (written to the Project Manager record's `state`, not returned by this API):
-  `PROVISIONING`, `UPDATING`, `DELETING`, `READY`, `FAILED`, `DELETED`.
+  `PROVISIONING`, `UPDATING`, `DELETING`, `READY`, `DELETED`.

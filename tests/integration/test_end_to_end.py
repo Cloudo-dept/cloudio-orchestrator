@@ -217,11 +217,12 @@ async def test_resource_run_refused_by_validation_never_reaches_the_engine(
     assert not any("dagRuns" in p for _, p in airflow.requests)  # nothing was provisioned
     assert not servicenow.incidents  # a precheck refusal pages nobody
     assert servicenow.ritms[-1].state == 4  # RITM closed unsuccessful
-    # Nothing is rolled back; the record the request was put on says so.
-    assert project_manager.resources[f"proj-1/vm/{run.run_id}"]["state"] == "FAILED"
+    # The placeholder record the request was put on is gone: nothing was provisioned behind it.
+    assert project_manager.deletes == [f"proj-1/vm/{run.run_id}"]
+    assert project_manager.resources == {}
 
 
-async def test_failed_resource_run_marks_the_resource_failed(
+async def test_failed_resource_run_deletes_the_placeholder_record(
     pg_session_factory: async_sessionmaker,
     servicenow: ServiceNowMock,
     airflow: AirflowMock,
@@ -249,15 +250,18 @@ async def test_failed_resource_run_marks_the_resource_failed(
         if current is not None and current.run_state.engine_run_id is not None:
             break
     dag_run_id = (await runs.get(run.run_id)).run_state.engine_run_id
+    resource_id = project_manager.resources[f"proj-1/vm/{run.run_id}"]["project_resource_id"]
     airflow.fail(dag_run_id, task="provision_vm", responsible_group="netops", message="quota")
 
     final = await _drive(runs, executor, run.run_id)
 
     assert final is not None and final.status is RunStatus.FAILED
-    # Nothing is rolled back: the record stays, marked FAILED and no longer in progress.
-    record = project_manager.resources[f"proj-1/vm/{run.run_id}"]
-    assert record["state"] == "FAILED" and record["in_progress"] is False
-    latest = await runs.find_last_by_resource_id(record["project_resource_id"])
+    # The record the request was put on is deleted rather than left in a dead-end state.
+    assert project_manager.deletes == [f"proj-1/vm/{run.run_id}"]
+    assert project_manager.resources == {}
+    # The run still carries the record id, so the failure is still traceable from the portal's
+    # side of the lookup even though the record itself is gone.
+    latest = await runs.find_last_by_resource_id(resource_id)
     assert latest is not None and latest.run_id == run.run_id
 
 

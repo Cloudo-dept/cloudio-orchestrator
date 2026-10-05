@@ -70,10 +70,10 @@ class FailureEscalator:
     the older behaviour: an Incident to the default team and a work note, ticket left open. Those
     failures move onto the policy table by raising StepFailure with a kind; nothing else changes.
 
-    Either way, a resource the run left in flight is then marked FAILED, so it stops advertising a
-    run that is over. A **rejected** run (``reject``) escalates nothing — the ticket already carries
-    the rejection — but releases its resource too. The ticket side and the resource side are
-    guarded separately: one provider being down never costs the other its update.
+    Either way, a resource the run left in flight is then released, so no record keeps advertising
+    a run that is over. A **rejected** run (``reject``) escalates nothing — the ticket already
+    carries the rejection — but releases its resource the same way. The ticket side and the
+    resource side are guarded separately: one provider being down never costs the other its update.
     """
 
     def __init__(
@@ -94,20 +94,36 @@ class FailureEscalator:
                 await self._escalate_unclassified(run, error)
         except Exception as e:  # never let escalation crash the worker
             logger.exception("Failed to escalate run %s failure: %s", run.run_id, e)
-        await self._mark_resource_failed(run)
+        await self._release_resource(run)
 
     async def reject(self, run: WorkflowRun) -> None:
-        """Release the resource a rejected request was put on. A CREATE's placeholder record is
-        deleted — the resource was never provisioned; an UPDATE/DELETE leaves its resource READY,
-        exactly as it was. Never raises."""
+        """A rejected request escalates nothing — the ticket already carries the rejection — but
+        releases the resource it was put on, exactly as a failure does. Never raises."""
+        await self._release_resource(run)
+
+    async def _release_resource(self, run: WorkflowRun) -> None:
+        """Let go of the resource a run that ended badly left in flight, so no record keeps
+        advertising a run that is over. The outcome does not depend on *why* the run ended — a
+        failure and a rejection leave the same thing behind — only on what was being done:
+
+        * a CREATE's record is **deleted**. It was only ever a placeholder for the request, and a
+          record kept around in a dead-end state is one someone has to clear by hand before the
+          name is free to request again. Whatever the engine half-did is not rolled back and the
+          Incident is what records it; the record is not a memorial for it.
+        * an UPDATE/DELETE's record goes back to **READY**. The resource behind it still exists, so
+          deleting the record would lose a live resource. Nothing is advertised that did not
+          happen either: the change itself is only written on finalize, which a run that ends
+          badly never reaches.
+        """
         resource = self._resource_in_flight(run)
         if resource is None:
             return
         try:
             if run.run_state.operation is ResourceOperation.CREATE:
                 logger.info(
-                    "Run %s rejected: deleting placeholder resource %s.",
+                    "Run %s ended %s: deleting placeholder resource %s.",
                     run.run_id,
+                    run.status.value,
                     resource.vendor_id,
                 )
                 await self.resources.delete_resource(
@@ -115,7 +131,10 @@ class FailureEscalator:
                 )
             else:
                 logger.info(
-                    "Run %s rejected: resource %s back to READY.", run.run_id, resource.vendor_id
+                    "Run %s ended %s: resource %s back to READY.",
+                    run.run_id,
+                    run.status.value,
+                    resource.vendor_id,
                 )
                 await self.resources.update_resource(
                     resource.project_id,
@@ -123,23 +142,8 @@ class FailureEscalator:
                     resource.vendor_id,
                     resource_state_fields(run, ResourceState.READY),
                 )
-        except Exception as e:  # never let escalation crash the worker
-            logger.exception("Failed to release resource for rejected run %s: %s", run.run_id, e)
-
-    async def _mark_resource_failed(self, run: WorkflowRun) -> None:
-        resource = self._resource_in_flight(run)
-        if resource is None:
-            return
-        try:
-            await self.resources.update_resource(
-                resource.project_id,
-                resource.resource_type,
-                resource.vendor_id,
-                resource_state_fields(run, ResourceState.FAILED),
-            )
-            logger.info("Marked resource %s FAILED for run %s.", resource.vendor_id, run.run_id)
-        except Exception as e:  # never let escalation crash the worker
-            logger.exception("Failed to mark resource FAILED for run %s: %s", run.run_id, e)
+        except Exception as e:  # a PM outage must not undo the ticket-side escalation
+            logger.exception("Failed to release the resource of run %s: %s", run.run_id, e)
 
     @staticmethod
     def _resource_in_flight(run: WorkflowRun) -> ResourceSpec | None:

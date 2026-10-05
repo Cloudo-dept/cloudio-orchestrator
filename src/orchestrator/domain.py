@@ -73,6 +73,11 @@ class ResourceState(str, Enum):
     the resource steps as a run moves forward, and by the escalator when a run ends badly — so a
     record never keeps advertising a run that is over.
 
+    There is no failed state: a run that ends badly releases its resource rather than leaving the
+    record in a dead end nobody can clear — a CREATE's placeholder record is deleted, and an
+    UPDATE/DELETE's record goes back to READY, which is the truth about a resource that still
+    exists. What went wrong lives on the run and its Incident, not on the record.
+
     The values are the literal strings the resource record carries."""
 
     # A run is working on it, from the moment it was requested. Whether that run is still waiting
@@ -81,7 +86,6 @@ class ResourceState(str, Enum):
     UPDATING = "UPDATING"  # an UPDATE is under way
     DELETING = "DELETING"  # a DELETE is under way
     READY = "READY"  # no run is working on it
-    FAILED = "FAILED"  # the last run on it failed (nothing is rolled back)
     DELETED = "DELETED"  # a DELETE finished; the provider removes or retires the record
 
 

@@ -618,9 +618,9 @@ async def test_resource_run_reaches_completed(pg_session_factory, servicenow, ai
 
 Swap in `airflow.fail(...)` before the loop (and let retries exhaust) to assert the **failure**
 path: run ends `FAILED`, one `Incident` lands in `servicenow.incidents` routed to the responsible
-group, a work note is on the RITM, and the last PATCH marks the resource `state="FAILED"`,
-`in_progress=False` — nothing rolled back. A rejected RITM instead ends the run `REJECTED`, with no
-Incident, and a CREATE's record gone from `project_manager.resources`.
+group, a work note is on the RITM, and the CREATE's record is gone from `project_manager.resources`
+(an `update`/`delete`'s would be PATCHed back to `READY`) — released, not rolled back. A rejected
+RITM ends the run `REJECTED` with no Incident, and releases the record exactly the same way.
 
 ## Verifying against the real Project Manager
 

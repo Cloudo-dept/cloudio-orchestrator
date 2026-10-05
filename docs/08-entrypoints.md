@@ -380,7 +380,7 @@ async def build(settings: Settings) -> Container:
     }
 
     handlers = build_handlers(ticket_client, resource_client, engines)
-    escalator = FailureEscalator(ticket_client, resource_client,   # marks FAILED / releases on reject
+    escalator = FailureEscalator(ticket_client, resource_client,   # escalates / releases the resource
                                  settings.servicenow_incident_team)
     executor = RunExecutor(handlers, runs, settings, escalator)   # sets scheduled_at for polls/retries
     worker = OrchestratorWorker(runs, executor,

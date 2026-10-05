@@ -610,13 +610,9 @@ async def test_resource_run_refused_by_validation_fails_without_an_incident(
             TicketOutcome.UNSUCCESSFUL,
         )
     ]
-    # Nothing is rolled back; the record the request was put on says so.
-    assert resources.updated[-1] == (
-        "proj-1",
-        "vm",
-        str(run.run_id),
-        state_fields("FAILED", in_progress=False),
-    )
+    # The record the request was put on is gone — nothing was provisioned behind it, and the name
+    # is free to request again.
+    assert resources.deleted == [("proj-1", "vm", str(run.run_id))]
 
 
 async def test_validation_sits_between_the_approval_gate_and_the_engine() -> None:
@@ -886,14 +882,10 @@ async def test_finalize_falls_back_to_original_vendor_id(
 
 
 class ResourceManagerDownOnFailure(FakeResourceManagerClient):
-    """The resource manager is unreachable by the time a failed run's resource is marked."""
+    """The resource manager is unreachable by the time a failed run releases its resource."""
 
-    async def update_resource(
-        self, project_id: str, resource_type: str, vendor_id: str, fields: dict[str, Any]
-    ) -> None:
-        if fields.get("state") == "FAILED":
-            raise RuntimeError("Project Manager unavailable")
-        await super().update_resource(project_id, resource_type, vendor_id, fields)
+    async def delete_resource(self, project_id: str, resource_type: str, vendor_id: str) -> None:
+        raise RuntimeError("Project Manager unavailable")
 
 
 class IncidentsDownTicketClient(FakeTicketSystemClient):
@@ -924,7 +916,7 @@ class CloseTicketDownClient(FakeTicketSystemClient):
         raise RuntimeError("ServiceNow unavailable")
 
 
-async def test_failed_resource_run_marks_the_resource_failed(
+async def test_failed_create_deletes_the_placeholder_resource(
     runs, tickets, resources, settings
 ) -> None:
     engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
@@ -935,14 +927,31 @@ async def test_failed_resource_run_marks_the_resource_failed(
 
     assert final.status is RunStatus.FAILED
     assert len(tickets.incidents) == 1
-    # Nothing is rolled back: the record stays, marked FAILED and no longer in progress.
-    assert resources.updated[-1] == (
-        "proj-1",
-        "vm",
-        str(run.run_id),
-        state_fields("FAILED", in_progress=False),
+    # The record was only ever a placeholder for the request, so it goes rather than sitting in a
+    # dead end someone has to clear by hand. The Incident is what records the failure.
+    assert resources.deleted == [("proj-1", "vm", str(run.run_id))]
+    # Nothing is rolled back either: the record never advertised a change the engine did not make,
+    # so there is nothing to undo — PROVISIONING was the last state it was given.
+    assert resources.updated == []
+
+
+async def test_failed_update_leaves_the_resource_ready(runs, tickets, resources, settings) -> None:
+    # The resource behind the record still exists, so the record stays and goes back to READY —
+    # deleting it would lose a live resource over a change that failed.
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(
+        make_run(run_type=RunType.RESOURCE, operation=ResourceOperation.UPDATE, max_retries=0)
     )
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.FAILED
     assert resources.deleted == []
+    assert resources.updated == [
+        ("proj-1", "vm", "vm-1", state_fields("UPDATING", in_progress=True)),
+        ("proj-1", "vm", "vm-1", state_fields("READY", in_progress=False)),
+    ]
 
 
 async def test_a_failure_after_finalize_leaves_the_resource_ready(
@@ -991,4 +1000,4 @@ async def test_a_ticket_system_outage_does_not_cost_the_resource_update(
     final = await drive(runs, executor, run.run_id, iters=20)
 
     assert final.status is RunStatus.FAILED
-    assert resources.updated[-1][3] == state_fields("FAILED", in_progress=False)
+    assert resources.deleted == [("proj-1", "vm", str(run.run_id))]

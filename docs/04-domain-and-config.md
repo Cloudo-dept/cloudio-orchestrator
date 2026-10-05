@@ -200,12 +200,15 @@ class ResourceState(str, Enum):
     record sees where the request is (see 07-orchestration for the transitions). The values are
     the literal strings on the record. Always written together with `in_progress` — true exactly
     for the three in-flight states. Whether the run behind an in-flight state is still waiting for
-    approval is the run's business (its current_step), not the record's."""
+    approval is the run's business (its current_step), not the record's.
+
+    There is no failed state: a run that ends badly releases its resource instead — a CREATE's
+    placeholder record is deleted, an UPDATE/DELETE's goes back to READY. What went wrong lives on
+    the run and its Incident, not on the record."""
     PROVISIONING = "PROVISIONING"           # a CREATE is under way
     UPDATING = "UPDATING"                   # an UPDATE is under way
     DELETING = "DELETING"                   # a DELETE is under way
-    READY = "READY"                         # finalized — or an UPDATE/DELETE was rejected
-    FAILED = "FAILED"                       # the run failed; nothing rolled back
+    READY = "READY"                         # finalized — or an UPDATE/DELETE run ended badly
     DELETED = "DELETED"                     # a DELETE finalized (the record is then removed)
 
 

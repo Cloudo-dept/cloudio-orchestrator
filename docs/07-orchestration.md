@@ -22,8 +22,8 @@ independent steps: `FinalizeResourceStep` applies the outcome to the record once
 the record's new state, while a `delete` marks it `DELETED` and then removes it — and the shared
 `CloseTicketStep` closes the RITM. The *requested change* lands at finalize, not at configure, so a
 failed run never leaves Project Manager advertising a change (or a deletion) the engine did not
-make. A failed run's record is marked `FAILED` instead — a status, not a rollback; there is still
-no compensation:
+make. A failed run's record is *released* instead — a `create`'s deleted, an `update`/`delete`'s
+back to `READY` — which is a release, not a rollback; there is still no compensation:
 
 - **automation**: `running_engine → closing_ticket` — attaches to the caller's pre-existing RITM
   (supplied at trigger time), so there is no `creating_ticket` step; it never touches Project
@@ -70,13 +70,16 @@ records share (one per region/environment) while a run targets exactly one — w
 | `configuring_resource` (after the ticket, before approval) | POST a new record (vendor id = run id) → `PROVISIONING` | PATCH `UPDATING` | PATCH `DELETING` |
 | `finalizing_resource` | PATCH `READY` (+ re-key to the engine's `final_vendor_id`, if reported) | PATCH `READY` + the whole spec + `last_modified_by` | PATCH `DELETED`, then DELETE the record |
 | run `REJECTED` (at `awaiting_approval`) | DELETE the record | PATCH `READY` | PATCH `READY` |
-| run `FAILED` | PATCH `FAILED` | PATCH `FAILED` | PATCH `FAILED` |
+| run `FAILED` | DELETE the record | PATCH `READY` | PATCH `READY` |
 
 The last two rows are the [escalator's](#orchestrationescalatorpy--the-failure-model) job, not a
-step's. A rejection stores no "rejected" state: a rejected `create` never had a resource behind its
-record, and a rejected `update`/`delete` leaves the resource exactly as it was, so `READY` is
-the truth. Neither row fires for a record that is already finalized — a run that fails in
-`closing_ticket` leaves its resource `READY`.
+step's — and they are the *same* row: a record is released by what was being done to it, not by why
+the run ended. There is no "rejected" or "failed" state. A `create`'s record is only ever a
+placeholder for the request, so it goes rather than sitting in a dead end someone has to clear by
+hand before the name can be requested again; an `update`/`delete`'s record is for a resource that
+still exists, so deleting it would lose a live resource and `READY` is the truth about it. Neither
+row fires for a record that is already finalized — a run that fails in `closing_ticket` leaves its
+resource `READY`.
 
 ## `orchestration/plans.py` — run plans as data
 
@@ -489,14 +492,15 @@ the default team, work note, ticket left open). That is the only branch, and it 
 those failures move onto the policy table by raising `StepFailure` with a kind.
 
 The escalator also owns the **resource side** of a run that ends without finalizing — the last two
-rows of the [lifecycle table](#the-resource-records-lifecycle-state). `escalate` marks the record
-`FAILED` after the ticket work; `reject` (called by the executor's `_reject`) deletes a `create`'s
-record or returns an `update`/`delete`'s record to `READY`. The ticket side and the
-resource side are guarded **separately** — a Project Manager outage never blocks the Incident, and
-a ServiceNow outage never blocks the record update — and neither method raises. Both are no-ops
-for an automation run, for a run that never configured its resource, and for a run whose resource
-was already finalized.
-Marking `FAILED` is not a rollback: whatever the engine did or half-did stays as it is.
+rows of the [lifecycle table](#the-resource-records-lifecycle-state). `escalate` releases the
+record after the ticket work and `reject` (called by the executor's `_reject`) releases it with no
+ticket work at all, both through the same `_release_resource`: a `create`'s record is deleted, an
+`update`/`delete`'s goes back to `READY`. The ticket side and the resource side are guarded
+**separately** — a Project Manager outage never blocks the Incident, and a ServiceNow outage never
+blocks the record update — and neither method raises. Both are no-ops for an automation run, for a
+run that never configured its resource, and for a run whose resource was already finalized.
+Releasing is not a rollback: whatever the engine did or half-did stays as it is, and the Incident
+is what records it — the record is not a memorial for it.
 
 ```python
 class FailureEscalator:
@@ -517,12 +521,19 @@ class FailureEscalator:
                 await self._escalate_unclassified(run, error)
         except Exception as e:      # never let escalation crash the worker
             logger.exception("Failed to escalate run %s failure: %s", run.run_id, e)
-        await self._mark_resource_failed(run)                   # guarded on its own
+        await self._release_resource(run)                       # guarded on its own
 
     async def reject(self, run: WorkflowRun) -> None:
-        """Release the resource a rejected request was put on: a CREATE's record is deleted
-        (nothing was provisioned); an UPDATE/DELETE's resource goes back to READY, exactly as it
-        was. Never raises."""
+        """A rejected request escalates nothing — the ticket already carries the rejection — but
+        releases the resource it was put on, exactly as a failure does. Never raises."""
+        await self._release_resource(run)
+
+    async def _release_resource(self, run: WorkflowRun) -> None:
+        """Let go of the resource a run that ended badly left in flight, so no record keeps
+        advertising a run that is over. A CREATE's record is deleted — it was only ever a
+        placeholder, and a record left in a dead-end state is one someone has to clear by hand
+        before the name is free again. An UPDATE/DELETE's record goes back to READY: the resource
+        behind it still exists, and the change itself is only ever written on finalize."""
         resource = self._resource_in_flight(run)
         if resource is None:
             return
@@ -534,19 +545,8 @@ class FailureEscalator:
                 await self.resources.update_resource(
                     resource.project_id, resource.resource_type, resource.vendor_id,
                     resource_state_fields(run, ResourceState.READY))
-        except Exception as e:      # never let escalation crash the worker
-            logger.exception("Failed to release resource for rejected run %s: %s", run.run_id, e)
-
-    async def _mark_resource_failed(self, run: WorkflowRun) -> None:
-        resource = self._resource_in_flight(run)
-        if resource is None:
-            return
-        try:
-            await self.resources.update_resource(
-                resource.project_id, resource.resource_type, resource.vendor_id,
-                resource_state_fields(run, ResourceState.FAILED))
         except Exception as e:      # a PM outage must not undo the ticket-side escalation
-            logger.exception("Failed to mark resource FAILED for run %s: %s", run.run_id, e)
+            logger.exception("Failed to release the resource of run %s: %s", run.run_id, e)
 
     @staticmethod
     def _resource_in_flight(run: WorkflowRun) -> ResourceSpec | None:
