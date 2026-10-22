@@ -155,9 +155,13 @@ class ResourceRunSummary(BaseModel):
     ticket_id: str | None
     incident_id: str | None
     failure_detail: str | None
+    # The resource's own specs (ResourceSpec.data) — a free-form pass-through payload, shaped by
+    # the resource type rather than by us. Only set when the caller asks (include_resource_data);
+    # the routes serve with response_model_exclude_unset, so otherwise the key is absent entirely.
+    resource_data: dict[str, Any] | None = None
 
 
-def summarize_run(run: WorkflowRun) -> ResourceRunSummary:
+def summarize_run(run: WorkflowRun, *, include_resource_data: bool = False) -> ResourceRunSummary:
     """Project a run onto the summary. The failure detail prefers what the engine reported — the
     message that says what actually went wrong — and falls back to the last step error."""
     st = run.run_state
@@ -165,7 +169,7 @@ def summarize_run(run: WorkflowRun) -> ResourceRunSummary:
     detail = failure.detail if failure is not None and failure.detail else None
     if detail is None and st.errors:
         detail = list(st.errors.values())[-1]
-    return ResourceRunSummary(
+    summary = ResourceRunSummary(
         run_id=run.run_id,
         resource_id=st.resource.resource_id if st.resource is not None else "",
         status=run.status,
@@ -178,6 +182,10 @@ def summarize_run(run: WorkflowRun) -> ResourceRunSummary:
         incident_id=st.incident_id,
         failure_detail=detail,
     )
+    if include_resource_data:
+        # Assigned after construction so it counts as set (and so is serialized) only when asked.
+        summary.resource_data = st.resource.data if st.resource is not None else {}
+    return summary
 
 
 MAX_BATCH_RESOURCE_IDS = 200
@@ -443,9 +451,14 @@ async def trigger_legacy_run(
     )
 
 
-@app.get("/api/v1/workflow-runs/latest", response_model=ResourceRunSummary)
+@app.get(
+    "/api/v1/workflow-runs/latest",
+    response_model=ResourceRunSummary,
+    response_model_exclude_unset=True,
+)
 async def get_latest_resource_run(
     resource_id: str,
+    include_resource_data: bool = False,
     svc: WorkflowRunService = Depends(get_run_service),
 ) -> ResourceRunSummary:
     """The most recent run against one resource manager record — what a portal shows beside a
@@ -453,6 +466,9 @@ async def get_latest_resource_run(
 
     Declared BEFORE /workflow-runs/{run_id}: that route parses its path segment as a UUID, so
     whichever is declared first wins and "latest" would be rejected there as a malformed run id.
+
+    ``include_resource_data=true`` adds ``resource_data``: the resource's specs as the run carries
+    them.
     """
     run = await svc.find_last_by_resource_id(resource_id)
     if run is None:
@@ -460,12 +476,17 @@ async def get_latest_resource_run(
             status.HTTP_404_NOT_FOUND,
             detail=f"No runs for resource record '{resource_id}'.",
         )
-    return summarize_run(run)
+    return summarize_run(run, include_resource_data=include_resource_data)
 
 
-@app.get("/api/v1/workflow-runs/latest-batch", response_model=list[ResourceRunSummary])
+@app.get(
+    "/api/v1/workflow-runs/latest-batch",
+    response_model=list[ResourceRunSummary],
+    response_model_exclude_unset=True,
+)
 async def get_latest_resource_runs(
     resource_id: str,
+    include_resource_data: bool = False,
     svc: WorkflowRunService = Depends(get_run_service),
 ) -> list[ResourceRunSummary]:
     """The latest run for each of several resource manager records — one round trip for a portal
@@ -476,12 +497,18 @@ async def get_latest_resource_runs(
 
     Declared BEFORE /workflow-runs/{run_id} for the same reason as /workflow-runs/latest — that
     route parses its path segment as a UUID and would reject this one as a malformed run id.
+
+    ``include_resource_data=true`` adds ``resource_data`` to every item, as on /latest.
     """
     resource_ids = _parse_resource_ids(resource_id)
     runs = await svc.find_last_by_resource_ids(resource_ids)
     by_record = {run.run_state.resource.resource_id: run for run in runs if run.run_state.resource}
     # Answer in the order asked, so a caller can zip the response against its own list of records.
-    return [summarize_run(by_record[rid]) for rid in resource_ids if rid in by_record]
+    return [
+        summarize_run(by_record[rid], include_resource_data=include_resource_data)
+        for rid in resource_ids
+        if rid in by_record
+    ]
 
 
 @app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)

@@ -211,26 +211,32 @@ async def trigger_workflow_run(request: WorkflowRunTriggerRequest,
 
 # BEFORE /{run_id}: that route parses its path segment as a UUID, so whichever is declared first
 # wins and "latest" would be rejected there as a malformed run id.
-@app.get("/api/v1/workflow-runs/latest", response_model=ResourceRunSummary)
-async def get_latest_resource_run(resource_id: str,
+# exclude_unset: resource_data is only set (and so only serialized) when include_resource_data.
+@app.get("/api/v1/workflow-runs/latest", response_model=ResourceRunSummary,
+         response_model_exclude_unset=True)
+async def get_latest_resource_run(resource_id: str, include_resource_data: bool = False,
                                   svc: WorkflowRunService = Depends(get_run_service)):
     run = await svc.find_last_by_resource_id(resource_id)
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             detail=f"No runs for resource record '{resource_id}'.")
-    return summarize_run(run)          # a trimmed summary, not the internal run_state
+    # a trimmed summary, not the internal run_state
+    return summarize_run(run, include_resource_data=include_resource_data)
 
 
 # Also BEFORE /{run_id}, for the same reason. The list form of the lookup above: one round trip
 # for a portal screen listing a project's resources.
-@app.get("/api/v1/workflow-runs/latest-batch", response_model=list[ResourceRunSummary])
+@app.get("/api/v1/workflow-runs/latest-batch", response_model=list[ResourceRunSummary],
+         response_model_exclude_unset=True)
 async def get_latest_resource_runs(resource_id: str,      # comma-separated record ids
+                                   include_resource_data: bool = False,
                                    svc: WorkflowRunService = Depends(get_run_service)):
     resource_ids = _parse_resource_ids(resource_id)       # blanks/dupes dropped; 422 if empty/>200
     runs = await svc.find_last_by_resource_ids(resource_ids)
     by_record = {run.run_state.resource.resource_id: run for run in runs if run.run_state.resource}
     # Records with no runs drop out (never a 404); answered in the order asked.
-    return [summarize_run(by_record[rid]) for rid in resource_ids if rid in by_record]
+    return [summarize_run(by_record[rid], include_resource_data=include_resource_data)
+            for rid in resource_ids if rid in by_record]
 
 
 @app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)

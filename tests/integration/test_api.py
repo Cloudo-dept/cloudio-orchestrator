@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -335,7 +336,11 @@ async def test_list_by_resource_and_ticket(client: httpx.AsyncClient) -> None:
 
 
 async def _seed_resource_run(
-    runs: FakeWorkflowRunRepository, *, resource_id: str, minutes_ago: int
+    runs: FakeWorkflowRunRepository,
+    *,
+    resource_id: str,
+    minutes_ago: int,
+    resource_data: dict[str, Any] | None = None,
 ) -> uuid.UUID:
     """A resource run against one resource manager record, created `minutes_ago` before now."""
     from datetime import timedelta
@@ -346,6 +351,8 @@ async def _seed_resource_run(
     run = make_run(run_type=RunType.RESOURCE)
     assert run.run_state.resource is not None
     run.run_state.resource.resource_id = resource_id
+    if resource_data is not None:
+        run.run_state.resource.data = resource_data
     run.created_at = utcnow() - timedelta(minutes=minutes_ago)
     await runs.create(run)
     return run.run_id
@@ -378,6 +385,24 @@ async def test_latest_run_for_a_resource_record(
         "incident_id",
         "failure_detail",
     }
+
+
+async def test_latest_run_includes_resource_data_only_when_asked(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    await _seed_resource_run(
+        runs, resource_id="rec-1", minutes_ago=1, resource_data={"cpu": 4, "memory_gb": 16}
+    )
+
+    with_data = await client.get(
+        "/api/v1/workflow-runs/latest",
+        params={"resource_id": "rec-1", "include_resource_data": "true"},
+    )
+    without = await client.get("/api/v1/workflow-runs/latest", params={"resource_id": "rec-1"})
+
+    assert with_data.status_code == 200
+    assert with_data.json()["resource_data"] == {"cpu": 4, "memory_gb": 16}
+    assert "resource_data" not in without.json()  # absent, not null, by default
 
 
 async def test_latest_run_for_an_unknown_resource_record_is_404(client: httpx.AsyncClient) -> None:
@@ -416,6 +441,25 @@ async def test_latest_batch_answers_one_run_per_record_in_the_order_asked(
     body = resp.json()
     assert [item["run_id"] for item in body] == [str(newest_2), str(newest_1)]
     assert [item["resource_id"] for item in body] == ["rec-2", "rec-1"]  # match rows to the request
+
+
+async def test_latest_batch_includes_resource_data_only_when_asked(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1, resource_data={"cpu": 2})
+    await _seed_resource_run(runs, resource_id="rec-2", minutes_ago=1, resource_data={"cpu": 8})
+
+    with_data = await client.get(
+        "/api/v1/workflow-runs/latest-batch",
+        params={"resource_id": "rec-2,rec-1", "include_resource_data": "true"},
+    )
+    without = await client.get(
+        "/api/v1/workflow-runs/latest-batch", params={"resource_id": "rec-2,rec-1"}
+    )
+
+    assert with_data.status_code == 200
+    assert [item["resource_data"] for item in with_data.json()] == [{"cpu": 8}, {"cpu": 2}]
+    assert all("resource_data" not in item for item in without.json())
 
 
 async def test_latest_batch_omits_records_with_no_runs(
