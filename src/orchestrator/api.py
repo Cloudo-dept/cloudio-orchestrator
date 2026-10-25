@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.domain import (
@@ -312,7 +312,12 @@ async def readyz(health_check: HealthCheck = Depends(get_health_check)) -> Healt
     return HealthResponse(status="ready")
 
 
-@app.post("/api/v1/workflows", response_model=WorkflowResponse, status_code=status.HTTP_201_CREATED)
+# --- v1 API: every versioned route hangs off this router; a v2 is a new router beside it ---
+
+v1 = APIRouter(prefix="/api/v1")
+
+
+@v1.post("/workflows", response_model=WorkflowResponse, status_code=status.HTTP_201_CREATED)
 async def register_workflow(
     request: WorkflowRegisterRequest,
     svc: WorkflowService = Depends(get_workflow_service),
@@ -335,14 +340,14 @@ async def register_workflow(
         ) from None
 
 
-@app.get("/api/v1/workflows", response_model=list[WorkflowResponse])
+@v1.get("/workflows", response_model=list[WorkflowResponse])
 async def list_workflows(
     svc: WorkflowService = Depends(get_workflow_service),
 ) -> list[Workflow]:
     return await svc.list()
 
 
-@app.get("/api/v1/workflows/{identifier}", response_model=WorkflowResponse)
+@v1.get("/workflows/{identifier}", response_model=WorkflowResponse)
 async def get_workflow(
     identifier: str,
     svc: WorkflowService = Depends(get_workflow_service),
@@ -353,7 +358,7 @@ async def get_workflow(
     return wf
 
 
-@app.put("/api/v1/workflows/{identifier}", response_model=WorkflowResponse)
+@v1.put("/workflows/{identifier}", response_model=WorkflowResponse)
 async def update_workflow(
     identifier: str,
     request: WorkflowUpdateRequest,
@@ -374,9 +379,7 @@ async def update_workflow(
     return updated
 
 
-@app.post(
-    "/api/v1/workflow-runs", response_model=WorkflowRunResponse, status_code=status.HTTP_201_CREATED
-)
+@v1.post("/workflow-runs", response_model=WorkflowRunResponse, status_code=status.HTTP_201_CREATED)
 async def trigger_workflow_run(
     request: WorkflowRunTriggerRequest,
     svc: WorkflowRunService = Depends(get_run_service),
@@ -424,9 +427,7 @@ async def trigger_workflow_run(
         ) from None
 
 
-@app.post(
-    "/api/v1/legacy-runs", response_model=WorkflowRunResponse, status_code=status.HTTP_201_CREATED
-)
+@v1.post("/legacy-runs", response_model=WorkflowRunResponse, status_code=status.HTTP_201_CREATED)
 async def trigger_legacy_run(
     request: LegacyRunRequest,
     svc: WorkflowRunService = Depends(get_run_service),
@@ -451,8 +452,8 @@ async def trigger_legacy_run(
     )
 
 
-@app.get(
-    "/api/v1/workflow-runs/latest",
+@v1.get(
+    "/workflow-runs/latest",
     response_model=ResourceRunSummary,
     response_model_exclude_unset=True,
 )
@@ -479,8 +480,8 @@ async def get_latest_resource_run(
     return summarize_run(run, include_resource_data=include_resource_data)
 
 
-@app.get(
-    "/api/v1/workflow-runs/latest-batch",
+@v1.get(
+    "/workflow-runs/latest-batch",
     response_model=list[ResourceRunSummary],
     response_model_exclude_unset=True,
 )
@@ -511,7 +512,7 @@ async def get_latest_resource_runs(
     ]
 
 
-@app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)
+@v1.get("/workflow-runs/{run_id}", response_model=WorkflowRunResponse)
 async def get_workflow_run(
     run_id: uuid.UUID,
     svc: WorkflowRunService = Depends(get_run_service),
@@ -522,7 +523,7 @@ async def get_workflow_run(
     return run
 
 
-@app.get("/api/v1/workflow-runs", response_model=list[WorkflowRunResponse])
+@v1.get("/workflow-runs", response_model=list[WorkflowRunResponse])
 async def list_workflow_runs(
     ticket_id: str | None = None,
     vendor_id: str | None = None,
@@ -538,8 +539,8 @@ async def list_workflow_runs(
 # --- Callbacks: external systems wake a waiting run early (co-exists with polling) ---
 
 
-@app.post(
-    "/api/v1/callbacks/ticket-approval",
+@v1.post(
+    "/callbacks/ticket-approval",
     response_model=CallbackAcceptedResponse,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["callbacks"],
@@ -555,8 +556,8 @@ async def ticket_approval_callback(
     return CallbackAcceptedResponse(woken=woken)
 
 
-@app.post(
-    "/api/v1/callbacks/engine-run",
+@v1.post(
+    "/callbacks/engine-run",
     response_model=CallbackAcceptedResponse,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["callbacks"],
@@ -570,3 +571,6 @@ async def engine_run_callback(
     already-terminal engine run is a no-op (woken=0), never an error."""
     woken = await svc.wake_by_engine_run(request.engine_run_id)
     return CallbackAcceptedResponse(woken=woken)
+
+
+app.include_router(v1)
