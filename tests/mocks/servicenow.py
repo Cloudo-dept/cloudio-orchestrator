@@ -143,4 +143,10 @@ def _build(mock: ServiceNowMock) -> FastAPI:
         mock.incidents.append(Incident(number=number, sys_id=sys_id, body=body))
         return {"result": {"number": number, "sys_id": sys_id}}
 
+    @app.patch("/api/now/table/incident/{sys_id}")
+    async def patch_incident(sys_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        inc = next(i for i in mock.incidents if i.sys_id == sys_id)
+        inc.body.update(body)  # a PATCH merges onto the record
+        return {"result": {"number": inc.number, "sys_id": inc.sys_id}}
+
     return app

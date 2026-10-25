@@ -46,6 +46,13 @@ class TicketSystemClient(abc.ABC):
         one-line title, `description` the body a responder reads first, and `comment` the same
         failure detail as a note — so it survives where a provider treats the body as immutable."""
 
+    @abc.abstractmethod
+    async def close_incident(self, incident: TicketRef, note: str | None = None,
+                             outcome: TicketOutcome = TicketOutcome.SUCCESSFUL) -> None:
+        """Resolve an incident, optionally with a resolution note. `outcome` DOCUMENTATION marks
+        an incident opened only to keep a record, so it reads as one rather than as a fault that
+        somebody fixed. UNSUCCESSFUL has no meaning for an incident."""
+
 
 class ResourceManagerClient(abc.ABC):
     """Domain-level resource operations (Project Manager is one implementation)."""
@@ -484,6 +491,21 @@ class ServiceNowTicketClient(TicketSystemClient):
             resp.raise_for_status()
             r = resp.json()["result"]
             return TicketRef(ticket_id=r["number"], native_id=r["sys_id"])
+
+    async def close_incident(self, incident: TicketRef, note: str | None = None,
+                             outcome: TicketOutcome = TicketOutcome.SUCCESSFUL) -> None:
+        # One PATCH by the sys_id open_incident returned. close_code + close_notes are required
+        # for the Resolved (6) transition, so close_notes always carries something.
+        body: dict[str, Any] = {
+            "state": self._INC_RESOLVED,
+            "close_code": self._INC_CLOSE_CODE,              # "Solved (Work Around)"
+            "close_notes": note or "Incident closed automatically",
+            "u_category_actual": "CloudIO",
+        }
+        # Per call, never in a shared payload — or every resolved incident would carry it.
+        if outcome is TicketOutcome.DOCUMENTATION:
+            body["u_subcategory_actual"] = self._DOC_SUBCATEGORY  # "לצורך תיעוד - נסגר אוטומטית"
+        await self._patch("incident", incident.native_id, **body)
 ```
 
 ## `adapters/project_manager.py`

@@ -74,6 +74,37 @@ async def test_close_ticket_unsuccessful_uses_the_incomplete_state(
     assert ritm.state == 4 and ritm.work_notes == ["failed validation"]
 
 
+async def test_close_incident_resolves_it(
+    servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
+) -> None:
+    ref = await servicenow_client.open_incident(
+        summary="x", requested_by="jdoe", responsible_group="cloudio"
+    )
+    await servicenow_client.close_incident(ref, note="fixed upstream")
+    body = next(i for i in servicenow.incidents if i.sys_id == ref.native_id).body
+    assert body["state"] == 6
+    assert body["close_code"] == "Solved (Work Around)"
+    assert body["close_notes"] == "fixed upstream"
+    assert body["u_category_actual"] == "CloudIO"
+    # Only a documentation close carries the marker.
+    assert "u_subcategory_actual" not in body
+
+
+async def test_close_incident_as_documentation_marks_it(
+    servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
+) -> None:
+    ref = await servicenow_client.open_incident(
+        summary="x", requested_by="jdoe", responsible_group="cloudio"
+    )
+    await servicenow_client.close_incident(ref, outcome=TicketOutcome.DOCUMENTATION)
+    body = next(i for i in servicenow.incidents if i.sys_id == ref.native_id).body
+    assert body["state"] == 6
+    assert body["close_notes"] == "Incident closed automatically"  # required even with no note
+    assert body["u_subcategory_actual"] == "לצורך תיעוד - נסגר אוטומטית"
+    # One PATCH by the sys_id open_incident returned — no lookup by number first.
+    assert servicenow.requests[-1] == ("PATCH", f"/api/now/table/incident/{ref.native_id}")
+
+
 async def test_annotate_ticket_adds_note_only(
     servicenow: ServiceNowMock, servicenow_client: ServiceNowTicketClient
 ) -> None:

@@ -234,7 +234,7 @@ async def test_approval_group_and_dag_group_never_feed_each_other(
     assert final.status is RunStatus.FAILED
     # RITM ← the request's own variable; INC ← the DAG. Neither is ever fed the other's group.
     assert tickets.opened_fields == [{"approval_group": "Approvers"}]
-    assert tickets.incidents[-1]["responsible_group"] == "netops"  # INC ← the DAG, not the request
+    assert tickets.incidents[0]["responsible_group"] == "netops"  # INC ← the DAG, not the request
 
 
 async def test_transient_failure_retries_then_completes(runs, resources, engine, settings) -> None:
@@ -311,7 +311,7 @@ async def test_task_exception_opens_incident_and_closes_ticket_naming_it(
     assert final.status is RunStatus.FAILED
     assert final.run_state.engine_failure is not None
     assert final.run_state.engine_failure.responsible_group == "netops"
-    inc = tickets.incidents[-1]
+    inc = tickets.incidents[0]  # the team's incident; [1] is the default team's record of it
     assert inc["responsible_group"] == "netops"
     # The workflow's name (not its identifier), and the RITM a responder will search by.
     assert inc["summary"] == "Error in Provision VM automation (RITM0000001)"
@@ -345,7 +345,83 @@ async def test_task_exception_is_retried_before_escalating(
 
     assert final.status is RunStatus.FAILED
     assert len(engine.trigger_calls) == 3  # the first run + two retries, each a fresh engine run
-    assert len(tickets.incidents) == 1
+    assert len(tickets.incidents) == 2  # escalated once: the team's incident + its record
+
+
+async def test_another_teams_failure_leaves_the_default_team_a_documentation_incident(
+    runs, tickets, resources, settings
+) -> None:
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=0))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    team, doc = tickets.incidents
+    assert team["responsible_group"] == "netops"  # the real work item, left open
+    assert doc["responsible_group"] == "cloudio"
+    assert doc["comment"] == team["comment"] and doc["summary"] == team["summary"]
+    # Only the record is closed, and closed as documentation-only.
+    assert tickets.closed_incidents == [(doc["ticket_id"], None, TicketOutcome.DOCUMENTATION)]
+    # The requester sees exactly what they did before: the team's incident, not the record.
+    assert final.run_state.incident_id == team["ticket_id"]
+    assert tickets.closed == [
+        (
+            "RITM0000001",
+            f"An error occurred. Incident {team['ticket_id']} was created",
+            TicketOutcome.UNSUCCESSFUL,
+        )
+    ]
+
+
+async def test_a_default_team_failure_opens_no_documentation_incident(
+    runs, tickets, resources, settings
+) -> None:
+    # The default team already owns the incident; a second identical one in its queue is noise.
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    assert engine.failure is not None
+    engine.failure.responsible_group = "cloudio"
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=0))
+
+    await drive(runs, executor, run.run_id, iters=20)
+
+    assert [i["responsible_group"] for i in tickets.incidents] == ["cloudio"]
+    assert tickets.closed_incidents == []
+
+
+class CloseIncidentDownClient(FakeTicketSystemClient):
+    """The ticket system cannot resolve incidents."""
+
+    async def close_incident(
+        self,
+        incident: TicketRef,
+        note: str | None = None,
+        outcome: TicketOutcome = TicketOutcome.SUCCESSFUL,
+    ) -> None:
+        raise RuntimeError("ServiceNow unavailable")
+
+
+async def test_a_failed_documentation_incident_still_closes_the_ticket(
+    runs, resources, settings
+) -> None:
+    tickets = CloseIncidentDownClient()
+    engine = engine_failing_with(FailureKind.TASK, exception_name="TaskException")
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.AUTOMATION, max_retries=0))
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    team = tickets.incidents[0]
+    assert final.run_state.incident_id == team["ticket_id"]
+    assert tickets.closed == [
+        (
+            "RITM0000001",
+            f"An error occurred. Incident {team['ticket_id']} was created",
+            TicketOutcome.UNSUCCESSFUL,
+        )
+    ]
+    assert final.run_state.ticket_closed is True
 
 
 class BrokenRunRepository(FakeWorkflowRunRepository):
@@ -381,6 +457,7 @@ async def test_missing_handler_fails_the_run_and_opens_an_incident(
     assert tickets.incidents[0]["flow_type"] == "provision-vm"
     assert tickets.incidents[0]["failed_task"] == "running_engine"
     assert final.run_state.incident_id is not None
+    assert tickets.closed_incidents == []  # unclassified: the open incident is the work item
 
 
 async def test_a_broken_save_fails_the_run_and_opens_an_incident(
@@ -412,7 +489,8 @@ async def test_a_save_failing_after_escalation_does_not_open_a_second_incident(
     await executor.handle(run.run_id)  # trigger the engine run (saves once)
     await executor.handle(run.run_id)  # sees FAILED, escalates, then the save breaks
 
-    assert len(tickets.incidents) == 1  # one failure → one Incident
+    # One failure → one escalation: the team's incident and the default team's record of it.
+    assert len(tickets.incidents) == 2
 
 
 async def test_engine_failure_without_a_task_names_the_step_instead(
@@ -933,7 +1011,7 @@ async def test_failed_create_deletes_the_placeholder_resource(
     final = await drive(runs, executor, run.run_id, iters=20)
 
     assert final.status is RunStatus.FAILED
-    assert len(tickets.incidents) == 1
+    assert len(tickets.incidents) == 2  # netops' incident + the default team's record
     # The record was only ever a placeholder for the request, so it goes rather than sitting in a
     # dead end someone has to clear by hand. The Incident is what records the failure.
     assert resources.deleted == [("proj-1", "vm", str(run.run_id))]
@@ -992,7 +1070,7 @@ async def test_a_resource_manager_outage_does_not_cost_the_incident(
     final = await drive(runs, executor, run.run_id, iters=20)
 
     assert final.status is RunStatus.FAILED
-    assert len(tickets.incidents) == 1
+    assert tickets.incidents[0]["responsible_group"] == "netops"
     assert tickets.closed[-1][2] is TicketOutcome.UNSUCCESSFUL
 
 

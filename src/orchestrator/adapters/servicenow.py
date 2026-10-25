@@ -32,6 +32,11 @@ class ServiceNowTicketClient(TicketSystemClient):
         TicketOutcome.SUCCESSFUL: _RITM_CLOSED,
         TicketOutcome.UNSUCCESSFUL: _RITM_CLOSED_INCOMPLETE,
     }
+    _INC_RESOLVED = 6  # incident `state`: Resolved
+    _INC_CLOSE_CODE = "Solved (Work Around)"  # ServiceNow requires a close code to resolve
+    # Marks an incident opened only for the record. Set per close, never in a shared payload —
+    # anywhere wider and every resolved incident would read as documentation-only.
+    _DOC_SUBCATEGORY = "לצורך תיעוד - נסגר אוטומטית"
     # RITM `approval` field values that are terminal; anything else means still pending.
     _APPROVAL_MAP = {"approved": ApprovalStatus.APPROVED, "rejected": ApprovalStatus.REJECTED}
 
@@ -202,6 +207,23 @@ class ServiceNowTicketClient(TicketSystemClient):
         body = {"work_notes": note} if note else {}
         state = self._CLOSE_STATES[outcome]
         await self._patch("sc_req_item", ticket.native_id, state=state, **body)
+
+    async def close_incident(
+        self,
+        incident: TicketRef,
+        note: str | None = None,
+        outcome: TicketOutcome = TicketOutcome.SUCCESSFUL,
+    ) -> None:
+        # One round trip: the ref open_incident returned already carries the sys_id.
+        body: dict[str, Any] = {
+            "state": self._INC_RESOLVED,
+            "close_code": self._INC_CLOSE_CODE,
+            "close_notes": note or "Incident closed automatically",  # required to resolve
+            "u_category_actual": "CloudIO",
+        }
+        if outcome is TicketOutcome.DOCUMENTATION:
+            body["u_subcategory_actual"] = self._DOC_SUBCATEGORY
+        await self._patch("incident", incident.native_id, **body)
 
     async def annotate_ticket(self, ticket: TicketRef, note: str) -> None:
         await self._patch("sc_req_item", ticket.native_id, work_notes=note)

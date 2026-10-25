@@ -156,6 +156,17 @@ class TicketSystemClient(abc.ABC):
         failure detail, so the detail survives even where a provider treats the body as immutable.
         """
 
+    @abc.abstractmethod
+    async def close_incident(
+        self,
+        incident: TicketRef,
+        note: str | None = None,
+        outcome: TicketOutcome = TicketOutcome.SUCCESSFUL,
+    ) -> None:
+        """Resolve an incident, optionally with a resolution note. ``outcome`` DOCUMENTATION marks
+        an incident opened only to keep a record, so it reads as one rather than as a fault that
+        somebody fixed. UNSUCCESSFUL has no meaning for an incident."""
+
 
 class ResourceManagerClient(abc.ABC):
     """Domain-level resource operations (Project Manager is one implementation)."""

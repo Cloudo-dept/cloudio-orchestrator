@@ -65,7 +65,9 @@ class FailureEscalator:
 
     A **classified** failure (``StepFailure`` — today only a DAG failure, whose exception the engine
     adapter classified) is escalated by its policy: an Incident to the responsible group when the
-    policy asks for one, then the requester's ticket closed UNSUCCESSFUL with the policy's comment.
+    policy asks for one (plus a documentation-only record for the default team, opened and resolved
+    at once, when another team owns it), then the requester's ticket closed UNSUCCESSFUL with the
+    policy's comment, naming the responsible team's incident.
     Everything else — an adapter that exhausted its retries, a step that blew its deadline — keeps
     the older behaviour: an Incident to the default team and a work note, ticket left open. Those
     failures move onto the policy table by raising StepFailure with a kind; nothing else changes.
@@ -192,6 +194,7 @@ class FailureEscalator:
                 run.run_id,
                 group,
             )
+            await self._log_documentation_incident(run, group, detail)
         if st.ticket is None:  # failed before the ticket existed — nothing to tell the requester
             logger.info("Run %s has no ticket to close.", run.run_id)
             return
@@ -199,6 +202,39 @@ class FailureEscalator:
         await self.ticket.close_ticket(st.ticket, note=note, outcome=TicketOutcome.UNSUCCESSFUL)
         st.ticket_closed = True  # the CLOSE_TICKET step is never reached, but a re-drive might be
         logger.info("Closed ticket %s as unsuccessful: %s", st.ticket.ticket_id, note)
+
+    async def _log_documentation_incident(self, run: WorkflowRun, group: str, detail: str) -> None:
+        """Leave the default team a record of a failure another team owns: an incident opened and
+        resolved at once, marked documentation-only. The responsible team's incident stays the
+        real work item — it is the one ``incident_id`` holds and the ticket's comment names; this
+        one is deliberately not persisted.
+
+        Skipped when the default team is itself responsible: a second, identical incident in the
+        same queue is noise. Guarded on its own, so a failure here never costs the requester's
+        ticket its close.
+        """
+        if group == self.default_team:
+            return
+        failure = run.run_state.engine_failure
+        try:
+            doc = await self.ticket.open_incident(
+                summary=incident_summary(run),
+                requested_by=run.created_by,
+                responsible_group=self.default_team,
+                flow_type=incident_flow_type(run, failure),
+                failed_task=incident_failed_task(run, failure),
+                comment=detail,
+                description=incident_description(run, detail),
+            )
+            await self.ticket.close_incident(doc, outcome=TicketOutcome.DOCUMENTATION)
+            logger.info(
+                "Logged documentation incident %s for run %s (owned by team '%s').",
+                doc.ticket_id,
+                run.run_id,
+                group,
+            )
+        except Exception as e:  # the record is a nicety; the ticket close is not
+            logger.exception("Failed to log a documentation incident for run %s: %s", run.run_id, e)
 
     async def _escalate_unclassified(self, run: WorkflowRun, error: Exception) -> None:
         st = run.run_state

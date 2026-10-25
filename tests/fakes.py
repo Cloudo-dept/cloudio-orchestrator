@@ -189,6 +189,8 @@ class FakeTicketSystemClient(TicketSystemClient):
         self.closed: list[tuple[str, str | None, TicketOutcome]] = []  # (ticket_id, note, outcome)
         self.notes: list[tuple[str, str]] = []  # (ticket_id, note)
         self.incidents: list[dict[str, Any]] = []
+        # (incident_id, note, outcome)
+        self.closed_incidents: list[tuple[str, str | None, TicketOutcome]] = []
         # default APPROVED so a resource run drives straight through AWAIT_APPROVAL; flip to
         # PENDING/REJECTED to exercise the wait/rejection paths.
         self.approval_status = ApprovalStatus.APPROVED
@@ -251,6 +253,14 @@ class FakeTicketSystemClient(TicketSystemClient):
             }
         )
         return ref
+
+    async def close_incident(
+        self,
+        incident: TicketRef,
+        note: str | None = None,
+        outcome: TicketOutcome = TicketOutcome.SUCCESSFUL,
+    ) -> None:
+        self.closed_incidents.append((incident.ticket_id, note, outcome))
 
 
 class FakeResourceManagerClient(ResourceManagerClient):

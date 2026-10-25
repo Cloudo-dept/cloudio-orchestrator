@@ -133,6 +133,9 @@ class TicketOutcome(str, Enum):
 
     SUCCESSFUL = "successful"  # the request was fulfilled
     UNSUCCESSFUL = "unsuccessful"  # the request ended in failure and was not fulfilled
+    # An incident opened only to keep a record, closed as soon as it is opened. Incidents only —
+    # a requester's ticket is never closed this way.
+    DOCUMENTATION = "documentation"
 
 
 # --- Exceptions ---
