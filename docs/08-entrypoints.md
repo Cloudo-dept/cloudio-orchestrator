@@ -269,11 +269,13 @@ app.include_router(callbacks)       # its own router: outside the API-key gate
 ### Authentication — API keys
 
 Every `/api/v1` route requires an `X-API-Key` header holding one of the keys in
-`Settings.api_keys` (client name → key, `ORCH_API_KEYS` as JSON); a missing or unknown key is a
+`Settings.api_keys` — one field per calling client (`ORCH_API_KEY_UI`, `ORCH_API_KEY_PORTAL`,
+`ORCH_API_KEY_SERVICENOW`), collected by client name; a missing or unknown key is a
 `401` with `WWW-Authenticate: ApiKey`. The gate is a router-level dependency (`require_api_key`)
 over an `ApiKeyAuthenticator` (`auth.py`) that `bootstrap.build()` constructs from settings — the
 API itself never reads configuration. Keys are named per client so one can be rotated or revoked
-alone; comparison is constant-time across every key.
+alone; comparison is constant-time across every key. A new caller is a new `api_key_<client>` field
+plus its entry in the `api_keys` property.
 
 Two exemptions, both deliberate:
 
@@ -283,7 +285,7 @@ Two exemptions, both deliberate:
   that post them hold no key.
 - **`/healthz` / `/readyz`** are on the app, not `v1`, so platform probes need no credentials.
 
-With `api_keys` empty the gate is open and startup logs a warning — for local development only.
+With no key set the gate is open and startup logs a warning — for local development only.
 
 ## `worker.py` — daemon: workers claim and drive runs directly
 

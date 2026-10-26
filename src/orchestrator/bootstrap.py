@@ -183,7 +183,7 @@ async def build(settings: Settings) -> Container:
     if authenticator.enabled:
         logger.info("API keys configured for clients: %s.", sorted(settings.api_keys))
     else:
-        logger.warning("No API keys configured (ORCH_API_KEYS) — the API is open to any caller.")
+        logger.warning("No API keys configured (ORCH_API_KEY_*) — the API is open to any caller.")
 
     return Container(
         workflow_service=WorkflowService(workflows),

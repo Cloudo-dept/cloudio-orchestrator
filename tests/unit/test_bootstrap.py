@@ -38,7 +38,7 @@ async def test_build_wires_the_container(env: None) -> None:
     assert isinstance(container.run_service, WorkflowRunService)
     assert isinstance(container.worker, OrchestratorWorker)
     assert isinstance(container.health_check, PostgresHealthCheck)
-    assert not container.authenticator.enabled  # no ORCH_API_KEYS in env → open
+    assert not container.authenticator.enabled  # no ORCH_API_KEY_* in env → open
     # concurrency_limit → that many RunWorker loops.
     assert len(container.worker._workers) == 3
     # One pooled client per provider, the legacy runner included, all closed on shutdown.

@@ -20,10 +20,13 @@ class Settings(BaseSettings):
     # wins. An unrecognised name degrades to INFO with a warning rather than failing startup.
     log_level: str = "INFO"
 
-    # Inbound API keys: client name -> key, sent by callers as the X-API-Key header. Required on
-    # every /api/v1 route except the wake-early callbacks (network-trust, see 01-external-contracts)
-    # and the health probes. Empty → the API is open; startup logs a warning. Dev only.
-    api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+    # Inbound API keys, one per calling client, sent as the X-API-Key header. Required on every
+    # /api/v1 route except the wake-early callbacks (network-trust, see 01-external-contracts) and
+    # the health probes. Unset → that client has no key. None set → the API is open; startup logs a
+    # warning (dev only). A new caller gets a new field here and an entry in `api_keys` below.
+    api_key_ui: SecretStr | None = None  # the dev browser console's proxy
+    api_key_portal: SecretStr | None = None  # the portal (via its gateway): /workflow-runs/latest
+    api_key_servicenow: SecretStr | None = None  # ServiceNow outbound REST: automation triggers
 
     # Retry policy (application-owned; expressed as WorkflowRun.scheduled_at, never a queue delay).
     retry_base_seconds: float = 10.0  # base for per-step exponential backoff
@@ -82,3 +85,13 @@ class Settings(BaseSettings):
     # provider that stopped answering, and charging both to one budget turns healthy backpressure
     # (more workers than connections, which is the point of the cap) into spurious step retries.
     http_pool_acquire_timeout_seconds: float = 60.0
+
+    @property
+    def api_keys(self) -> dict[str, SecretStr]:
+        """The configured inbound keys by client name; unset or empty ones are left out."""
+        keys = {
+            "ui": self.api_key_ui,
+            "portal": self.api_key_portal,
+            "servicenow": self.api_key_servicenow,
+        }
+        return {client: key for client, key in keys.items() if key and key.get_secret_value()}

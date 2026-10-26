@@ -14,7 +14,7 @@ x-app: &app
     ORCH_AIRFLOW_BASE_URL: http://airflow:8080          # engine adapter target (creds from .env)
     ORCH_PM_BASE_URL: http://project-manager:8000       # dev Project Manager mock (token from .env)
     # One dev API key, shared with the ui service below so the console's proxy can call the API.
-    ORCH_API_KEYS: '{"ui": "${UI_API_KEY:-dev-ui-key}"}'
+    ORCH_API_KEY_UI: ${UI_API_KEY:-dev-ui-key}
   volumes:
     - ./src:/app/src          # editable install → code edits hot-reload
     - ./alembic.ini:/app/alembic.ini
@@ -103,7 +103,7 @@ services:
       UI_PORT: "8090"
       UI_USERNAME: ${UI_USERNAME:-admin}       # Basic-auth gate on the console (override in .env)
       UI_PASSWORD: ${UI_PASSWORD:-password}
-      UI_API_KEY: ${UI_API_KEY:-dev-ui-key}    # sent as X-API-Key; must match ORCH_API_KEYS["ui"]
+      UI_API_KEY: ${UI_API_KEY:-dev-ui-key}    # sent as X-API-Key; must match ORCH_API_KEY_UI
     volumes:
       - ./dev/ui/static:/app/static    # edit the console live — no rebuild needed
       - ./dev/ui/server.py:/app/server.py

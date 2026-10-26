@@ -74,8 +74,12 @@ def test_no_queue_dsn_attribute(env: None) -> None:
     assert not hasattr(settings, "queue_dsn")
 
 
-def test_api_keys_parsed_from_json_as_secrets(env: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ORCH_API_KEYS", '{"ui": "ui-key", "portal": "portal-key"}')
+def test_api_keys_collected_from_their_own_fields(
+    env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ORCH_API_KEY_UI", "ui-key")
+    monkeypatch.setenv("ORCH_API_KEY_PORTAL", "portal-key")
+    monkeypatch.setenv("ORCH_API_KEY_SERVICENOW", "")  # empty counts as unset
     settings = Settings()
     assert "ui-key" not in repr(settings)
     assert {client: key.get_secret_value() for client, key in settings.api_keys.items()} == {
