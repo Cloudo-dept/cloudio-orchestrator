@@ -405,6 +405,65 @@ async def test_latest_run_includes_resource_data_only_when_asked(
     assert "resource_data" not in without.json()  # absent, not null, by default
 
 
+async def test_latest_run_includes_ticket_engine_and_steps_data_only_when_asked(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    from datetime import UTC, datetime
+
+    from orchestrator.domain import StepName, TicketRef
+
+    run_id = await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1)
+    run = await runs.get(run_id)
+    assert run is not None
+    run.run_state.ticket = TicketRef(ticket_id="RITM0001234", native_id="sys-1234")
+    run.run_state.engine_run_id = "dagrun-7"
+    # Stored out of order on purpose: the response must come back oldest first regardless.
+    run.run_state.step_started_at = {
+        StepName.AWAIT_APPROVAL: datetime(2026, 10, 1, 12, 5, tzinfo=UTC),
+        StepName.CREATE_TICKET: datetime(2026, 10, 1, 12, 0, tzinfo=UTC),
+    }
+    await runs.save(run)
+
+    with_data = await client.get(
+        "/api/v1/workflow-runs/latest",
+        params={
+            "resource_id": "rec-1",
+            "include_ticket_data": "true",
+            "include_engine_data": "true",
+            "include_steps_data": "true",
+        },
+    )
+    without = await client.get("/api/v1/workflow-runs/latest", params={"resource_id": "rec-1"})
+
+    assert with_data.status_code == 200
+    body = with_data.json()
+    assert body["ticket"] == {"ticket_id": "RITM0001234", "native_id": "sys-1234"}
+    assert body["engine_run_id"] == "dagrun-7"
+    assert list(body["steps_started_at"].items()) == [
+        (StepName.CREATE_TICKET.value, "2026-10-01T12:00:00Z"),
+        (StepName.AWAIT_APPROVAL.value, "2026-10-01T12:05:00Z"),
+    ]
+    assert "resource_data" not in body  # each flag is independent
+    assert not {"ticket", "engine_run_id", "steps_started_at"} & set(without.json())
+
+
+async def test_latest_batch_applies_the_include_flags_to_every_item(
+    client: httpx.AsyncClient, runs: FakeWorkflowRunRepository
+) -> None:
+    await _seed_resource_run(runs, resource_id="rec-1", minutes_ago=1)
+    await _seed_resource_run(runs, resource_id="rec-2", minutes_ago=1)
+
+    resp = await client.get(
+        "/api/v1/workflow-runs/latest-batch",
+        params={"resource_id": "rec-2,rec-1", "include_engine_data": "true"},
+    )
+
+    assert resp.status_code == 200
+    # Present even before the engine is triggered — null is the answer, not a missing key.
+    assert [item["engine_run_id"] for item in resp.json()] == [None, None]
+    assert all("ticket" not in item for item in resp.json())
+
+
 async def test_latest_run_for_an_unknown_resource_record_is_404(client: httpx.AsyncClient) -> None:
     resp = await client.get("/api/v1/workflow-runs/latest", params={"resource_id": "ghost"})
     assert resp.status_code == 404 and "ghost" in resp.json()["detail"]

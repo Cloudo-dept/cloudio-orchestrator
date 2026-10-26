@@ -251,6 +251,41 @@ async def test_transient_failure_retries_then_completes(runs, resources, engine,
     assert len(tickets.open_ticket_calls) == 1
 
 
+async def test_step_started_at_logs_every_step_of_a_completed_run(
+    runs, tickets, resources, engine, settings
+) -> None:
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE))
+
+    final = await drive(runs, executor, run.run_id)
+
+    assert final.status is RunStatus.COMPLETED
+    plan = RUN_PLANS[RunType.RESOURCE]
+    started = final.run_state.step_started_at
+    assert set(started) == set(plan)  # a completed step keeps its entry
+    assert [started[step] for step in plan] == sorted(started.values())  # begun in plan order
+    assert final.run_state.attempt_started_at is None  # no step in progress
+
+
+async def test_a_retry_keeps_the_steps_first_start_but_restarts_its_budget(
+    runs, resources, engine, settings
+) -> None:
+    tickets = FlakyTicketClient(fail_times=1)
+    executor, _ = build_executor(runs, tickets, resources, engine, settings)
+    run = await runs.create(make_run(run_type=RunType.RESOURCE, max_retries=3))
+
+    await executor.handle(run.run_id)  # CREATE_TICKET fails once → retry scheduled
+    mid = await runs.get(run.run_id)
+    assert mid is not None and mid.status is RunStatus.RUNNING
+    first_start = mid.run_state.step_started_at[StepName.CREATE_TICKET]
+    assert mid.run_state.attempt_started_at is None  # the retry gets a fresh budget
+
+    final = await drive(runs, executor, run.run_id, iters=20)
+
+    assert final.status is RunStatus.COMPLETED
+    assert final.run_state.step_started_at[StepName.CREATE_TICKET] == first_start
+
+
 async def test_permanent_failure_marks_failed_and_escalates(
     runs, resources, engine, settings
 ) -> None:
@@ -551,7 +586,7 @@ async def test_deadline_exceeded_fails_the_step(runs, tickets, resources, engine
 
     from orchestrator.domain import utcnow
 
-    run.run_state.step_started_at[StepName.CREATE_TICKET] = utcnow() - timedelta(seconds=10)
+    run.run_state.attempt_started_at = utcnow() - timedelta(seconds=10)
     created = await runs.create(run)
 
     final = await drive(runs, executor, created.run_id, iters=5)

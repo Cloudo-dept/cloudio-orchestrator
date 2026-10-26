@@ -665,7 +665,10 @@ class RunExecutor:
         while True:                                  # advance through synchronous steps
             run.current_step = step
             handler = self.handlers[step]
-            started = run.run_state.step_started_at.setdefault(step, utcnow())
+            run.run_state.step_started_at.setdefault(step, utcnow())   # the log: first start
+            if run.run_state.attempt_started_at is None:                 # the deadline clock
+                run.run_state.attempt_started_at = utcnow()
+            started = run.run_state.attempt_started_at
             try:
                 if utcnow() - started > timedelta(seconds=handler.max_step_duration_seconds):
                     raise StepDeadlineExceeded(f"Step {step} exceeded its wall-clock budget")
@@ -682,7 +685,7 @@ class RunExecutor:
                 return
 
             run.run_state.step_attempts.pop(step, None)
-            run.run_state.step_started_at.pop(step, None)
+            run.run_state.attempt_started_at = None  # step_started_at keeps its entry
             idx = plan.index(step)
             if idx + 1 < len(plan):
                 step = plan[idx + 1]
@@ -703,7 +706,7 @@ class RunExecutor:
         retryable = policy_for(kind).retryable
         if retryable and attempts[step] <= run.max_retries:
             handler.reset_for_retry(run.run_state)
-            run.run_state.step_started_at.pop(step, None)
+            run.run_state.attempt_started_at = None  # the retry gets a fresh budget
             backoff = (self.settings.retry_base_seconds * 2 ** (attempts[step] - 1)
                        + random.uniform(1, 5))
             await self._schedule(run, delay=backoff)

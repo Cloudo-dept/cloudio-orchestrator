@@ -25,6 +25,7 @@ from orchestrator.domain import (
     RunState,
     RunStatus,
     RunType,
+    StepName,
     TicketRef,
     TicketRefRequired,
     UnknownWorkflowError,
@@ -159,11 +160,28 @@ class ResourceRunSummary(BaseModel):
     # the resource type rather than by us. Only set when the caller asks (include_resource_data);
     # the routes serve with response_model_exclude_unset, so otherwise the key is absent entirely.
     resource_data: dict[str, Any] | None = None
+    # The same opt-in, absent-unless-asked rule applies to each of these (see RunSummaryIncludes).
+    ticket: TicketRef | None = None  # the ticket's id and the provider's native id for it
+    engine_run_id: str | None = None  # the engine's id for the run it was handed
+    steps_started_at: dict[StepName, datetime] | None = None  # every step begun, oldest first
 
 
-def summarize_run(run: WorkflowRun, *, include_resource_data: bool = False) -> ResourceRunSummary:
+class RunSummaryIncludes(BaseModel):
+    """The opt-in sections of a ResourceRunSummary, read from the query string. Each one off
+    leaves its keys out of the response entirely, not null."""
+
+    include_resource_data: bool = False  # -> resource_data
+    include_ticket_data: bool = False  # -> ticket
+    include_engine_data: bool = False  # -> engine_run_id
+    include_steps_data: bool = False  # -> steps_started_at
+
+
+def summarize_run(
+    run: WorkflowRun, includes: RunSummaryIncludes | None = None
+) -> ResourceRunSummary:
     """Project a run onto the summary. The failure detail prefers what the engine reported — the
     message that says what actually went wrong — and falls back to the last step error."""
+    includes = includes or RunSummaryIncludes()
     st = run.run_state
     failure = st.engine_failure
     detail = failure.detail if failure is not None and failure.detail else None
@@ -182,9 +200,16 @@ def summarize_run(run: WorkflowRun, *, include_resource_data: bool = False) -> R
         incident_id=st.incident_id,
         failure_detail=detail,
     )
-    if include_resource_data:
-        # Assigned after construction so it counts as set (and so is serialized) only when asked.
+    # Each assigned after construction so it counts as set (and so is serialized) only when asked.
+    if includes.include_resource_data:
         summary.resource_data = st.resource.data if st.resource is not None else {}
+    if includes.include_ticket_data:
+        summary.ticket = st.ticket
+    if includes.include_engine_data:
+        summary.engine_run_id = st.engine_run_id
+    if includes.include_steps_data:
+        # Sorted here: the run state round-trips through JSONB, which does not keep key order.
+        summary.steps_started_at = dict(sorted(st.step_started_at.items(), key=lambda kv: kv[1]))
     return summary
 
 
@@ -459,7 +484,7 @@ async def trigger_legacy_run(
 )
 async def get_latest_resource_run(
     resource_id: str,
-    include_resource_data: bool = False,
+    includes: RunSummaryIncludes = Depends(),
     svc: WorkflowRunService = Depends(get_run_service),
 ) -> ResourceRunSummary:
     """The most recent run against one resource manager record — what a portal shows beside a
@@ -468,8 +493,13 @@ async def get_latest_resource_run(
     Declared BEFORE /workflow-runs/{run_id}: that route parses its path segment as a UUID, so
     whichever is declared first wins and "latest" would be rejected there as a malformed run id.
 
-    ``include_resource_data=true`` adds ``resource_data``: the resource's specs as the run carries
-    them.
+    Opt-in sections, each absent unless its flag is ``true``:
+
+    - ``include_resource_data`` adds ``resource_data``: the resource's specs, as the run has them.
+    - ``include_ticket_data`` adds ``ticket``: its ``ticket_id`` and the provider's ``native_id``.
+    - ``include_engine_data`` adds ``engine_run_id``: the engine's id for the run (null until
+      triggered).
+    - ``include_steps_data`` adds ``steps_started_at``: every step begun and when, oldest first.
     """
     run = await svc.find_last_by_resource_id(resource_id)
     if run is None:
@@ -477,7 +507,7 @@ async def get_latest_resource_run(
             status.HTTP_404_NOT_FOUND,
             detail=f"No runs for resource record '{resource_id}'.",
         )
-    return summarize_run(run, include_resource_data=include_resource_data)
+    return summarize_run(run, includes)
 
 
 @v1.get(
@@ -487,7 +517,7 @@ async def get_latest_resource_run(
 )
 async def get_latest_resource_runs(
     resource_id: str,
-    include_resource_data: bool = False,
+    includes: RunSummaryIncludes = Depends(),
     svc: WorkflowRunService = Depends(get_run_service),
 ) -> list[ResourceRunSummary]:
     """The latest run for each of several resource manager records — one round trip for a portal
@@ -499,17 +529,13 @@ async def get_latest_resource_runs(
     Declared BEFORE /workflow-runs/{run_id} for the same reason as /workflow-runs/latest — that
     route parses its path segment as a UUID and would reject this one as a malformed run id.
 
-    ``include_resource_data=true`` adds ``resource_data`` to every item, as on /latest.
+    Takes the same opt-in flags as /latest, applied to every item.
     """
     resource_ids = _parse_resource_ids(resource_id)
     runs = await svc.find_last_by_resource_ids(resource_ids)
     by_record = {run.run_state.resource.resource_id: run for run in runs if run.run_state.resource}
     # Answer in the order asked, so a caller can zip the response against its own list of records.
-    return [
-        summarize_run(by_record[rid], include_resource_data=include_resource_data)
-        for rid in resource_ids
-        if rid in by_record
-    ]
+    return [summarize_run(by_record[rid], includes) for rid in resource_ids if rid in by_record]
 
 
 @v1.get("/workflow-runs/{run_id}", response_model=WorkflowRunResponse)

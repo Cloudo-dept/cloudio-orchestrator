@@ -237,13 +237,20 @@ whose `state` says something is under way, or went wrong.
 - **Query param (required):** `resource_id: str` — the resource manager's own id for the
   record (Project Manager: `project_resource_id`). *Not* the `vendor_id`: that is shared by the records for every
   region/environment, while a run targets exactly one of them.
-- **Query param (optional):** `include_resource_data: bool = false` — when `true`, the response
-  also carries `resource_data`: the resource's specs (`ResourceSpec.data`) as the run carries them,
-  passed through untouched. When `false` the key is absent from the response, not `null`.
+- **Query params (optional), all `bool = false`** — each one, when `true`, adds a section to the
+  response; when `false` its key is **absent** from the response, not `null`. They are independent
+  (`RunSummaryIncludes` in `api.py`):
+
+  | Param | Adds | Content |
+  |---|---|---|
+  | `include_resource_data` | `resource_data` | The resource's specs (`ResourceSpec.data`) as the run carries them, passed through untouched. |
+  | `include_ticket_data` | `ticket` | `{ticket_id, native_id}` — ServiceNow: the RITM number and its `sys_id`. `null` if no ticket yet. |
+  | `include_engine_data` | `engine_run_id` | The engine's id for the run it was handed — Airflow: the DAG run id. `null` until triggered. |
+  | `include_steps_data` | `steps_started_at` | `{step: started_at}` for **every step the run has begun** (completed ones included), oldest first. A retried step keeps its *first* start. |
 - **Response `200` — `ResourceRunSummary`:** `run_id`, `resource_id` (the record the run targets),
   `status`, `current_step`, `operation`, `created_by`, `created_at`, `updated_at`, `ticket_id`,
-  `incident_id`, `failure_detail` (what the engine reported, else the last step error), and
-  `resource_data` only when asked for.
+  `incident_id`, `failure_detail` (what the engine reported, else the last step error), and the
+  opt-in sections above only when asked for.
   Deliberately **not** a `WorkflowRunResponse`: the run's working state — step attempts, engine
   payloads, parameter sets — is orchestration bookkeeping, not something a resource's owner reads.
 - **Errors:** `404` — that record has no runs (including runs created before record ids were
@@ -263,8 +270,7 @@ in one round trip — what a portal screen listing a project's resources asks in
   (`?resource_id=rec-1,rec-2,rec-3`). Blanks and duplicates are dropped; **at most 200** ids per
   request (`MAX_BATCH_RESOURCE_IDS` in `api.py`), which keeps the URL and the query bounded — a
   portal paging its resource list stays well under it. Ids themselves must not contain a comma.
-- **Query param (optional):** `include_resource_data: bool = false` — as on `/latest`: adds
-  `resource_data` to every entry.
+- **Query params (optional):** the same `include_*` flags as on `/latest`, applied to every entry.
 - **Response `200` — `list[ResourceRunSummary]`:** one entry per record **that has a run**, its
   latest, **in the order the ids were asked for**. A record with no runs is simply **absent** — not
   an error, and never a `404`; each entry carries its own `resource_id`, so the caller matches rows

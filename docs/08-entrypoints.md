@@ -152,6 +152,9 @@ class WorkflowRunResponse(BaseModel):
 # --- App + routes (dependencies wired by bootstrap via app.state.container) ---
 
 app = FastAPI(title="Orchestrator Core API")
+# Every versioned route hangs off a router; a v2 is a new router mounted beside it. /healthz and
+# /readyz stay on the app itself, unversioned. Mounted at the bottom: app.include_router(v1).
+v1 = APIRouter(prefix="/api/v1")
 
 
 def get_workflow_service(request: Request) -> WorkflowService:
@@ -162,8 +165,8 @@ def get_run_service(request: Request) -> WorkflowRunService:
     return request.app.state.container.run_service
 
 
-@app.post("/api/v1/workflows", response_model=WorkflowResponse,
-          status_code=status.HTTP_201_CREATED)
+@v1.post("/workflows", response_model=WorkflowResponse,
+         status_code=status.HTTP_201_CREATED)
 async def register_workflow(request: WorkflowRegisterRequest,
                             svc: WorkflowService = Depends(get_workflow_service)):
     return await svc.register(Workflow(
@@ -172,7 +175,7 @@ async def register_workflow(request: WorkflowRegisterRequest,
         ticket_template_id=request.ticket_template_id))
 
 
-@app.get("/api/v1/workflows/{identifier}", response_model=WorkflowResponse)
+@v1.get("/workflows/{identifier}", response_model=WorkflowResponse)
 async def get_workflow(identifier: str,
                        svc: WorkflowService = Depends(get_workflow_service)):
     wf = await svc.get(identifier)
@@ -181,8 +184,8 @@ async def get_workflow(identifier: str,
     return wf
 
 
-@app.post("/api/v1/workflow-runs", response_model=WorkflowRunResponse,
-          status_code=status.HTTP_201_CREATED)
+@v1.post("/workflow-runs", response_model=WorkflowRunResponse,
+         status_code=status.HTTP_201_CREATED)
 async def trigger_workflow_run(request: WorkflowRunTriggerRequest,
                                svc: WorkflowRunService = Depends(get_run_service)):
     try:
@@ -211,35 +214,36 @@ async def trigger_workflow_run(request: WorkflowRunTriggerRequest,
 
 # BEFORE /{run_id}: that route parses its path segment as a UUID, so whichever is declared first
 # wins and "latest" would be rejected there as a malformed run id.
-# exclude_unset: resource_data is only set (and so only serialized) when include_resource_data.
-@app.get("/api/v1/workflow-runs/latest", response_model=ResourceRunSummary,
-         response_model_exclude_unset=True)
-async def get_latest_resource_run(resource_id: str, include_resource_data: bool = False,
+# exclude_unset: each opt-in section (resource_data, ticket, engine_run_id, steps_started_at) is
+# only set — and so only serialized — when its RunSummaryIncludes flag is true.
+@v1.get("/workflow-runs/latest", response_model=ResourceRunSummary,
+        response_model_exclude_unset=True)
+async def get_latest_resource_run(resource_id: str,
+                                  includes: RunSummaryIncludes = Depends(),  # include_* flags
                                   svc: WorkflowRunService = Depends(get_run_service)):
     run = await svc.find_last_by_resource_id(resource_id)
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             detail=f"No runs for resource record '{resource_id}'.")
     # a trimmed summary, not the internal run_state
-    return summarize_run(run, include_resource_data=include_resource_data)
+    return summarize_run(run, includes)
 
 
 # Also BEFORE /{run_id}, for the same reason. The list form of the lookup above: one round trip
 # for a portal screen listing a project's resources.
-@app.get("/api/v1/workflow-runs/latest-batch", response_model=list[ResourceRunSummary],
-         response_model_exclude_unset=True)
+@v1.get("/workflow-runs/latest-batch", response_model=list[ResourceRunSummary],
+        response_model_exclude_unset=True)
 async def get_latest_resource_runs(resource_id: str,      # comma-separated record ids
-                                   include_resource_data: bool = False,
+                                   includes: RunSummaryIncludes = Depends(),
                                    svc: WorkflowRunService = Depends(get_run_service)):
     resource_ids = _parse_resource_ids(resource_id)       # blanks/dupes dropped; 422 if empty/>200
     runs = await svc.find_last_by_resource_ids(resource_ids)
     by_record = {run.run_state.resource.resource_id: run for run in runs if run.run_state.resource}
     # Records with no runs drop out (never a 404); answered in the order asked.
-    return [summarize_run(by_record[rid], include_resource_data=include_resource_data)
-            for rid in resource_ids if rid in by_record]
+    return [summarize_run(by_record[rid], includes) for rid in resource_ids if rid in by_record]
 
 
-@app.get("/api/v1/workflow-runs/{run_id}", response_model=WorkflowRunResponse)
+@v1.get("/workflow-runs/{run_id}", response_model=WorkflowRunResponse)
 async def get_workflow_run(run_id: uuid.UUID,
                            svc: WorkflowRunService = Depends(get_run_service)):
     run = await svc.get(run_id)
@@ -248,7 +252,7 @@ async def get_workflow_run(run_id: uuid.UUID,
     return run
 
 
-@app.get("/api/v1/workflow-runs", response_model=list[WorkflowRunResponse])
+@v1.get("/workflow-runs", response_model=list[WorkflowRunResponse])
 async def list_workflow_runs(ticket_id: str | None = None, vendor_id: str | None = None,
                              svc: WorkflowRunService = Depends(get_run_service)):
     if ticket_id:
@@ -256,6 +260,9 @@ async def list_workflow_runs(ticket_id: str | None = None, vendor_id: str | None
     if vendor_id:
         return await svc.find_by_vendor_id(vendor_id)
     return await svc.list_recent()     # unfiltered: the most recent runs, newest first
+
+
+app.include_router(v1)
 ```
 
 ## `worker.py` — daemon: workers claim and drive runs directly

@@ -349,7 +349,13 @@ class RunState(BaseModel):
 
     # retry / deadline bookkeeping (keyed by StepName)
     step_attempts: dict[StepName, int] = PyField(default_factory=dict)
+    # A log: every step this run has begun, and when it first did. Never cleared — a completed or
+    # retried step keeps its entry — so it is not the deadline clock; attempt_started_at is.
     step_started_at: dict[StepName, datetime] = PyField(default_factory=dict)
+    # When the current step's current attempt began: the clock its wall-clock budget runs on.
+    # One value, not a map — only one step is ever in progress. Cleared on completion and on retry,
+    # so the next step (or the retry) starts a fresh budget.
+    attempt_started_at: datetime | None = None
     errors: dict[StepName, str] = PyField(default_factory=dict)
 
     # per-step outputs handed off to later steps (keyed by StepName)
