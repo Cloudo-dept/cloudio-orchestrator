@@ -12,9 +12,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Security, status
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field
 
+from orchestrator.auth import ApiKeyAuthenticator
 from orchestrator.domain import (
     LegacyRequest,
     ResourceIdRequired,
@@ -314,6 +316,32 @@ def get_health_check(request: Request) -> HealthCheck:
     return health_check
 
 
+def get_authenticator(request: Request) -> ApiKeyAuthenticator:
+    authenticator: ApiKeyAuthenticator = request.app.state.container.authenticator
+    return authenticator
+
+
+# auto_error=False: a missing header must reach require_api_key, which answers 401 (FastAPI's own
+# error is a 403) — and lets the gate stand open when no keys are configured.
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(
+    api_key: str | None = Security(api_key_header),
+    authenticator: ApiKeyAuthenticator = Depends(get_authenticator),
+) -> None:
+    """Router-level gate: the request must carry a configured key in X-API-Key."""
+    if not authenticator.enabled:
+        return
+    if authenticator.identify(api_key) is None:
+        logger.warning("Rejected request: %s API key.", "invalid" if api_key else "missing")
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+
 @app.get("/healthz", response_model=HealthResponse, tags=["health"])
 async def healthz() -> HealthResponse:
     """Liveness: the process is up and serving. Does not touch the database."""
@@ -564,12 +592,16 @@ async def list_workflow_runs(
 
 # --- Callbacks: external systems wake a waiting run early (co-exists with polling) ---
 
+# Its own router so it can stay outside the API-key gate: callbacks are network-trust (see
+# 01-external-contracts) — they carry only a neutral reference and can do no more than make a
+# waiting run re-poll, and the ticket system / engine posting them hold no API key.
+callbacks = APIRouter(prefix="/api/v1", tags=["callbacks"])
 
-@v1.post(
+
+@callbacks.post(
     "/callbacks/ticket-approval",
     response_model=CallbackAcceptedResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    tags=["callbacks"],
 )
 async def ticket_approval_callback(
     request: TicketApprovalCallbackRequest,
@@ -582,11 +614,10 @@ async def ticket_approval_callback(
     return CallbackAcceptedResponse(woken=woken)
 
 
-@v1.post(
+@callbacks.post(
     "/callbacks/engine-run",
     response_model=CallbackAcceptedResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    tags=["callbacks"],
 )
 async def engine_run_callback(
     request: EngineRunCallbackRequest,
@@ -599,4 +630,5 @@ async def engine_run_callback(
     return CallbackAcceptedResponse(woken=woken)
 
 
-app.include_router(v1)
+app.include_router(v1, dependencies=[Depends(require_api_key)])
+app.include_router(callbacks)

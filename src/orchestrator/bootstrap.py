@@ -16,6 +16,7 @@ from orchestrator.adapters.legacy_automation import HttpLegacyAutomationClient
 from orchestrator.adapters.logging_transport import FailureLoggingTransport
 from orchestrator.adapters.project_manager import ProjectManagerResourceClient
 from orchestrator.adapters.servicenow import ServiceNowTicketClient
+from orchestrator.auth import ApiKeyAuthenticator
 from orchestrator.config import Settings
 from orchestrator.domain import WorkflowEngineType
 from orchestrator.orchestration.escalator import FailureEscalator
@@ -36,6 +37,7 @@ class Container(BaseModel):
     workflow_service: WorkflowService
     run_service: WorkflowRunService
     callback_service: RunCallbackService
+    authenticator: ApiKeyAuthenticator
     worker: OrchestratorWorker
     health_check: HealthCheck
     # The pooled provider clients. Held only so an entrypoint can release their connections on
@@ -177,10 +179,17 @@ async def build(settings: Settings) -> Container:
         settings.http_max_keepalive_connections,
     )
 
+    authenticator = ApiKeyAuthenticator(settings.api_keys)
+    if authenticator.enabled:
+        logger.info("API keys configured for clients: %s.", sorted(settings.api_keys))
+    else:
+        logger.warning("No API keys configured (ORCH_API_KEYS) — the API is open to any caller.")
+
     return Container(
         workflow_service=WorkflowService(workflows),
         run_service=WorkflowRunService(runs, workflows),
         callback_service=RunCallbackService(runs),
+        authenticator=authenticator,
         worker=worker,
         health_check=PostgresHealthCheck(session_factory),
         http_clients=[servicenow_http, pm_http, airflow_http, legacy_http],

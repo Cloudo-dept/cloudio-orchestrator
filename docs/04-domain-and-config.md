@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # wins. An unrecognised name degrades to INFO with a warning rather than failing startup.
     log_level: str = "INFO"
 
+    # Inbound API keys: client name -> key, sent as the X-API-Key header. Required on every
+    # /api/v1 route except the wake-early callbacks and the health probes. Empty → API is open.
+    api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+
     # Retry policy (application-owned; expressed as WorkflowRun.scheduled_at, never a queue delay).
     # Poll intervals live on the step handlers themselves (StepHandler.poll_interval_seconds).
     retry_base_seconds: float = 10.0             # base for per-step exponential backoff

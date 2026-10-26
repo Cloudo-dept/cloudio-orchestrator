@@ -129,6 +129,15 @@ This starts:
   standalone stdlib server (`dev/ui/`) that serves the static GUI and reverse-proxies `/api` to the
   orchestrator, so the API stays untouched. Run it outside compose with
   `python dev/ui/server.py` (set `ORCH_API_BASE` if the API isn't on `localhost:8000`).
+  The console is behind HTTP Basic auth — `admin` / `password` under compose, overridable via
+  `UI_USERNAME` / `UI_PASSWORD` in `.env`; outside compose it's open unless `UI_PASSWORD` is set.
+  The proxy adds the console's orchestrator API key (`UI_API_KEY`, default `dev-ui-key`) to every
+  `/api` call server-side, so the browser never holds it.
+- **API keys** — every `/api/v1` route except `/api/v1/callbacks/*` (and `/healthz`, `/readyz`)
+  needs an `X-API-Key` header matching one of `ORCH_API_KEYS` (client name → key, JSON). Compose
+  registers a single `ui` key from `UI_API_KEY`; call the API directly with
+  `curl -H 'X-API-Key: dev-ui-key' localhost:8000/api/v1/workflows`. With `ORCH_API_KEYS` unset the
+  API is open (startup logs a warning).
   `ticket_params`, `workflow_params`, and `resource.data` are authored as JSON in a Monaco editor —
   vendored under `dev/ui/static/vendor/monaco/` (see its README) so the console needs no CDN, no
   npm, and no build step.

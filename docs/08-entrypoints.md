@@ -262,8 +262,28 @@ async def list_workflow_runs(ticket_id: str | None = None, vendor_id: str | None
     return await svc.list_recent()     # unfiltered: the most recent runs, newest first
 
 
-app.include_router(v1)
+app.include_router(v1, dependencies=[Depends(require_api_key)])
+app.include_router(callbacks)       # its own router: outside the API-key gate
 ```
+
+### Authentication — API keys
+
+Every `/api/v1` route requires an `X-API-Key` header holding one of the keys in
+`Settings.api_keys` (client name → key, `ORCH_API_KEYS` as JSON); a missing or unknown key is a
+`401` with `WWW-Authenticate: ApiKey`. The gate is a router-level dependency (`require_api_key`)
+over an `ApiKeyAuthenticator` (`auth.py`) that `bootstrap.build()` constructs from settings — the
+API itself never reads configuration. Keys are named per client so one can be rotated or revoked
+alone; comparison is constant-time across every key.
+
+Two exemptions, both deliberate:
+
+- **`/api/v1/callbacks/*`** live on their own `callbacks` router outside the gate. They stay
+  network-trust ([01-external-contracts](01-external-contracts.md)): they carry only a neutral
+  reference and can do no more than make a waiting run re-poll, and the ticket system and engine
+  that post them hold no key.
+- **`/healthz` / `/readyz`** are on the app, not `v1`, so platform probes need no credentials.
+
+With `api_keys` empty the gate is open and startup logs a warning — for local development only.
 
 ## `worker.py` — daemon: workers claim and drive runs directly
 

@@ -7,8 +7,10 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from orchestrator.api import MAX_BATCH_RESOURCE_IDS, app
+from orchestrator.auth import ApiKeyAuthenticator
 from orchestrator.services import RunCallbackService, WorkflowRunService, WorkflowService
 from tests.fakes import FakeHealthCheck, FakeWorkflowRepository, FakeWorkflowRunRepository
 
@@ -21,6 +23,7 @@ async def client(
         workflow_service=WorkflowService(workflows),
         run_service=WorkflowRunService(runs, workflows),
         callback_service=RunCallbackService(runs),
+        authenticator=ApiKeyAuthenticator({}),  # open; the gate has its own tests below
         health_check=FakeHealthCheck(healthy=True),
     )
     transport = httpx.ASGITransport(app=app)
@@ -638,3 +641,41 @@ async def test_the_two_payload_shapes_are_told_apart_by_route_not_by_body(
     # And a native trigger payload posted to the legacy route is missing flow_type/db_operation.
     native = {"workflow_identifier": "provision-vm", "created_by": "jdoe", "ticket_params": {}}
     assert (await client.post("/api/v1/legacy-runs", json=native)).status_code == 422
+
+
+# --- API-key gate ---
+
+
+@pytest.fixture
+def keyed(client: httpx.AsyncClient) -> httpx.AsyncClient:
+    """The same client, with the API requiring a key (the "portal" client's is ``portal-key``)."""
+    app.state.container.authenticator = ApiKeyAuthenticator({"portal": SecretStr("portal-key")})
+    return client
+
+
+async def test_v1_route_without_key_is_401(keyed: httpx.AsyncClient) -> None:
+    resp = await keyed.get("/api/v1/workflows")
+    assert resp.status_code == 401
+    assert resp.headers["WWW-Authenticate"] == "ApiKey"
+
+
+async def test_v1_route_with_wrong_key_is_401(keyed: httpx.AsyncClient) -> None:
+    resp = await keyed.get("/api/v1/workflows", headers={"X-API-Key": "nope"})
+    assert resp.status_code == 401
+
+
+async def test_v1_route_with_valid_key_passes(keyed: httpx.AsyncClient) -> None:
+    resp = await keyed.post(
+        "/api/v1/workflows", json=WORKFLOW_BODY, headers={"X-API-Key": "portal-key"}
+    )
+    assert resp.status_code == 201
+
+
+async def test_callbacks_and_health_need_no_key(keyed: httpx.AsyncClient) -> None:
+    """Callbacks are network-trust (the ticket system and engine hold no key); probes must answer
+    for the platform without credentials."""
+    ticket = await keyed.post("/api/v1/callbacks/ticket-approval", json={"ticket_id": "RITM-x"})
+    engine = await keyed.post("/api/v1/callbacks/engine-run", json={"engine_run_id": "x"})
+    assert ticket.status_code == engine.status_code == 202
+    assert (await keyed.get("/healthz")).status_code == 200
+    assert (await keyed.get("/readyz")).status_code == 200

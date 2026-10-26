@@ -72,3 +72,17 @@ def test_no_queue_dsn_attribute(env: None) -> None:
     # The queue was cut; there is no derived DSN anymore.
     settings = Settings()
     assert not hasattr(settings, "queue_dsn")
+
+
+def test_api_keys_parsed_from_json_as_secrets(env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ORCH_API_KEYS", '{"ui": "ui-key", "portal": "portal-key"}')
+    settings = Settings()
+    assert "ui-key" not in repr(settings)
+    assert {client: key.get_secret_value() for client, key in settings.api_keys.items()} == {
+        "ui": "ui-key",
+        "portal": "portal-key",
+    }
+
+
+def test_api_keys_default_to_empty(env: None) -> None:
+    assert Settings().api_keys == {}

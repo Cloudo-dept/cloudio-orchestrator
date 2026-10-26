@@ -16,6 +16,7 @@ Everything else is deliberately flat: modules are grouped **by role**, not one-c
 | `ports.py` | the six ABCs every adapter implements (the two repositories, the four clients) | `domain` |
 | `orchestration/` | step handlers, run plans, `RunExecutor`, `FailureEscalator` | `domain`, `ports` |
 | `services.py` | `WorkflowService`, `WorkflowRunService` (use-cases the API delegates to) | `domain`, `ports` |
+| `auth.py` | `ApiKeyAuthenticator` (which configured client an inbound API key belongs to) | pydantic |
 | `adapters/` | concrete port implementations + Alembic migrations | `domain`, `ports`, tech libs |
 | `api.py` / `worker.py` / `cli.py` / `bootstrap.py` | delivery + wiring | everything |
 
