@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Security, status
 from fastapi.security import APIKeyHeader
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.auth import ApiKeyAuthenticator
@@ -295,6 +296,8 @@ app = FastAPI(title="Orchestrator Core API", lifespan=lifespan)
 # middleware stack on first request, so build() — which runs inside lifespan — is too late.
 app.add_middleware(RequestContextMiddleware)
 
+Instrumentator().instrument(app).expose(app)
+Instrumentator(excluded_handlers=["/metrics", "/docs", "/healthcheck"]).instrument(app).expose(app)
 
 def get_workflow_service(request: Request) -> WorkflowService:
     service: WorkflowService = request.app.state.container.workflow_service
@@ -340,6 +343,7 @@ def require_api_key(
             detail="Missing or invalid API key.",
             headers={"WWW-Authenticate": "ApiKey"},
         )
+
 
 
 @app.get("/healthz", response_model=HealthResponse, tags=["health"])

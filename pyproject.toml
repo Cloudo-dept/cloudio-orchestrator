@@ -16,6 +16,7 @@ dependencies = [
     "alembic",
     "typer",
     "ecs-logging==2.1.0",
+    "prometheus-fastapi-instrumentator>=8.1.0",
 ]
 
 [dependency-groups]
